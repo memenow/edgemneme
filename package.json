@@ -1,0 +1,40 @@
+{
+  "name": "edgemneme",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.18.0",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "check": "pnpm typecheck && pnpm test:coverage && pnpm test:workers && pnpm wrangler:check",
+    "test": "vitest run --coverage.enabled=false",
+    "test:coverage": "vitest run --coverage.enabled=true",
+    "test:workers": "vitest run --config vitest.workers.config.ts",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "projection:rebuild:plan": "node scripts/enqueue-projection-rebuild.mjs plan",
+    "projection:rebuild:enqueue": "node scripts/enqueue-projection-rebuild.mjs enqueue",
+    "projection:rebuild:verify": "node scripts/enqueue-projection-rebuild.mjs verify",
+    "wrangler:check": "wrangler deploy --dry-run --config wrangler/memory-gateway.jsonc && wrangler deploy --dry-run --config wrangler/memory-orchestrator.jsonc && wrangler deploy --dry-run --config wrangler/github-sync.jsonc && wrangler deploy --dry-run --config wrangler/claude-runner.jsonc"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "agents": "0.19.0",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "0.18.8",
+    "@cloudflare/workers-types": "5.20260724.1",
+    "@types/node": "24.13.3",
+    "@vitest/coverage-istanbul": "4.1.10",
+    "typescript": "7.0.2",
+    "vitest": "4.1.10",
+    "wrangler": "4.114.0"
+  },
+  "pnpm": {
+    "overrides": {
+      "@hono/node-server": "2.0.10"
+    }
+  }
+}

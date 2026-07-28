@@ -1,0 +1,491 @@
+name: Apply D1 Migrations
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: Type APPLY to run pending production migrations
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-cloudflare
+  cancel-in-progress: false
+
+jobs:
+  confirm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Require explicit confirmation
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          if [[ "$CONFIRM" != "APPLY" ]]; then
+            echo "Migration confirmation must be exactly APPLY." >&2
+            exit 1
+          fi
+
+  migrate:
+    needs: confirm
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: production
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Verify immutable migration source
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "D1 migrations may run only from a main-branch dispatch." >&2
+            exit 1
+          fi
+          if [[ "$(git rev-parse HEAD)" != "$GITHUB_SHA" ]]; then
+            echo "The checked-out migration source does not match the dispatch commit." >&2
+            exit 1
+          fi
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        with:
+          version: 10.18.0
+          run_install: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Validate and mask production resource settings
+        env:
+          CF_D1_MEMORY_DATABASE_ID: ${{ vars.CF_D1_MEMORY_DATABASE_ID }}
+          CF_D1_SEARCH_DATABASE_ID: ${{ vars.CF_D1_SEARCH_DATABASE_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          required=(
+            CF_D1_MEMORY_DATABASE_ID
+            CF_D1_SEARCH_DATABASE_ID
+          )
+          missing=()
+          for name in "${required[@]}"; do
+            if [[ -z "${!name:-}" ]]; then
+              missing+=("$name")
+            fi
+          done
+          if (( ${#missing[@]} > 0 )); then
+            echo "Missing required production settings: ${missing[*]}" >&2
+            exit 1
+          fi
+          echo "::add-mask::$CF_D1_MEMORY_DATABASE_ID"
+          echo "::add-mask::$CF_D1_SEARCH_DATABASE_ID"
+
+      - name: Render migration config
+        env:
+          CF_D1_MEMORY_DATABASE_ID: ${{ vars.CF_D1_MEMORY_DATABASE_ID }}
+          CF_D1_SEARCH_DATABASE_ID: ${{ vars.CF_D1_SEARCH_DATABASE_ID }}
+        run: node scripts/render-wrangler-config.mjs memory-orchestrator
+
+      - name: Capture and verify private pre-migration backups
+        timeout-minutes: 25
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          config="wrangler/.wrangler/memory-orchestrator.generated.jsonc"
+          backup_bucket="edgemneme-projections"
+          backup_prefix="system/backups/d1-migrations/${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}"
+          backup_dir="${RUNNER_TEMP}/edgemneme-d1-migration-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          if [[ -e "$backup_dir" ]]; then
+            echo "The isolated migration backup directory already exists." >&2
+            exit 1
+          fi
+          install -d -m 0700 -- "$backup_dir"
+          {
+            echo "EDGEMNEME_D1_BACKUP_DIR=$backup_dir"
+            echo "EDGEMNEME_D1_BACKUP_PREFIX=$backup_prefix"
+          } >> "$GITHUB_ENV"
+
+          if ! pnpm exec wrangler r2 bucket domain list "$backup_bucket" \
+            --config "$config" > "$backup_dir/r2-custom-domains.log" 2>&1; then
+            echo "Unable to verify that the D1 backup bucket has no custom domain." >&2
+            exit 1
+          fi
+          if ! grep -Fqx \
+            "There are no custom domains connected to this bucket." \
+            "$backup_dir/r2-custom-domains.log"; then
+            echo "The D1 backup bucket has public custom-domain access enabled." >&2
+            exit 1
+          fi
+          if ! pnpm exec wrangler r2 bucket dev-url get "$backup_bucket" \
+            --config "$config" > "$backup_dir/r2-dev-url.log" 2>&1; then
+            echo "Unable to verify that the D1 backup bucket has no r2.dev access." >&2
+            exit 1
+          fi
+          if ! grep -Fqx \
+            "Public access via the r2.dev URL is disabled." \
+            "$backup_dir/r2-dev-url.log"; then
+            echo "The D1 backup bucket has public r2.dev access enabled." >&2
+            exit 1
+          fi
+          rm -f -- "$backup_dir/r2-custom-domains.log" "$backup_dir/r2-dev-url.log"
+
+          capture_bookmark() {
+            local database="$1"
+            local output="$2"
+            if ! pnpm exec wrangler d1 time-travel info "$database" --json \
+              --config "$config" > "$output" 2>&1; then
+              echo "Unable to capture the $database Time Travel bookmark." >&2
+              return 1
+            fi
+          }
+
+          capture_bookmark MEMORY_DB "$backup_dir/memory-bookmark-before.json"
+          capture_bookmark SEARCH_DB "$backup_dir/search-bookmark-before.json"
+
+          if ! pnpm exec wrangler d1 export MEMORY_DB --remote --skip-confirmation \
+            --output "$backup_dir/memory.sql" --config "$config" \
+            > "$backup_dir/memory-export.log" 2>&1; then
+            echo "Unable to create the private MEMORY_DB export." >&2
+            exit 1
+          fi
+          rm -f -- "$backup_dir/memory-export.log"
+
+          snapshot_search_table() {
+            local label="$1"
+            local query="$2"
+            local order_by="$3"
+            local key_map="$4"
+            local page_size="$5"
+            local output="$backup_dir/$label.jsonl"
+            local page="$backup_dir/$label.page.json"
+            local cursor="$backup_dir/$label.cursor.json"
+            local predicate=""
+            local next_predicate
+            local page_count
+            : > "$output"
+            while true; do
+              if ! pnpm exec wrangler d1 execute SEARCH_DB --remote --json \
+                --config "$config" \
+                --command "$query $predicate ORDER BY $order_by LIMIT $page_size;" \
+                > "$page" 2>&1; then
+                echo "Unable to capture the $label logical snapshot." >&2
+                return 1
+              fi
+              page_count="$(
+                node scripts/d1-migration-safety.mjs append-keyset-page \
+                  "$page" "$output" "$cursor" "$key_map"
+              )"
+              rm -f -- "$page"
+              if [[ ! "$page_count" =~ ^[0-9]+$ ]] || (( page_count > page_size )); then
+                echo "The $label logical snapshot returned an invalid page size." >&2
+                return 1
+              fi
+              if (( page_count < page_size )); then
+                break
+              fi
+              next_predicate="$(
+                node scripts/d1-migration-safety.mjs keyset-predicate "$cursor" "$key_map"
+              )"
+              if [[ -z "$next_predicate" || "$next_predicate" == "$predicate" ]]; then
+                echo "The $label logical snapshot cursor did not advance." >&2
+                return 1
+              fi
+              predicate="$next_predicate"
+            done
+            rm -f -- "$cursor"
+          }
+
+          detect_search_table() {
+            local table="$1"
+            local output="$backup_dir/$table.presence.json"
+            case "$table" in
+              memory_fts_chunk_ledger|memory_search_projection_deletions|memory_search_projection_write_leases|memory_search_vector_cleanup_receipts|memory_search_vector_cleanup_janitor_state)
+                ;;
+              *)
+                echo "Refusing to probe an unexpected Search D1 table." >&2
+                return 1
+                ;;
+            esac
+            if ! pnpm exec wrangler d1 execute SEARCH_DB --remote --json \
+              --config "$config" \
+              --command "SELECT name AS table_name FROM sqlite_master WHERE type = 'table' AND name = '$table';" \
+              > "$output" 2>&1; then
+              echo "Unable to determine whether $table exists." >&2
+              return 1
+            fi
+            node scripts/d1-migration-safety.mjs detect-search-table "$table" "$output"
+            rm -f -- "$output"
+          }
+
+          snapshot_search_table \
+            "search-generations" \
+            "SELECT * FROM search_generations" \
+            "generation_id" \
+            '{"generation_id":"generation_id"}' \
+            500
+          snapshot_search_table \
+            "memory-fts" \
+            "SELECT rowid AS fts_rowid, * FROM memory_fts" \
+            "rowid" \
+            '{"fts_rowid":"rowid"}' \
+            25
+          snapshot_search_table \
+            "memory-projection-heads" \
+            "SELECT * FROM memory_projection_heads" \
+            "generation_id, project_id, memory_id" \
+            '{"generation_id":"generation_id","project_id":"project_id","memory_id":"memory_id"}' \
+            500
+
+          ledger_present="$(detect_search_table memory_fts_chunk_ledger)"
+          deletions_present="$(detect_search_table memory_search_projection_deletions)"
+          write_leases_present="$(detect_search_table memory_search_projection_write_leases)"
+          cleanup_receipts_present="$(
+            detect_search_table memory_search_vector_cleanup_receipts
+          )"
+          cleanup_janitor_state_present="$(
+            detect_search_table memory_search_vector_cleanup_janitor_state
+          )"
+          if [[ "$ledger_present" == "1" ]]; then
+            snapshot_search_table \
+              "memory-fts-chunk-ledger" \
+              "SELECT * FROM memory_fts_chunk_ledger" \
+              "fts_rowid" \
+              '{"fts_rowid":"fts_rowid"}' \
+              500
+          else
+            : > "$backup_dir/memory-fts-chunk-ledger.jsonl"
+          fi
+          if [[ "$deletions_present" == "1" ]]; then
+            snapshot_search_table \
+              "memory-search-projection-deletions" \
+              "SELECT * FROM memory_search_projection_deletions" \
+              "generation_id, project_id, memory_id" \
+              '{"generation_id":"generation_id","project_id":"project_id","memory_id":"memory_id"}' \
+              500
+          else
+            : > "$backup_dir/memory-search-projection-deletions.jsonl"
+          fi
+          if [[ "$write_leases_present" == "1" ]]; then
+            snapshot_search_table \
+              "memory-search-projection-write-leases" \
+              "SELECT * FROM memory_search_projection_write_leases" \
+              "generation_id, project_id, memory_id" \
+              '{"generation_id":"generation_id","project_id":"project_id","memory_id":"memory_id"}' \
+              500
+          else
+            : > "$backup_dir/memory-search-projection-write-leases.jsonl"
+          fi
+          if [[ "$cleanup_receipts_present" == "1" ]]; then
+            snapshot_search_table \
+              "memory-search-vector-cleanup-receipts" \
+              "SELECT * FROM memory_search_vector_cleanup_receipts" \
+              "generation_id, project_id, memory_id, vector_id" \
+              '{"generation_id":"generation_id","project_id":"project_id","memory_id":"memory_id","vector_id":"vector_id"}' \
+              500
+          else
+            : > "$backup_dir/memory-search-vector-cleanup-receipts.jsonl"
+          fi
+          if [[ "$cleanup_janitor_state_present" == "1" ]]; then
+            snapshot_search_table \
+              "memory-search-vector-cleanup-janitor-state" \
+              "SELECT * FROM memory_search_vector_cleanup_janitor_state" \
+              "state_id" \
+              '{"state_id":"state_id"}' \
+              500
+          else
+            : > "$backup_dir/memory-search-vector-cleanup-janitor-state.jsonl"
+          fi
+
+          ledger_count="0"
+          deletions_count="0"
+          write_leases_count="0"
+          cleanup_receipts_count="0"
+          cleanup_janitor_state_count="0"
+          if [[ "$ledger_present" == "1" ]]; then
+            ledger_count="(SELECT COUNT(*) FROM memory_fts_chunk_ledger)"
+          fi
+          if [[ "$deletions_present" == "1" ]]; then
+            deletions_count="(SELECT COUNT(*) FROM memory_search_projection_deletions)"
+          fi
+          if [[ "$write_leases_present" == "1" ]]; then
+            write_leases_count="(SELECT COUNT(*) FROM memory_search_projection_write_leases)"
+          fi
+          if [[ "$cleanup_receipts_present" == "1" ]]; then
+            cleanup_receipts_count="(SELECT COUNT(*) FROM memory_search_vector_cleanup_receipts)"
+          fi
+          if [[ "$cleanup_janitor_state_present" == "1" ]]; then
+            cleanup_janitor_state_count="(SELECT COUNT(*) FROM memory_search_vector_cleanup_janitor_state)"
+          fi
+          count_query="SELECT
+            (SELECT COUNT(*) FROM search_generations) AS search_generations,
+            (SELECT COUNT(*) FROM memory_fts) AS memory_fts,
+            (SELECT COUNT(*) FROM memory_projection_heads) AS memory_projection_heads,
+            $ledger_count AS memory_fts_chunk_ledger,
+            $deletions_count AS memory_search_projection_deletions,
+            $write_leases_count AS memory_search_projection_write_leases,
+            $cleanup_receipts_count AS memory_search_vector_cleanup_receipts,
+            $cleanup_janitor_state_count AS memory_search_vector_cleanup_janitor_state;"
+
+          if ! pnpm exec wrangler d1 execute SEARCH_DB --remote --json \
+            --config "$config" \
+            --command "$count_query" \
+            > "$backup_dir/search-snapshot-counts.json" 2>&1; then
+            echo "Unable to validate the Search D1 logical snapshot row counts." >&2
+            exit 1
+          fi
+          node scripts/d1-migration-safety.mjs validate-search-snapshot \
+            "$backup_dir/search-snapshot-counts.json" "$backup_dir"
+          rm -f -- "$backup_dir/search-snapshot-counts.json"
+
+          upload_and_verify() {
+            local object="$1"
+            local content_type="$2"
+            local source="$backup_dir/$object"
+            local downloaded="$backup_dir/$object.downloaded"
+            local transfer_log="$backup_dir/r2-transfer.log"
+            if ! pnpm exec wrangler r2 object put \
+              "$backup_bucket/$backup_prefix/$object" --remote --force \
+              --content-type "$content_type" --file "$source" --config "$config" \
+              > "$transfer_log" 2>&1; then
+              echo "Unable to retain a private D1 migration backup object." >&2
+              return 1
+            fi
+            if ! pnpm exec wrangler r2 object get \
+              "$backup_bucket/$backup_prefix/$object" --remote \
+              --file "$downloaded" --config "$config" \
+              > "$transfer_log" 2>&1; then
+              echo "Unable to download a private D1 migration backup object for verification." >&2
+              return 1
+            fi
+            if ! cmp --silent -- "$source" "$downloaded"; then
+              echo "A private D1 migration backup object failed byte-for-byte verification." >&2
+              return 1
+            fi
+            rm -f -- "$downloaded" "$transfer_log"
+          }
+
+          upload_and_verify "memory.sql" "application/sql"
+          upload_and_verify "search-generations.jsonl" "application/x-ndjson"
+          upload_and_verify "memory-fts.jsonl" "application/x-ndjson"
+          upload_and_verify "memory-projection-heads.jsonl" "application/x-ndjson"
+          upload_and_verify "memory-fts-chunk-ledger.jsonl" "application/x-ndjson"
+          upload_and_verify "memory-search-projection-deletions.jsonl" "application/x-ndjson"
+          upload_and_verify "memory-search-projection-write-leases.jsonl" "application/x-ndjson"
+          upload_and_verify "memory-search-vector-cleanup-receipts.jsonl" "application/x-ndjson"
+          upload_and_verify "memory-search-vector-cleanup-janitor-state.jsonl" "application/x-ndjson"
+          capture_bookmark MEMORY_DB "$backup_dir/memory-bookmark.json"
+          capture_bookmark SEARCH_DB "$backup_dir/search-bookmark.json"
+          captured_at="$(date -u +"%Y-%m-%dT%H:%M:%S.000Z")"
+          EDGEMNEME_D1_BACKUP_CAPTURED_AT="$captured_at" \
+            node scripts/d1-migration-safety.mjs create-backup-manifest \
+              "$backup_dir" "$backup_dir/manifest.json"
+          node scripts/d1-migration-safety.mjs verify-backup \
+            "$backup_dir/manifest.json" "$backup_dir"
+          upload_and_verify "manifest.json" "application/json"
+
+      - name: Apply memory database migrations
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: >-
+          pnpm exec wrangler d1 migrations apply MEMORY_DB --remote
+          --config wrangler/.wrangler/memory-orchestrator.generated.jsonc
+
+      - name: Apply search database migrations
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: >-
+          pnpm exec wrangler d1 migrations apply SEARCH_DB --remote
+          --config wrangler/.wrangler/memory-orchestrator.generated.jsonc
+
+      - name: Validate migrated D1 databases
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          config="wrangler/.wrangler/memory-orchestrator.generated.jsonc"
+          validation_dir="${EDGEMNEME_D1_BACKUP_DIR:?Migration backup directory is unavailable}"
+
+          check_no_pending() {
+            local database="$1"
+            local output
+            if ! output="$(
+              pnpm exec wrangler d1 migrations list "$database" --remote \
+                --config "$config" 2>&1
+            )"; then
+              echo "Unable to verify remote migrations for $database." >&2
+              return 1
+            fi
+            if [[ "$output" != *"No migrations to apply!"* ]] || \
+               [[ "$output" == *"Migrations to be applied:"* ]]; then
+              echo "Pending or indeterminate migrations remain for $database." >&2
+              return 1
+            fi
+          }
+
+          run_validation_query() {
+            local database="$1"
+            local command="$2"
+            local output="$3"
+            if ! pnpm exec wrangler d1 execute "$database" --remote --json \
+              --config "$config" --command "$command" > "$output" 2>&1; then
+              echo "Unable to execute a required post-migration check for $database." >&2
+              return 1
+            fi
+          }
+
+          check_no_pending MEMORY_DB
+          check_no_pending SEARCH_DB
+
+          run_validation_query MEMORY_DB \
+            "PRAGMA quick_check; PRAGMA foreign_key_check;" \
+            "$validation_dir/memory-integrity.json"
+          run_validation_query SEARCH_DB \
+            "PRAGMA quick_check; PRAGMA foreign_key_check;" \
+            "$validation_dir/search-integrity.json"
+          node scripts/d1-migration-safety.mjs validate-integrity \
+            MEMORY_DB "$validation_dir/memory-integrity.json"
+          node scripts/d1-migration-safety.mjs validate-integrity \
+            SEARCH_DB "$validation_dir/search-integrity.json"
+
+          schema_sql="SELECT type, name, sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type, name;"
+          run_validation_query MEMORY_DB "$schema_sql" "$validation_dir/memory-schema.json"
+          run_validation_query SEARCH_DB "$schema_sql" "$validation_dir/search-schema.json"
+          node scripts/d1-migration-safety.mjs validate-schema \
+            MEMORY_DB "$validation_dir/memory-schema.json"
+          node scripts/d1-migration-safety.mjs validate-schema \
+            SEARCH_DB "$validation_dir/search-schema.json"
+
+      - name: Remove ephemeral migration files
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${EDGEMNEME_D1_BACKUP_DIR:-}" && \
+                "$EDGEMNEME_D1_BACKUP_DIR" == "$RUNNER_TEMP"/edgemneme-d1-migration-* ]]; then
+            find "$EDGEMNEME_D1_BACKUP_DIR" -mindepth 1 -maxdepth 1 -type f -delete
+            rmdir -- "$EDGEMNEME_D1_BACKUP_DIR"
+          fi
+          rm -f -- wrangler/.wrangler/memory-orchestrator.generated.jsonc

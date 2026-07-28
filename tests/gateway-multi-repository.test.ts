@@ -1,0 +1,579 @@
+import { readFileSync } from "node:fs";
+import { DatabaseSync, type SQLInputValue, type StatementSync } from "node:sqlite";
+import { describe, expect, it } from "vitest";
+import { GatewayService, type GatewayEnv } from "../src/gateway/service";
+import type { AuthenticatedPrincipal } from "../src/security/auth";
+
+const NOW = "2026-07-27T12:00:00.000Z";
+const PROJECT_ID = "project-1";
+const PROJECT_REF = "project:one";
+
+describe("GatewayService multi-repository isolation", () => {
+  it("allows a repository writer to open, submit, and close only in its repository", async () => {
+    const fixture = createFixture();
+    const service = fixture.service(repoWriterPrincipal());
+
+    const opened = await service.openSession({
+      projectRef: PROJECT_REF,
+      agentMeta: { name: "repository-writer" },
+      worktreeMeta: {
+        repository_id: "repository-a",
+        ref: "refs/heads/feature-a",
+        worktree_id: "worktree-a"
+      }
+    });
+    const sessionId = String(opened.session_id);
+    expect(
+      fixture.database
+        .prepare(
+          `SELECT repository_id, repository_ref, worktree_id
+           FROM sessions WHERE session_id = ?`
+        )
+        .get(sessionId)
+    ).toEqual({
+      repository_id: "repository-a",
+      repository_ref: "refs/heads/feature-a",
+      worktree_id: "worktree-a"
+    });
+
+    const forgedEvidence = {
+      source_type: "repository_file",
+      locator: "docs/architecture.md",
+      excerpt_hash: "a".repeat(64),
+      repository_id: "repository-b",
+      repository_authority: "default_branch"
+    };
+    const candidate = await service.submitCandidate({
+      projectRef: PROJECT_REF,
+      sessionId,
+      content: "Repository A uses D1 as its memory authority.",
+      evidence: [forgedEvidence],
+      idempotencyKey: "candidate-repository-a"
+    });
+    expect(candidate.status).toBe("queued");
+    expect(
+      fixture.database
+        .prepare(
+          `SELECT repository_id, repository_ref, repository_path,
+                  repository_authority, locator
+           FROM evidence`
+        )
+        .get()
+    ).toEqual({
+      repository_id: "repository-a",
+      repository_ref: "refs/heads/feature-a",
+      repository_path: null,
+      repository_authority: "agent_supplied",
+      locator: "repository:repository-a:docs/architecture.md"
+    });
+    expect(
+      fixture.database
+        .prepare("SELECT evidence_json FROM observations WHERE observation_id = ?")
+        .get(String(candidate.candidate_id))
+    ).toEqual({
+      evidence_json: JSON.stringify([
+        {
+          excerpt_hash: "a".repeat(64),
+          locator: "docs/architecture.md",
+          source_type: "repository_file"
+        }
+      ])
+    });
+
+    await expect(
+      service.closeSession({
+        sessionId,
+        expectedSessionVersion: 1,
+        triggerConsolidation: false,
+        idempotencyKey: "close-repository-a"
+      })
+    ).resolves.toMatchObject({ status: "closed", session_version: 2 });
+    const beforeLateCandidate = tableCount(fixture.database, "observations");
+    await expect(
+      service.submitCandidate({
+        projectRef: PROJECT_REF,
+        sessionId,
+        content: "This candidate arrived after close.",
+        evidence: [],
+        idempotencyKey: "late-candidate-repository-a"
+      })
+    ).rejects.toMatchObject({ code: "VALIDATION_FAILED" });
+    expect(tableCount(fixture.database, "observations")).toBe(beforeLateCandidate);
+
+    const sessionsBeforeDeniedOpen = tableCount(fixture.database, "sessions");
+    await expect(
+      service.openSession({
+        projectRef: PROJECT_REF,
+        agentMeta: { name: "repository-writer" },
+        worktreeMeta: { repository_id: "repository-b" }
+      })
+    ).rejects.toMatchObject({ code: "PROJECT_UNAVAILABLE" });
+    expect(tableCount(fixture.database, "sessions")).toBe(sessionsBeforeDeniedOpen);
+  });
+
+  it("returns project memory plus only the authorized repository before pagination", async () => {
+    const fixture = createFixture();
+    seedMemories(fixture.database);
+    const service = fixture.service(repoWriterPrincipal());
+
+    const first = await service.search({ projectRef: PROJECT_REF, limit: 1 });
+    expect(memoryIds(first)).toEqual(["memory-shared"]);
+    const second = await service.search({
+      projectRef: PROJECT_REF,
+      limit: 1,
+      pageToken: String(first.next_page_token)
+    });
+    expect(memoryIds(second)).toEqual(["memory-a"]);
+    expect(memoryIds(second)).not.toContain("memory-b");
+    const unauthorizedFilter = await service.search({
+      projectRef: PROJECT_REF,
+      filters: { scope: "repository", scope_id: "repository-b" },
+      limit: 10
+    });
+    expect(memoryIds(unauthorizedFilter)).toEqual([]);
+
+    const projectService = fixture.service(projectMaintainerPrincipal());
+    const all = await projectService.search({ projectRef: PROJECT_REF, limit: 10 });
+    expect(memoryIds(all)).toEqual(["memory-shared", "memory-b", "memory-a"]);
+  });
+
+  it("intersects project access with a session repository and binds page tokens to it", async () => {
+    const fixture = createFixture();
+    seedMemories(fixture.database);
+    const projectService = fixture.service(projectMaintainerPrincipal());
+    const opened = await projectService.openSession({
+      projectRef: PROJECT_REF,
+      agentMeta: { name: "project-maintainer" },
+      worktreeMeta: { repository_id: "repository-a" }
+    });
+    const sessionId = String(opened.session_id);
+
+    const first = await projectService.search({
+      projectRef: PROJECT_REF,
+      sessionId,
+      limit: 1
+    });
+    expect(memoryIds(first)).toEqual(["memory-shared"]);
+    const second = await projectService.search({
+      projectRef: PROJECT_REF,
+      sessionId,
+      limit: 1,
+      pageToken: String(first.next_page_token)
+    });
+    expect(memoryIds(second)).toEqual(["memory-a"]);
+
+    await expect(
+      projectService.search({
+        projectRef: PROJECT_REF,
+        limit: 1,
+        pageToken: String(first.next_page_token)
+      })
+    ).rejects.toMatchObject({ code: "PAGE_TOKEN_INVALID" });
+  });
+
+  it("rejects a page token replayed by another principal with the same repository grant", async () => {
+    const fixture = createFixture();
+    seedMemories(fixture.database);
+    const writer = fixture.service(repoWriterPrincipal());
+    const reader = fixture.service(repoReaderPrincipal());
+    const first = await writer.search({ projectRef: PROJECT_REF, limit: 1 });
+
+    await expect(
+      reader.search({
+        projectRef: PROJECT_REF,
+        limit: 1,
+        pageToken: String(first.next_page_token)
+      })
+    ).rejects.toMatchObject({ code: "PAGE_TOKEN_INVALID" });
+  });
+
+  it("rejects ambiguous or unowned structured worktree context before mutation", async () => {
+    const fixture = createFixture();
+    const service = fixture.service(repoWriterPrincipal());
+    const before = tableCount(fixture.database, "sessions");
+
+    await expect(
+      service.openSession({
+        projectRef: PROJECT_REF,
+        agentMeta: { name: "repository-writer" },
+        worktreeMeta: {
+          repository_id: "repository-a",
+          repository_ref: "refs/heads/a",
+          ref: "refs/heads/b"
+        }
+      })
+    ).rejects.toMatchObject({ code: "VALIDATION_FAILED" });
+    await expect(
+      service.openSession({
+        projectRef: PROJECT_REF,
+        agentMeta: { name: "repository-writer" },
+        worktreeMeta: { ref: "refs/heads/a" }
+      })
+    ).rejects.toMatchObject({ code: "VALIDATION_FAILED" });
+    expect(tableCount(fixture.database, "sessions")).toBe(before);
+  });
+
+  it("fails closed when a repository writer grant is revoked before session creation", async () => {
+    const fixture = createFixture();
+    const service = fixture.service(repoWriterPrincipal());
+    fixture.memoryDb.beforeBatch = (batchNumber) => {
+      if (batchNumber === 1) {
+        fixture.database
+          .prepare("UPDATE project_grants SET revoked_at = ? WHERE grant_id = ?")
+          .run(NOW, "grant-a-writer");
+      }
+    };
+
+    await expect(
+      service.openSession({
+        projectRef: PROJECT_REF,
+        agentMeta: { name: "repository-writer" },
+        worktreeMeta: { repository_id: "repository-a" }
+      })
+    ).rejects.toMatchObject({ code: "PROJECT_UNAVAILABLE" });
+    expect(tableCount(fixture.database, "sessions")).toBe(0);
+  });
+
+  it("fails closed when a repository writer grant is revoked before the candidate batch", async () => {
+    const fixture = createFixture();
+    const service = fixture.service(repoWriterPrincipal());
+    const opened = await service.openSession({
+      projectRef: PROJECT_REF,
+      agentMeta: { name: "repository-writer" },
+      worktreeMeta: { repository_id: "repository-a" }
+    });
+    fixture.memoryDb.beforeBatch = (batchNumber) => {
+      if (batchNumber === 3) {
+        fixture.database
+          .prepare("UPDATE project_grants SET revoked_at = ? WHERE grant_id = ?")
+          .run(NOW, "grant-a-writer");
+      }
+    };
+
+    await expect(
+      service.submitCandidate({
+        projectRef: PROJECT_REF,
+        sessionId: String(opened.session_id),
+        content: "This candidate must not survive grant revocation.",
+        evidence: [],
+        idempotencyKey: "candidate-after-grant-revocation"
+      })
+    ).rejects.toMatchObject({ code: "PROJECT_UNAVAILABLE" });
+    expect(tableCount(fixture.database, "observations")).toBe(0);
+    expect(tableCount(fixture.database, "idempotency_records")).toBe(0);
+    expect(tableCount(fixture.database, "outbox_events")).toBe(0);
+  });
+
+  it("fails closed when a repository writer grant is revoked before the close batch", async () => {
+    const fixture = createFixture();
+    const service = fixture.service(repoWriterPrincipal());
+    const opened = await service.openSession({
+      projectRef: PROJECT_REF,
+      agentMeta: { name: "repository-writer" },
+      worktreeMeta: { repository_id: "repository-a" }
+    });
+    const sessionId = String(opened.session_id);
+    fixture.memoryDb.beforeBatch = (batchNumber) => {
+      if (batchNumber === 3) {
+        fixture.database
+          .prepare("UPDATE project_grants SET revoked_at = ? WHERE grant_id = ?")
+          .run(NOW, "grant-a-writer");
+      }
+    };
+
+    await expect(
+      service.closeSession({
+        sessionId,
+        expectedSessionVersion: 1,
+        summary: "This close must not survive grant revocation.",
+        triggerConsolidation: true,
+        idempotencyKey: "close-after-grant-revocation"
+      })
+    ).rejects.toMatchObject({ code: "PROJECT_UNAVAILABLE" });
+    expect(
+      fixture.database
+        .prepare("SELECT status, session_version FROM sessions WHERE session_id = ?")
+        .get(sessionId)
+    ).toEqual({ status: "open", session_version: 1 });
+    expect(tableCount(fixture.database, "session_consolidations")).toBe(0);
+    expect(tableCount(fixture.database, "idempotency_records")).toBe(0);
+    expect(tableCount(fixture.database, "outbox_events")).toBe(0);
+  });
+
+  it("derives memory-change repository context and overwrites caller-supplied context", async () => {
+    const fixture = createFixture();
+    seedMemories(fixture.database);
+    const service = fixture.service(projectMaintainerPrincipal());
+    const before = mutationTableCounts(fixture.database);
+
+    await service.submitMemoryChange({
+      operation: "correct",
+      target_memory_id: "memory-a",
+      expected_memory_version: 1,
+      expected_project_version: 0,
+      payload: { content: "Repository A uses a reviewed release policy." },
+      evidence: [{ source_type: "repository_file", locator: "docs/release.md" }],
+      idempotency_key: "memory-change-repository-a",
+      target_repository_context: {
+        scope: "repository",
+        scope_id: "repository-b",
+        repository_id: "repository-b",
+        repository_ref: null,
+        session_id: null,
+        worktree_id: null
+      }
+    });
+    await service.submitMemoryChange({
+      operation: "invalidate",
+      target_memory_id: "memory-b",
+      expected_memory_version: 1,
+      expected_project_version: 0,
+      payload: { reason: "Repository B replaced this policy." },
+      evidence: [{ source_type: "repository_file", locator: "docs/replaced.md" }],
+      idempotency_key: "memory-change-repository-b"
+    });
+
+    expect(fixture.coordinatorInputs).toHaveLength(2);
+    expect(fixture.coordinatorInputs[0]?.target_repository_context).toEqual({
+      scope: "repository",
+      scope_id: "repository-a",
+      repository_id: "repository-a",
+      repository_ref: null,
+      session_id: null,
+      worktree_id: null
+    });
+    expect(fixture.coordinatorInputs[1]?.target_repository_context).toEqual({
+      scope: "repository",
+      scope_id: "repository-b",
+      repository_id: "repository-b",
+      repository_ref: null,
+      session_id: null,
+      worktree_id: null
+    });
+    expect(mutationTableCounts(fixture.database)).toEqual(before);
+  });
+});
+
+function createFixture(): {
+  database: DatabaseSync;
+  memoryDb: SqliteD1;
+  coordinatorInputs: Array<Record<string, unknown>>;
+  service: (principal: AuthenticatedPrincipal) => GatewayService;
+} {
+  const database = new DatabaseSync(":memory:");
+  for (const migration of [
+    "migrations/0001_initial.sql",
+    "migrations/0002_allow_synthetic_cleanup.sql",
+    "migrations/0003_validity_interval_guard.sql",
+    "migrations/0004_synthetic_cleanup_registry_and_validity_preflight.sql",
+    "migrations/0005_synthetic_cleanup_fence.sql",
+    "migrations/0006_repository_scope_context.sql"
+  ]) {
+    database.exec(readFileSync(migration, "utf8"));
+  }
+  database.exec(`
+    INSERT INTO projects
+      (project_id, project_ref, locator, display_name, project_version, created_at, updated_at)
+    VALUES ('${PROJECT_ID}', '${PROJECT_REF}', '${PROJECT_REF}', 'Project One',
+            0, '${NOW}', '${NOW}');
+    INSERT INTO repositories
+      (repository_id, project_id, provider, external_id, owner, name, default_branch,
+       created_at, updated_at)
+    VALUES
+      ('repository-a', '${PROJECT_ID}', 'github', 101, 'memenow', 'repo-a', 'main',
+       '${NOW}', '${NOW}'),
+      ('repository-b', '${PROJECT_ID}', 'github', 102, 'memenow', 'repo-b', 'main',
+       '${NOW}', '${NOW}');
+    INSERT INTO principals
+      (principal_id, issuer, subject, token_digest, created_at)
+    VALUES
+      ('project-maintainer', 'test', 'project-maintainer', 'digest-maintainer', '${NOW}'),
+      ('repo-a-writer', 'test', 'repo-a-writer', 'digest-writer', '${NOW}'),
+      ('repo-a-reader', 'test', 'repo-a-reader', 'digest-reader', '${NOW}');
+    INSERT INTO project_grants
+      (grant_id, project_id, principal_id, role, scope_kind, scope_id, created_at)
+    VALUES
+      ('grant-project', '${PROJECT_ID}', 'project-maintainer', 'maintainer',
+       'project', '${PROJECT_ID}', '${NOW}'),
+      ('grant-a-writer', '${PROJECT_ID}', 'repo-a-writer', 'writer',
+       'repository', 'repository-a', '${NOW}'),
+      ('grant-a-reader', '${PROJECT_ID}', 'repo-a-reader', 'reader',
+       'repository', 'repository-a', '${NOW}');
+    INSERT INTO project_grant_repository_contexts
+      (project_id, grant_id, repository_id, created_at)
+    VALUES
+      ('${PROJECT_ID}', 'grant-a-writer', 'repository-a', '${NOW}'),
+      ('${PROJECT_ID}', 'grant-a-reader', 'repository-a', '${NOW}');
+  `);
+  const memoryDb = new SqliteD1(database);
+  const coordinatorInputs: Array<Record<string, unknown>> = [];
+  const projectCoordinator = {
+    idFromName: () => ({ toString: () => PROJECT_ID }),
+    get: () => ({
+      fetch: async (_url: string, init: RequestInit) => {
+        coordinatorInputs.push(JSON.parse(String(init.body)) as Record<string, unknown>);
+        return Response.json({ accepted: true });
+      }
+    })
+  };
+  return {
+    database,
+    memoryDb,
+    coordinatorInputs,
+    service: (principal) =>
+      new GatewayService(
+        {
+          MEMORY_DB: memoryDb as unknown as D1Database,
+          PAGE_TOKEN_HMAC_KEY: "multi-repository-page-token-test-key",
+          PROJECT_COORDINATOR: projectCoordinator
+        } as unknown as GatewayEnv,
+        principal
+      )
+  };
+}
+
+function seedMemories(database: DatabaseSync): void {
+  database.exec(`
+    INSERT INTO audit_events
+      (audit_id, project_id, sequence, event_type, actor_principal_id, request_digest,
+       previous_event_hash, event_hash, recorded_at)
+    VALUES ('audit-1', '${PROJECT_ID}', 1, 'test.seed', 'project-maintainer',
+            'request-digest', NULL, 'event-hash', '${NOW}');
+    INSERT INTO memories
+      (memory_id, project_id, memory_version, kind, memory_class, scope, scope_id,
+       status, created_at, updated_at)
+    VALUES
+      ('memory-shared', '${PROJECT_ID}', 0, 'fact', 'semantic', 'project', '${PROJECT_ID}',
+       'active', '${NOW}', '2026-07-27T12:03:00.000Z'),
+      ('memory-b', '${PROJECT_ID}', 0, 'fact', 'semantic', 'repository', 'repository-b',
+       'active', '${NOW}', '2026-07-27T12:02:00.000Z'),
+      ('memory-a', '${PROJECT_ID}', 0, 'fact', 'semantic', 'repository', 'repository-a',
+       'active', '${NOW}', '2026-07-27T12:01:00.000Z');
+    INSERT INTO memory_versions
+      (revision_id, project_id, memory_id, memory_version, content, content_sha256,
+       audit_id, recorded_at)
+    VALUES
+      ('revision-shared', '${PROJECT_ID}', 'memory-shared', 1, 'Shared policy.',
+       'sha-shared', 'audit-1', '${NOW}'),
+      ('revision-b', '${PROJECT_ID}', 'memory-b', 1, 'Repository B policy.',
+       'sha-b', 'audit-1', '${NOW}'),
+      ('revision-a', '${PROJECT_ID}', 'memory-a', 1, 'Repository A policy.',
+       'sha-a', 'audit-1', '${NOW}');
+    UPDATE memories
+    SET memory_version = 1,
+        current_revision_id = CASE memory_id
+          WHEN 'memory-shared' THEN 'revision-shared'
+          WHEN 'memory-b' THEN 'revision-b'
+          ELSE 'revision-a'
+        END;
+    INSERT INTO memory_repository_contexts
+      (project_id, memory_id, repository_id, created_at)
+    VALUES
+      ('${PROJECT_ID}', 'memory-a', 'repository-a', '${NOW}'),
+      ('${PROJECT_ID}', 'memory-b', 'repository-b', '${NOW}');
+  `);
+}
+
+function repoWriterPrincipal(): AuthenticatedPrincipal {
+  return { principalId: "repo-a-writer", projectId: PROJECT_ID, role: "writer" };
+}
+
+function repoReaderPrincipal(): AuthenticatedPrincipal {
+  return { principalId: "repo-a-reader", projectId: PROJECT_ID, role: "reader" };
+}
+
+function projectMaintainerPrincipal(): AuthenticatedPrincipal {
+  return {
+    principalId: "project-maintainer",
+    projectId: PROJECT_ID,
+    role: "maintainer"
+  };
+}
+
+function memoryIds(result: Record<string, unknown>): string[] {
+  return (result.memories as Array<{ memory_id: string }>).map((row) => row.memory_id);
+}
+
+function tableCount(database: DatabaseSync, table: string): number {
+  if (!/^[a-z_]+$/u.test(table)) {
+    throw new TypeError("Table names must be simple identifiers.");
+  }
+  return (database.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number })
+    .count;
+}
+
+function mutationTableCounts(database: DatabaseSync): Record<string, number> {
+  return Object.fromEntries(
+    [
+      "memories",
+      "memory_versions",
+      "evidence",
+      "version_evidence",
+      "audit_events",
+      "idempotency_records",
+      "outbox_events"
+    ].map((table) => [table, tableCount(database, table)])
+  );
+}
+
+class SqliteStatement {
+  private bindings: SQLInputValue[] = [];
+
+  constructor(
+    private readonly database: DatabaseSync,
+    private readonly sql: string
+  ) {}
+
+  bind(...bindings: unknown[]): SqliteStatement {
+    this.bindings = bindings as SQLInputValue[];
+    return this;
+  }
+
+  async first<T>(): Promise<T | null> {
+    return (this.statement().get(...this.bindings) as T | undefined) ?? null;
+  }
+
+  async all<T>(): Promise<{ results: T[] }> {
+    return { results: this.statement().all(...this.bindings) as T[] };
+  }
+
+  async run(): Promise<{ meta: { changes: number } }> {
+    return { meta: { changes: Number(this.statement().run(...this.bindings).changes) } };
+  }
+
+  private statement(): StatementSync {
+    return this.database.prepare(this.sql);
+  }
+}
+
+class SqliteD1 {
+  batchCount = 0;
+  beforeBatch: ((batchNumber: number) => void) | undefined;
+
+  constructor(private readonly database: DatabaseSync) {}
+
+  prepare(sql: string): SqliteStatement {
+    return new SqliteStatement(this.database, sql);
+  }
+
+  withSession(_constraint: "first-primary"): SqliteD1 {
+    return this;
+  }
+
+  async batch(statements: SqliteStatement[]): Promise<Array<{ meta: { changes: number } }>> {
+    this.batchCount += 1;
+    this.beforeBatch?.(this.batchCount);
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const results: Array<{ meta: { changes: number } }> = [];
+      for (const statement of statements) {
+        results.push(await statement.run());
+      }
+      this.database.exec("COMMIT");
+      return results;
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+}

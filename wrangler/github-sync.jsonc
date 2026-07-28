@@ -1,0 +1,23 @@
+{
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "edgemneme-github-sync",
+  "main": "../workers/github-sync/index.ts",
+  "compatibility_date": "2026-07-25",
+  "workers_dev": false,
+  "preview_urls": false,
+  "vars": {
+    "GITHUB_SYNC_ENABLED": "false",
+    "GITHUB_CREDENTIAL_VERSION": "unconfigured"
+  },
+  "triggers": {
+    "crons": []
+  },
+  "d1_databases": [
+    {
+      "binding": "MEMORY_DB",
+      "database_name": "edgemneme-memory",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "../migrations"
+    }
+  ]
+}
