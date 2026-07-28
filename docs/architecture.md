@@ -166,11 +166,12 @@ Each project version has a private immutable prefix:
 ```text
 projects/{project_id}/projections/{snapshot_id}/
 ├── manifest.json
+├── README.md
 ├── objects/{hash-prefix}/{memory_id}.md
 ├── revisions/{hash-prefix}/{memory_id}/{revision_id}.md
 └── indexes/
-    ├── by-kind/{kind}/index.json
-    ├── by-class/{memory_class}/index.json
+    ├── by-kind/{kind}/index.{json,md}
+    ├── by-class/{memory_class}/index.{json,md}
     ├── by-scope/{scope_id}/index.json
     └── by-status/{status}/index.json
 ```
