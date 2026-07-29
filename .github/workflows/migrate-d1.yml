@@ -218,7 +218,7 @@ jobs:
             local table="$1"
             local output="$backup_dir/$table.presence.json"
             case "$table" in
-              memory_fts_chunk_ledger|memory_search_projection_deletions|memory_search_projection_write_leases|memory_search_vector_cleanup_receipts|memory_search_vector_cleanup_janitor_state)
+              search_generations|memory_fts|memory_projection_heads|memory_fts_chunk_ledger|memory_search_projection_deletions|memory_search_projection_write_leases|memory_search_vector_cleanup_receipts|memory_search_vector_cleanup_janitor_state)
                 ;;
               *)
                 echo "Refusing to probe an unexpected Search D1 table." >&2
@@ -236,25 +236,9 @@ jobs:
             rm -f -- "$output"
           }
 
-          snapshot_search_table \
-            "search-generations" \
-            "SELECT * FROM search_generations" \
-            "generation_id" \
-            '{"generation_id":"generation_id"}' \
-            500
-          snapshot_search_table \
-            "memory-fts" \
-            "SELECT rowid AS fts_rowid, * FROM memory_fts" \
-            "rowid" \
-            '{"fts_rowid":"rowid"}' \
-            25
-          snapshot_search_table \
-            "memory-projection-heads" \
-            "SELECT * FROM memory_projection_heads" \
-            "generation_id, project_id, memory_id" \
-            '{"generation_id":"generation_id","project_id":"project_id","memory_id":"memory_id"}' \
-            500
-
+          search_generations_present="$(detect_search_table search_generations)"
+          memory_fts_present="$(detect_search_table memory_fts)"
+          projection_heads_present="$(detect_search_table memory_projection_heads)"
           ledger_present="$(detect_search_table memory_fts_chunk_ledger)"
           deletions_present="$(detect_search_table memory_search_projection_deletions)"
           write_leases_present="$(detect_search_table memory_search_projection_write_leases)"
@@ -264,10 +248,32 @@ jobs:
           cleanup_janitor_state_present="$(
             detect_search_table memory_search_vector_cleanup_janitor_state
           )"
+          if [[ "$search_generations_present" == "1" ]]; then
+            snapshot_search_table "search-generations" "SELECT * FROM search_generations" \
+              "generation_id" \
+              '{"generation_id":"generation_id"}' \
+              500
+          else
+            : > "$backup_dir/search-generations.jsonl"
+          fi
+          if [[ "$memory_fts_present" == "1" ]]; then
+            snapshot_search_table "memory-fts" "SELECT rowid AS fts_rowid, * FROM memory_fts" \
+              "rowid" \
+              '{"fts_rowid":"rowid"}' \
+              25
+          else
+            : > "$backup_dir/memory-fts.jsonl"
+          fi
+          if [[ "$projection_heads_present" == "1" ]]; then
+            snapshot_search_table "memory-projection-heads" "SELECT * FROM memory_projection_heads" \
+              "generation_id, project_id, memory_id" \
+              '{"generation_id":"generation_id","project_id":"project_id","memory_id":"memory_id"}' \
+              500
+          else
+            : > "$backup_dir/memory-projection-heads.jsonl"
+          fi
           if [[ "$ledger_present" == "1" ]]; then
-            snapshot_search_table \
-              "memory-fts-chunk-ledger" \
-              "SELECT * FROM memory_fts_chunk_ledger" \
+            snapshot_search_table "memory-fts-chunk-ledger" "SELECT * FROM memory_fts_chunk_ledger" \
               "fts_rowid" \
               '{"fts_rowid":"fts_rowid"}' \
               500
@@ -275,9 +281,7 @@ jobs:
             : > "$backup_dir/memory-fts-chunk-ledger.jsonl"
           fi
           if [[ "$deletions_present" == "1" ]]; then
-            snapshot_search_table \
-              "memory-search-projection-deletions" \
-              "SELECT * FROM memory_search_projection_deletions" \
+            snapshot_search_table "memory-search-projection-deletions" "SELECT * FROM memory_search_projection_deletions" \
               "generation_id, project_id, memory_id" \
               '{"generation_id":"generation_id","project_id":"project_id","memory_id":"memory_id"}' \
               500
@@ -285,9 +289,7 @@ jobs:
             : > "$backup_dir/memory-search-projection-deletions.jsonl"
           fi
           if [[ "$write_leases_present" == "1" ]]; then
-            snapshot_search_table \
-              "memory-search-projection-write-leases" \
-              "SELECT * FROM memory_search_projection_write_leases" \
+            snapshot_search_table "memory-search-projection-write-leases" "SELECT * FROM memory_search_projection_write_leases" \
               "generation_id, project_id, memory_id" \
               '{"generation_id":"generation_id","project_id":"project_id","memory_id":"memory_id"}' \
               500
@@ -295,9 +297,7 @@ jobs:
             : > "$backup_dir/memory-search-projection-write-leases.jsonl"
           fi
           if [[ "$cleanup_receipts_present" == "1" ]]; then
-            snapshot_search_table \
-              "memory-search-vector-cleanup-receipts" \
-              "SELECT * FROM memory_search_vector_cleanup_receipts" \
+            snapshot_search_table "memory-search-vector-cleanup-receipts" "SELECT * FROM memory_search_vector_cleanup_receipts" \
               "generation_id, project_id, memory_id, vector_id" \
               '{"generation_id":"generation_id","project_id":"project_id","memory_id":"memory_id","vector_id":"vector_id"}' \
               500
@@ -305,9 +305,7 @@ jobs:
             : > "$backup_dir/memory-search-vector-cleanup-receipts.jsonl"
           fi
           if [[ "$cleanup_janitor_state_present" == "1" ]]; then
-            snapshot_search_table \
-              "memory-search-vector-cleanup-janitor-state" \
-              "SELECT * FROM memory_search_vector_cleanup_janitor_state" \
+            snapshot_search_table "memory-search-vector-cleanup-janitor-state" "SELECT * FROM memory_search_vector_cleanup_janitor_state" \
               "state_id" \
               '{"state_id":"state_id"}' \
               500
@@ -315,11 +313,23 @@ jobs:
             : > "$backup_dir/memory-search-vector-cleanup-janitor-state.jsonl"
           fi
 
+          search_generations_count="0"
+          memory_fts_count="0"
+          projection_heads_count="0"
           ledger_count="0"
           deletions_count="0"
           write_leases_count="0"
           cleanup_receipts_count="0"
           cleanup_janitor_state_count="0"
+          if [[ "$search_generations_present" == "1" ]]; then
+            search_generations_count="(SELECT COUNT(*) FROM search_generations)"
+          fi
+          if [[ "$memory_fts_present" == "1" ]]; then
+            memory_fts_count="(SELECT COUNT(*) FROM memory_fts)"
+          fi
+          if [[ "$projection_heads_present" == "1" ]]; then
+            projection_heads_count="(SELECT COUNT(*) FROM memory_projection_heads)"
+          fi
           if [[ "$ledger_present" == "1" ]]; then
             ledger_count="(SELECT COUNT(*) FROM memory_fts_chunk_ledger)"
           fi
@@ -336,9 +346,9 @@ jobs:
             cleanup_janitor_state_count="(SELECT COUNT(*) FROM memory_search_vector_cleanup_janitor_state)"
           fi
           count_query="SELECT
-            (SELECT COUNT(*) FROM search_generations) AS search_generations,
-            (SELECT COUNT(*) FROM memory_fts) AS memory_fts,
-            (SELECT COUNT(*) FROM memory_projection_heads) AS memory_projection_heads,
+            $search_generations_count AS search_generations,
+            $memory_fts_count AS memory_fts,
+            $projection_heads_count AS memory_projection_heads,
             $ledger_count AS memory_fts_chunk_ledger,
             $deletions_count AS memory_search_projection_deletions,
             $write_leases_count AS memory_search_projection_write_leases,

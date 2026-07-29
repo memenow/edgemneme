@@ -250,14 +250,26 @@ private R2 logical snapshot of `search_generations`, `memory_fts`, and
 byte-for-byte. The search database remains a projection and must be rebuilt
 from `MEMORY_DB` if a logical restore is insufficient.
 
+For a fresh or partially migrated `SEARCH_DB`, presence-probe each of those
+eight fixed table names before querying it. An absent table is represented by
+an empty checksummed JSONL object and an authoritative row count of zero; never
+issue a snapshot or count query against an absent table.
+
 ## Local validation
 
 ```bash
 pnpm typecheck
 pnpm test
 pnpm test:coverage
+pnpm test:workers
 pnpm wrangler:check
 ```
+
+The top-level Wrangler CLI and the Workers Vitest pool are intentionally pinned
+independently. Before changing either version, require both the local D1
+migration command to exit cleanly and the Worker suite to accept every declared
+compatibility date; a passing migration handler is not sufficient if the CLI
+process remains alive after completion.
 
 Validate D1 after every migration:
 

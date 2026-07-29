@@ -207,28 +207,25 @@ describe("D1 migration backup safety", () => {
     ).toThrow(/successful/iu);
   });
 
-  it("probes only the optional Search projection tables and fails closed on malformed output", () => {
-    expect(
-      detectSearchTablePresence(JSON.stringify(d1Result([])), "memory_fts_chunk_ledger")
-    ).toBe(false);
-    expect(
-      detectSearchTablePresence(
-        JSON.stringify(d1Result([{ table_name: "memory_fts_chunk_ledger" }])),
-        "memory_fts_chunk_ledger"
-      )
-    ).toBe(true);
-    expect(
-      detectSearchTablePresence(
-        JSON.stringify(d1Result([{ table_name: "memory_search_projection_write_leases" }])),
-        "memory_search_projection_write_leases"
-      )
-    ).toBe(true);
-    expect(
-      detectSearchTablePresence(
-        JSON.stringify(d1Result([{ table_name: "memory_search_vector_cleanup_janitor_state" }])),
-        "memory_search_vector_cleanup_janitor_state"
-      )
-    ).toBe(true);
+  it("probes only the eight controlled Search snapshot tables and fails closed on malformed output", () => {
+    const controlledTables = [
+      "search_generations",
+      "memory_fts",
+      "memory_projection_heads",
+      "memory_fts_chunk_ledger",
+      "memory_search_projection_deletions",
+      "memory_search_projection_write_leases",
+      "memory_search_vector_cleanup_receipts",
+      "memory_search_vector_cleanup_janitor_state"
+    ];
+
+    for (const table of controlledTables) {
+      expect(detectSearchTablePresence(JSON.stringify(d1Result([])), table)).toBe(false);
+      expect(
+        detectSearchTablePresence(JSON.stringify(d1Result([{ table_name: table }])), table)
+      ).toBe(true);
+    }
+
     expect(() =>
       detectSearchTablePresence(
         JSON.stringify(d1Result([{ table_name: "memory_projection_heads" }])),
@@ -236,8 +233,14 @@ describe("D1 migration backup safety", () => {
       )
     ).toThrow(/presence output/iu);
     expect(() =>
-      detectSearchTablePresence(JSON.stringify(d1Result([])), "memory_projection_heads")
-    ).toThrow(/optional Search projection tables/iu);
+      detectSearchTablePresence(
+        JSON.stringify(d1Result([{ table_name: "search_generations", unexpected: true }])),
+        "search_generations"
+      )
+    ).toThrow(/presence output/iu);
+    expect(() =>
+      detectSearchTablePresence(JSON.stringify(d1Result([])), "unexpected_search_table")
+    ).toThrow(/Search.*tables/iu);
   });
 
   it("builds injection-safe keyset predicates for integer and composite text cursors", () => {
@@ -337,35 +340,97 @@ describe("D1 migration backup safety", () => {
     expect(() => validateSearchSnapshotCountOutput(JSON.stringify(counts), snapshots)).not.toThrow();
   });
 
-  it("keeps pre-ledger backups query-safe while uploading every logical snapshot", () => {
+  it("gates every Search snapshot and row count on the same fixed table-presence probe", () => {
     const workflow = readFileSync(
       join(process.cwd(), ".github", "workflows", "migrate-d1.yml"),
       "utf8"
     );
+    const snapshots = [
+      {
+        table: "search_generations",
+        label: "search-generations",
+        query: "SELECT * FROM search_generations"
+      },
+      {
+        table: "memory_fts",
+        label: "memory-fts",
+        query: "SELECT rowid AS fts_rowid, * FROM memory_fts"
+      },
+      {
+        table: "memory_projection_heads",
+        label: "memory-projection-heads",
+        query: "SELECT * FROM memory_projection_heads"
+      },
+      {
+        table: "memory_fts_chunk_ledger",
+        label: "memory-fts-chunk-ledger",
+        query: "SELECT * FROM memory_fts_chunk_ledger"
+      },
+      {
+        table: "memory_search_projection_deletions",
+        label: "memory-search-projection-deletions",
+        query: "SELECT * FROM memory_search_projection_deletions"
+      },
+      {
+        table: "memory_search_projection_write_leases",
+        label: "memory-search-projection-write-leases",
+        query: "SELECT * FROM memory_search_projection_write_leases"
+      },
+      {
+        table: "memory_search_vector_cleanup_receipts",
+        label: "memory-search-vector-cleanup-receipts",
+        query: "SELECT * FROM memory_search_vector_cleanup_receipts"
+      },
+      {
+        table: "memory_search_vector_cleanup_janitor_state",
+        label: "memory-search-vector-cleanup-janitor-state",
+        query: "SELECT * FROM memory_search_vector_cleanup_janitor_state"
+      }
+    ];
 
-    expect(workflow).toContain("detect_search_table memory_fts_chunk_ledger");
-    expect(workflow).toContain("detect_search_table memory_search_projection_write_leases");
-    expect(workflow).toContain("detect_search_table memory_search_vector_cleanup_janitor_state");
-    expect(workflow).toContain('"SELECT * FROM memory_search_vector_cleanup_janitor_state"');
-    expect(workflow).toContain('"state_id"');
-    expect(workflow).toContain("AS memory_search_vector_cleanup_janitor_state");
     expect(workflow).toContain("FROM sqlite_master WHERE type = 'table'");
-    expect(workflow).toContain(': > "$backup_dir/memory-fts-chunk-ledger.jsonl"');
-    expect(workflow).toContain(': > "$backup_dir/memory-search-projection-deletions.jsonl"');
-    expect(workflow).toContain(': > "$backup_dir/memory-search-projection-write-leases.jsonl"');
-    expect(workflow).toContain(': > "$backup_dir/memory-search-vector-cleanup-receipts.jsonl"');
-    expect(workflow).toContain(
-      ': > "$backup_dir/memory-search-vector-cleanup-janitor-state.jsonl"'
-    );
-    expect(workflow).toContain(
-      'upload_and_verify "memory-search-projection-write-leases.jsonl" "application/x-ndjson"'
-    );
-    expect(workflow).toContain(
-      'upload_and_verify "memory-search-vector-cleanup-receipts.jsonl" "application/x-ndjson"'
-    );
-    expect(workflow).toContain(
-      'upload_and_verify "memory-search-vector-cleanup-janitor-state.jsonl" "application/x-ndjson"'
-    );
+    for (const snapshot of snapshots) {
+      expect(workflow).toContain(`detect_search_table ${snapshot.table}`);
+      const escapedLabel = snapshot.label.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+      const escapedQuery = snapshot.query.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+      const guardedSnapshot = workflow.match(
+        new RegExp(
+          `if \\[\\[ "\\$([A-Za-z_][A-Za-z0-9_]*)" == "1" \\]\\]; then\\s+` +
+            `snapshot_search_table\\s+"${escapedLabel}"\\s+"${escapedQuery}"[\\s\\S]*?` +
+            `else\\s+: > "\\$backup_dir/${escapedLabel}\\.jsonl"\\s+fi`,
+          "u"
+        )
+      );
+      expect(guardedSnapshot, `${snapshot.table} snapshot must be presence-gated`).not.toBeNull();
+
+      const presenceVariable = guardedSnapshot?.[1];
+      expect(presenceVariable).toBeTypeOf("string");
+      expect(workflow).toMatch(
+        new RegExp(
+          `${presenceVariable}="\\$\\(\\s*detect_search_table\\s+${snapshot.table}\\s*\\)"`,
+          "u"
+        )
+      );
+
+      const countAlias = workflow.match(
+        new RegExp(`\\$([A-Za-z_][A-Za-z0-9_]*) AS ${snapshot.table}(?:,|;)`, "u")
+      );
+      expect(countAlias, `${snapshot.table} count must use a gated value`).not.toBeNull();
+      const countVariable = countAlias?.[1];
+      expect(countVariable).toBeTypeOf("string");
+      expect(workflow).toContain(`${countVariable}="0"`);
+      expect(workflow).toMatch(
+        new RegExp(
+          `if \\[\\[ "\\$${presenceVariable}" == "1" \\]\\]; then\\s+` +
+            `${countVariable}="\\(SELECT COUNT\\(\\*\\) FROM ${snapshot.table}\\)"\\s+fi`,
+          "u"
+        )
+      );
+
+      expect(workflow).toContain(
+        `upload_and_verify "${snapshot.label}.jsonl" "application/x-ndjson"`
+      );
+    }
     expect(workflow).toContain("append-keyset-page");
     expect(workflow).not.toMatch(/LIMIT \$page_size OFFSET/iu);
   });

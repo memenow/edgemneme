@@ -30,11 +30,12 @@
     "@vitest/coverage-istanbul": "4.1.10",
     "typescript": "7.0.2",
     "vitest": "4.1.10",
-    "wrangler": "4.114.0"
+    "wrangler": "4.112.0"
   },
   "pnpm": {
     "overrides": {
-      "@hono/node-server": "2.0.10"
+      "@hono/node-server": "2.0.10",
+      "sharp": "0.35.2"
     }
   }
 }

@@ -13,7 +13,10 @@ const BACKUP_FORMAT = "edgemneme.d1-migration-backup";
 const SEARCH_EXPORT_BOUNDARY = "logical-snapshot-required-because-fts5-is-not-exportable";
 const REPOSITORY_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const EXPECTED_SCHEMA_CACHE = new Map();
-const OPTIONAL_SEARCH_TABLES = new Set([
+const CONTROLLED_SEARCH_TABLES = new Set([
+  "search_generations",
+  "memory_fts",
+  "memory_projection_heads",
   "memory_fts_chunk_ledger",
   "memory_search_projection_deletions",
   "memory_search_projection_write_leases",
@@ -79,8 +82,8 @@ export function extractD1PageRows(source) {
 }
 
 export function detectSearchTablePresence(source, expectedTable) {
-  if (!OPTIONAL_SEARCH_TABLES.has(expectedTable)) {
-    throw new Error("Only optional Search projection tables can be probed.");
+  if (!CONTROLLED_SEARCH_TABLES.has(expectedTable)) {
+    throw new Error("Only controlled Search snapshot tables can be probed.");
   }
   const rows = extractD1PageRows(source);
   if (rows.length === 0) {
