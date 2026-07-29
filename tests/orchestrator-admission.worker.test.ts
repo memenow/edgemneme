@@ -4,6 +4,7 @@ import orchestrator, {
   ProjectCoordinator
 } from "../workers/memory-orchestrator/index";
 import { sha256 } from "../src/security/crypto";
+import { PROJECTION_REBUILD_MAX_SNAPSHOT_CONTENT_BYTES } from "../src/projection/rebuild";
 
 const PROJECT_ID = "synthetic-project";
 
@@ -910,6 +911,58 @@ describe("synthetic cleanup work admission", () => {
     });
   });
 
+  it("fails an oversized legacy snapshot before writing any R2 projection", async () => {
+    const database = new FakeDatabase({
+      admissions: [1, 1, 1],
+      snapshotAuthority: {
+        project_version: 1,
+        memory_count: 1,
+        revision_count: 1,
+        scope_count: 1,
+        content_bytes: PROJECTION_REBUILD_MAX_SNAPSHOT_CONTENT_BYTES + 1,
+        scope_exists: 0
+      }
+    });
+    const steps: string[] = [];
+    const env = environment(database, vi.fn());
+
+    await expect(
+      MemoryWorkflow.prototype.run.call(
+        { env },
+        workflowEvent(),
+        workflowStep(steps)
+      )
+    ).rejects.toThrow(/content bytes/iu);
+
+    expect(env.PROJECTIONS.put).not.toHaveBeenCalled();
+    expect(database.workflowRun).toMatchObject({
+      status: "failed",
+      last_error_code: "INTERNAL"
+    });
+  });
+
+  it("completes a stale memory change without writing any projection", async () => {
+    const database = new FakeDatabase({
+      admissions: [1, 1, 1]
+    });
+    const steps: string[] = [];
+    const env = environment(database, vi.fn());
+
+    await expect(
+      MemoryWorkflow.prototype.run.call(
+        { env },
+        workflowEvent(),
+        workflowStep(steps)
+      )
+    ).resolves.toBeUndefined();
+
+    expect(env.PROJECTIONS.put).not.toHaveBeenCalled();
+    expect(database.workflowRun).toMatchObject({
+      status: "complete",
+      last_error_code: null
+    });
+  });
+
   it("completes a deferred candidate workflow with only the fixed model stage code", async () => {
     const fakeSecret = "fake-secret-from-workers-ai-error";
     const database = new FakeDatabase({
@@ -1578,6 +1631,7 @@ class FakeDatabase {
   readonly ordinaryReconciliationRows: Array<Record<string, unknown>>;
   readonly candidateRows: Array<Record<string, unknown>>;
   readonly repositoryIds: string[];
+  readonly snapshotAuthority: Record<string, unknown> | null;
   private readonly reconciliationReads: Array<Array<Record<string, unknown>>>;
   private readonly ordinaryReconciliationReads: Array<Array<Record<string, unknown>>>;
   private failRunOnceMatching: string | null;
@@ -1594,6 +1648,7 @@ class FakeDatabase {
     failRunOnceMatching?: string;
     candidateRows?: Array<Record<string, unknown>>;
     repositoryIds?: string[];
+    snapshotAuthority?: Record<string, unknown>;
   }) {
     this.admissions = [...options.admissions];
     this.outboxRows = options.outboxRows ?? [];
@@ -1609,6 +1664,7 @@ class FakeDatabase {
     this.workflowRun = options.workflowRun === undefined ? null : { ...options.workflowRun };
     this.candidateRows = (options.candidateRows ?? []).map((row) => ({ ...row }));
     this.repositoryIds = [...(options.repositoryIds ?? [])];
+    this.snapshotAuthority = options.snapshotAuthority ?? null;
   }
 
   withSession(_constraint: "first-primary"): FakeDatabase {
@@ -1667,6 +1723,11 @@ class FakeDatabase {
           return database.workflowRun?.workflow_id === bindings[0]
             ? { ...database.workflowRun }
             : null;
+        }
+        if (sql.includes("AS memory_count")) {
+          return database.snapshotAuthority === null
+            ? null
+            : { ...database.snapshotAuthority };
         }
         return null;
       },

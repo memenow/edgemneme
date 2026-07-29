@@ -322,6 +322,17 @@ class MutationProvenanceDatabase {
             valid_until: null
           };
         }
+        if (sql.includes("AS memory_count")) {
+          expect(statement.bindings).toEqual(["", PROJECT_ID, 7]);
+          return {
+            project_version: 7,
+            memory_count: 1,
+            revision_count: 2,
+            scope_count: 1,
+            content_bytes: 64,
+            scope_exists: 0
+          };
+        }
         if (sql.includes("FROM memory_versions")) {
           expect(statement.bindings).toEqual([PROJECT_ID, TARGET_MEMORY_ID, 1]);
           return {

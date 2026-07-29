@@ -27,6 +27,7 @@ const MAX_RECALL_RESULTS = 20;
 const MAX_RERANK_CANDIDATES = 20;
 const MAX_EMBEDDING_QUERY_CHARACTERS = 4_096;
 const MAX_RERANK_CONTEXT_CHARACTERS = 16_384;
+const D1_MAX_BINDINGS_PER_QUERY = 100;
 
 interface ActiveGenerationRow {
   generation_id: string;
@@ -105,11 +106,25 @@ export class SearchDbExactRecallProvider implements RecallProvider {
     if (input.exactReferences.length === 0) {
       return [];
     }
-    const hardFilters = projectionFilters(input.filters);
-    const exact = exactPredicates(input.exactReferences);
-    const result = await this.database
-      .prepare(
-        `SELECT memory_fts.generation_id, memory_fts.project_id, memory_fts.memory_id,
+    const limit = normalizeLimit(input.limit);
+    const maximumReferenceBindings = input.exactReferences.reduce(
+      (maximum, reference) =>
+        Math.max(maximum, exactReferenceBindingCount(reference)),
+      0
+    );
+    const hardFilters = projectionFiltersWithinBindingBudget(
+      input.filters,
+      maximumReferenceBindings + 1
+    );
+    const referenceBatches = batchExactReferences(
+      input.exactReferences,
+      D1_MAX_BINDINGS_PER_QUERY - hardFilters.bindings.length - 1
+    );
+    const statements = referenceBatches.map((references) => {
+      const exact = exactPredicates(references);
+      return this.database
+        .prepare(
+          `SELECT memory_fts.generation_id, memory_fts.project_id, memory_fts.memory_id,
                 memory_fts.revision_id, memory_fts.chunk_id
          FROM memory_fts
          JOIN memory_projection_heads visibility
@@ -121,10 +136,19 @@ export class SearchDbExactRecallProvider implements RecallProvider {
          ORDER BY memory_fts.memory_id ASC, memory_fts.revision_id ASC,
                   memory_fts.chunk_id ASC
          LIMIT ?`
-      )
-      .bind(...hardFilters.bindings, ...exact.bindings, normalizeLimit(input.limit))
-      .all<ProjectionRow>();
-    return validateProjectionRows(result.results, input, "exact");
+        )
+        .bind(...hardFilters.bindings, ...exact.bindings, limit);
+    });
+    const batchResults = await this.database.batch<ProjectionRow>(statements);
+    const hits = validateProjectionRows(
+      batchResults.flatMap((result) => result.results),
+      input,
+      "exact"
+    );
+    if (batchResults.length === 1) {
+      return hits;
+    }
+    return deduplicateAndSortRecallHits(hits).slice(0, limit);
   }
 }
 
@@ -139,7 +163,7 @@ export class SearchDbLexicalRecallProvider implements RecallProvider {
     if (normalizeLexicalQuery(input.query).ftsQuery !== lexicalQuery) {
       throw new TypeError("The FTS expression must match the normalized lexical query.");
     }
-    const hardFilters = projectionFilters(input.filters);
+    const hardFilters = projectionFiltersWithinBindingBudget(input.filters, 2);
     const result = await this.database
       .prepare(
         `SELECT memory_fts.generation_id, memory_fts.project_id, memory_fts.memory_id,
@@ -253,25 +277,52 @@ export async function createCloudflareSearchPipeline(
   };
 }
 
-function projectionFilters(filters: HardFilterPlan): {
+function projectionFilters(filters: HardFilterPlan, compactLists = false): {
   sql: string;
   bindings: unknown[];
 } {
   const conditions = ["memory_fts.generation_id = ?", "memory_fts.project_id = ?"];
   const bindings: unknown[] = [filters.indexGeneration, filters.projectId];
-  appendInFilter(conditions, bindings, "memory_fts.status", filters.statuses);
-  appendInFilter(conditions, bindings, "memory_fts.kind", filters.kinds);
-  appendInFilter(conditions, bindings, "memory_fts.memory_class", filters.memoryClasses);
+  appendInFilter(
+    conditions,
+    bindings,
+    "memory_fts.status",
+    filters.statuses,
+    compactLists
+  );
+  appendInFilter(
+    conditions,
+    bindings,
+    "memory_fts.kind",
+    filters.kinds,
+    compactLists
+  );
+  appendInFilter(
+    conditions,
+    bindings,
+    "memory_fts.memory_class",
+    filters.memoryClasses,
+    compactLists
+  );
   if (filters.authorizedRepositoryIds !== undefined) {
-    appendInFilter(conditions, bindings, "visibility.repository_partition", [
-      "*",
-      ...filters.authorizedRepositoryIds
-    ]);
+    appendInFilter(
+      conditions,
+      bindings,
+      "visibility.repository_partition",
+      ["*", ...filters.authorizedRepositoryIds],
+      compactLists
+    );
   }
   if (filters.scope !== undefined) {
     conditions.push("memory_fts.scope = ?");
     bindings.push(filters.scope.type);
-    appendInFilter(conditions, bindings, "memory_fts.scope_id", filters.scope.ids);
+    appendInFilter(
+      conditions,
+      bindings,
+      "memory_fts.scope_id",
+      filters.scope.ids,
+      compactLists
+    );
   }
   conditions.push(
     "(memory_fts.valid_from IS NULL OR julianday(memory_fts.valid_from) <= julianday(?))"
@@ -283,11 +334,28 @@ function projectionFilters(filters: HardFilterPlan): {
   return { sql: conditions.join(" AND "), bindings };
 }
 
+function projectionFiltersWithinBindingBudget(
+  filters: HardFilterPlan,
+  reservedBindings: number
+): { sql: string; bindings: unknown[] } {
+  let planned = projectionFilters(filters);
+  if (planned.bindings.length + reservedBindings <= D1_MAX_BINDINGS_PER_QUERY) {
+    return planned;
+  }
+  // Preserve every hard filter while packing its value lists into fewer bindings.
+  planned = projectionFilters(filters, true);
+  if (planned.bindings.length + reservedBindings > D1_MAX_BINDINGS_PER_QUERY) {
+    throw new Error("The search filters exceed D1's binding limit.");
+  }
+  return planned;
+}
+
 function appendInFilter(
   conditions: string[],
   bindings: unknown[],
   column: string,
-  values: readonly string[] | undefined
+  values: readonly string[] | undefined,
+  compact = false
 ): void {
   if (values === undefined) {
     return;
@@ -295,8 +363,51 @@ function appendInFilter(
   if (values.length === 0) {
     throw new TypeError(`${column} requires at least one filter value.`);
   }
+  if (compact) {
+    conditions.push(
+      `${column} IN (SELECT CAST(value AS TEXT) FROM json_each(?))`
+    );
+    bindings.push(JSON.stringify(values));
+    return;
+  }
   conditions.push(`${column} IN (${values.map(() => "?").join(", ")})`);
   bindings.push(...values);
+}
+
+function exactReferenceBindingCount(reference: ExactReference): number {
+  if (reference.type === "memory_id") {
+    return 1;
+  }
+  if (reference.type === "symbol") {
+    return 2;
+  }
+  return 3;
+}
+
+function batchExactReferences(
+  references: readonly ExactReference[],
+  bindingBudget: number
+): ExactReference[][] {
+  const batches: ExactReference[][] = [];
+  let batch: ExactReference[] = [];
+  let usedBindings = 0;
+  for (const reference of references) {
+    const requiredBindings = exactReferenceBindingCount(reference);
+    if (requiredBindings > bindingBudget) {
+      throw new Error("The exact-reference filters exceed D1's binding limit.");
+    }
+    if (batch.length > 0 && usedBindings + requiredBindings > bindingBudget) {
+      batches.push(batch);
+      batch = [];
+      usedBindings = 0;
+    }
+    batch.push(reference);
+    usedBindings += requiredBindings;
+  }
+  if (batch.length > 0) {
+    batches.push(batch);
+  }
+  return batches;
 }
 
 function exactPredicates(references: readonly ExactReference[]): {
@@ -365,6 +476,26 @@ function validateProjectionRows(
   });
 }
 
+function deduplicateAndSortRecallHits(hits: readonly RecallHit[]): RecallHit[] {
+  const unique = new Map<string, RecallHit>();
+  for (const hit of hits) {
+    const key = `${hit.memoryId}\u0000${hit.revisionId}\u0000${hit.chunkId}`;
+    if (!unique.has(key)) {
+      unique.set(key, hit);
+    }
+  }
+  return [...unique.values()].sort(
+    (left, right) =>
+      compareIdentifiers(left.memoryId, right.memoryId) ||
+      compareIdentifiers(left.revisionId, right.revisionId) ||
+      compareIdentifiers(left.chunkId, right.chunkId)
+  );
+}
+
+function compareIdentifiers(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
 function parseEmbedding(raw: unknown): number[] {
   const record = requireRecord(raw, "embedding output");
   if (!Array.isArray(record.data) || record.data.length !== 1) {
@@ -393,7 +524,11 @@ function parseEmbedding(raw: unknown): number[] {
 
 function parseVectorMatches(raw: unknown, input: RecallInput): RecallHit[] {
   const record = requireRecord(raw, "Vectorize output");
-  if (!Array.isArray(record.matches) || record.count !== record.matches.length) {
+  if (
+    !Array.isArray(record.matches) ||
+    record.count !== record.matches.length ||
+    record.matches.length > normalizeLimit(input.limit)
+  ) {
     throw new Error("The Vectorize output is invalid.");
   }
   return record.matches.map((value) => {
@@ -459,9 +594,10 @@ async function validateSemanticProjectionTuples(
       : {
           sql:
             `AND visibility.repository_partition IN (` +
-            ["*", ...input.filters.authorizedRepositoryIds].map(() => "?").join(", ") +
-            ")",
-          bindings: ["*", ...input.filters.authorizedRepositoryIds] as unknown[]
+            `SELECT CAST(value AS TEXT) FROM json_each(?))`,
+          bindings: [
+            JSON.stringify(["*", ...input.filters.authorizedRepositoryIds])
+          ] as unknown[]
         };
   const result = await database
     .prepare(

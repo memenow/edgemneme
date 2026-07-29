@@ -235,6 +235,87 @@ describe("candidate review evidence-to-scope provenance", () => {
     expect(versionEvidence?.[0]?.bindings).not.toContain("memory://candidate/evidence-b");
   });
 
+  it("counts a new scope when admitting a candidate projection", async () => {
+    const database = new ReviewDatabase("repository-a", {
+      snapshotAuthority: {
+        memory_count: 2_487,
+        revision_count: 2_487,
+        scope_count: 2_485,
+        content_bytes: 0,
+        scope_exists: 0
+      }
+    });
+    const coordinator = Object.assign(Object.create(ProjectCoordinator.prototype), {
+      env: reviewEnvironment(database)
+    });
+    const response = await ProjectCoordinator.prototype.fetch.call(
+      coordinator,
+      candidateReviewRequest("repository-a")
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({ code: "VALIDATION_FAILED" });
+    expect(database.batches).toHaveLength(0);
+    expect(database.reads).toContainEqual({
+      sql: expect.stringContaining("AS memory_count"),
+      bindings: ["repository-a", "project-1", 0]
+    });
+  });
+
+  it("does not add another scope when the approved scope already exists", async () => {
+    const database = new ReviewDatabase("repository-a", {
+      snapshotAuthority: {
+        memory_count: 2_487,
+        revision_count: 2_487,
+        scope_count: 2_485,
+        content_bytes: 0,
+        scope_exists: 1
+      }
+    });
+    const coordinator = Object.assign(Object.create(ProjectCoordinator.prototype), {
+      env: reviewEnvironment(database)
+    });
+    const response = await ProjectCoordinator.prototype.fetch.call(
+      coordinator,
+      candidateReviewRequest("repository-a")
+    );
+
+    expect(response.status).toBe(200);
+    expect(database.batches).toHaveLength(1);
+  });
+
+  it.each(["reject", "request_changes"] as const)(
+    "does not apply snapshot capacity admission to %s decisions",
+    async (decision) => {
+      const database = new ReviewDatabase("repository-a", {
+        snapshotAuthority: {
+          memory_count: 20_000,
+          revision_count: 20_000,
+          scope_count: 20_000,
+          content_bytes: 20_000_000,
+          scope_exists: 0
+        }
+      });
+      const coordinator = Object.assign(Object.create(ProjectCoordinator.prototype), {
+        env: reviewEnvironment(database)
+      });
+      const response = await ProjectCoordinator.prototype.fetch.call(
+        coordinator,
+        candidateReviewRequest("repository-a", {}, {
+          decision,
+          reason: "The candidate needs a different disposition.",
+          edits: decision === "request_changes" ? { content: "Revise the durable claim." } : null
+        })
+      );
+
+      expect(response.status).toBe(200);
+      expect(database.batches).toHaveLength(1);
+      expect(database.reads.some((statement) => statement.sql.includes("AS memory_count"))).toBe(
+        false
+      );
+    }
+  );
+
   it.each([
     ["an empty citation list", []],
     ["a forged citation", ["evidence-forged"]]
@@ -375,16 +456,37 @@ class ReviewDatabase {
   readonly reads: CapturedStatement[] = [];
   private readonly citedEvidenceIds: unknown;
   private readonly evidenceRows: Array<Record<string, unknown>>;
+  private readonly snapshotAuthority: {
+    memory_count: number;
+    revision_count: number;
+    scope_count: number;
+    content_bytes: number;
+    scope_exists: number;
+  };
 
   constructor(
     private readonly targetRepositoryId: string,
     options: {
       citedEvidenceIds?: unknown;
       evidenceRows?: Array<Record<string, unknown>>;
+      snapshotAuthority?: {
+        memory_count: number;
+        revision_count: number;
+        scope_count: number;
+        content_bytes: number;
+        scope_exists: number;
+      };
     } = {}
   ) {
     this.citedEvidenceIds = options.citedEvidenceIds ?? ["evidence-a"];
     this.evidenceRows = options.evidenceRows ?? [evidenceRow("evidence-a", "repository-a")];
+    this.snapshotAuthority = options.snapshotAuthority ?? {
+      memory_count: 1,
+      revision_count: 1,
+      scope_count: 1,
+      content_bytes: 32,
+      scope_exists: 1
+    };
   }
 
   withSession(_constraint: "first-primary"): ReviewDatabase {
@@ -443,6 +545,9 @@ class ReviewDatabase {
         }
         if (sql.includes("AS admitted")) {
           return { admitted: 1 };
+        }
+        if (sql.includes("AS memory_count")) {
+          return { project_version: 0, ...database.snapshotAuthority };
         }
         return null;
       },

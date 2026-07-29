@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { PROJECTION_REBUILD_MAX_SNAPSHOT_CONTENT_BYTES } from "../src/projection/rebuild";
 import { ProjectCoordinator } from "../workers/memory-orchestrator/index";
 
 const TARGET_MEMORY_ID = "00000000-0000-4000-8000-000000000010";
@@ -24,6 +25,56 @@ describe("formal memory content admission", () => {
     const response = await ProjectCoordinator.prototype.fetch.call(
       coordinator,
       mutationRequest(operation, payload)
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({ code: "VALIDATION_FAILED" });
+    expect(database.batches).toHaveLength(0);
+  });
+
+  it("rejects a safe correction when the next snapshot would exceed content capacity", async () => {
+    const database = new MutationDatabase("Existing safe content.", {
+      memory_count: 1,
+      revision_count: 1,
+      scope_count: 1,
+      content_bytes: PROJECTION_REBUILD_MAX_SNAPSHOT_CONTENT_BYTES - 2,
+      scope_exists: 0
+    });
+    const coordinator = Object.assign(Object.create(ProjectCoordinator.prototype), {
+      env: environment(database)
+    });
+    const response = await ProjectCoordinator.prototype.fetch.call(
+      coordinator,
+      mutationRequest("correct", { content: "界" })
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({
+      code: "VALIDATION_FAILED",
+      message:
+        "The project cannot accept this formal memory because projection capacity would be exceeded."
+    });
+    expect(database.batches).toHaveLength(0);
+    expect(database.reads).toContainEqual({
+      sql: expect.stringContaining("AS memory_count"),
+      bindings: ["", "project-1", 7]
+    });
+  });
+
+  it("counts the new revision when admitting a formal mutation projection", async () => {
+    const database = new MutationDatabase("Existing safe content.", {
+      memory_count: 2_487,
+      revision_count: 2_487,
+      scope_count: 2_487,
+      content_bytes: 0,
+      scope_exists: 0
+    });
+    const coordinator = Object.assign(Object.create(ProjectCoordinator.prototype), {
+      env: environment(database)
+    });
+    const response = await ProjectCoordinator.prototype.fetch.call(
+      coordinator,
+      mutationRequest("correct", { content: "Corrected safe content." })
     );
 
     expect(response.status).toBe(400);
@@ -80,8 +131,18 @@ interface CapturedStatement {
 
 class MutationDatabase {
   readonly batches: CapturedStatement[][] = [];
+  readonly reads: CapturedStatement[] = [];
 
-  constructor(private readonly storedContent: string) {}
+  constructor(
+    private readonly storedContent: string,
+    private readonly snapshotAuthority: {
+      memory_count: number;
+      revision_count: number;
+      scope_count: number;
+      content_bytes: number;
+      scope_exists: number;
+    } | null = null
+  ) {}
 
   withSession(_constraint: "first-primary"): MutationDatabase {
     return this;
@@ -90,6 +151,7 @@ class MutationDatabase {
   prepare(sql: string) {
     const database = this;
     const statement: CapturedStatement = { sql, bindings: [] };
+    this.reads.push(statement);
     return {
       get sql() {
         return statement.sql;
@@ -124,6 +186,11 @@ class MutationDatabase {
             valid_from: null,
             valid_until: null
           };
+        }
+        if (sql.includes("AS memory_count")) {
+          return database.snapshotAuthority === null
+            ? null
+            : { project_version: 7, ...database.snapshotAuthority };
         }
         if (sql.includes("FROM memory_versions")) {
           return {

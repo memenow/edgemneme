@@ -25,6 +25,11 @@ import {
   MEMORY_STATUSES
 } from "../contracts/taxonomy";
 import { resolveMemoryChangeRepositoryContext } from "../contracts/repository-context";
+import {
+  sameMutationEvidenceProvenance,
+  type MutationEvidenceRecord,
+  type StoredMutationEvidenceProvenance
+} from "../storage/mutation-evidence-plan";
 
 export interface CandidateEvidenceInput {
   source_type: string;
@@ -54,6 +59,15 @@ interface NormalizedWorktreeContext {
   repositoryId: string | null;
   repositoryRef: string | null;
   worktreeId: string | null;
+}
+
+interface CandidateEvidenceRecord extends MutationEvidenceRecord {
+  input: CandidateEvidenceInput;
+}
+
+interface StoredCandidateEvidenceProvenance
+  extends StoredMutationEvidenceProvenance {
+  evidence_id: string;
 }
 
 export type { GatewayEnv } from "./types";
@@ -469,17 +483,77 @@ export class GatewayService {
       workflow_id: inspection.accepted ? candidateId : null
     };
     const candidateContentSha = inspection.accepted ? await sha256(input.content) : null;
-    const evidenceStatements: D1PreparedStatement[] = [];
-    const evidenceLinkStatements: D1PreparedStatement[] = [];
+    const evidenceByTuple = new Map<string, CandidateEvidenceRecord>();
     if (inspection.accepted && candidateContentSha !== null) {
       for (const item of evidence) {
         const locator = namespaceEvidenceLocator(item.locator, session.repositoryId);
         const excerptHash =
           item.excerpt_hash ??
           (await sha256(`${locator}\n${candidateContentSha}`));
-        const evidenceId = await sha256(
-          `${this.principal.projectId}\n${item.source_type}\n${locator}\n${excerptHash}`
-        );
+        const tupleKey = canonicalJson([item.source_type, locator, excerptHash]);
+        const record: CandidateEvidenceRecord = {
+          evidenceId: await sha256(
+            `${this.principal.projectId}\n${item.source_type}\n${locator}\n${excerptHash}`
+          ),
+          sourceType: item.source_type,
+          locator,
+          commitSha: item.commit_sha ?? null,
+          excerptHash,
+          repositoryId: session.repositoryId,
+          repositoryRef: session.repositoryRef,
+          repositoryAuthority:
+            session.repositoryId === null ? null : "agent_supplied",
+          input: item
+        };
+        const duplicate = evidenceByTuple.get(tupleKey);
+        if (duplicate !== undefined) {
+          if (
+            !sameMutationEvidenceProvenance(record, {
+              commit_sha: duplicate.commitSha,
+              repository_id: duplicate.repositoryId,
+              repository_ref: duplicate.repositoryRef,
+              repository_path: null,
+              repository_authority: duplicate.repositoryAuthority,
+              sensitivity_status: "clear"
+            })
+          ) {
+            throw candidateEvidenceConflict();
+          }
+          continue;
+        }
+        evidenceByTuple.set(tupleKey, record);
+      }
+    }
+    const evidenceRecords = [...evidenceByTuple.values()];
+    const primaryDatabase = this.env.MEMORY_DB.withSession("first-primary");
+    await Promise.all(
+      evidenceRecords.map(async (record) => {
+        const stored = await primaryDatabase.prepare(
+          `SELECT evidence_id, commit_sha, repository_id, repository_ref,
+                  repository_path, repository_authority, sensitivity_status
+           FROM evidence
+           WHERE project_id = ? AND source_type = ? AND locator = ? AND excerpt_hash = ?`
+        )
+          .bind(
+            this.principal.projectId,
+            record.sourceType,
+            record.locator,
+            record.excerptHash
+          )
+          .first<StoredCandidateEvidenceProvenance>();
+        if (
+          stored !== null &&
+          (stored.evidence_id !== record.evidenceId ||
+            !sameMutationEvidenceProvenance(record, stored))
+        ) {
+          throw candidateEvidenceConflict();
+        }
+      })
+    );
+    const evidenceStatements: D1PreparedStatement[] = [];
+    const evidenceLinkStatements: D1PreparedStatement[] = [];
+    if (inspection.accepted && candidateContentSha !== null) {
+      for (const record of evidenceRecords) {
         evidenceStatements.push(
           this.env.MEMORY_DB.prepare(
             `INSERT INTO evidence
@@ -492,18 +566,35 @@ export class GatewayService {
                WHERE project_id = ? AND principal_id = ? AND session_id = ?
                  AND observation_id = ?
              )
-             ON CONFLICT(project_id, source_type, locator, excerpt_hash) DO NOTHING`
+             /*
+              * Atomic compare-and-abort guard: immutable evidence triggers accept an
+              * exact replay and abort the whole batch if provenance changed after the
+              * first-primary preflight. The invalid sensitivity branch invokes the
+              * evidence table CHECK constraint instead of clearing quarantined data.
+              */
+             ON CONFLICT(project_id, source_type, locator, excerpt_hash) DO UPDATE SET
+               evidence_id = excluded.evidence_id,
+               commit_sha = excluded.commit_sha,
+               repository_id = excluded.repository_id,
+               repository_ref = excluded.repository_ref,
+               repository_path = excluded.repository_path,
+               repository_authority = excluded.repository_authority,
+               sensitivity_status = CASE
+                 WHEN evidence.sensitivity_status = excluded.sensitivity_status
+                 THEN evidence.sensitivity_status
+                 ELSE 'candidate_evidence_provenance_conflict'
+               END`
           ).bind(
-            evidenceId,
+            record.evidenceId,
             this.principal.projectId,
-            item.source_type,
-            locator,
-            item.commit_sha ?? null,
-            excerptHash,
+            record.sourceType,
+            record.locator,
+            record.commitSha,
+            record.excerptHash,
             now,
-            session.repositoryId,
-            session.repositoryRef,
-            session.repositoryId === null ? null : "agent_supplied",
+            record.repositoryId,
+            record.repositoryRef,
+            record.repositoryAuthority,
             this.principal.projectId,
             this.principal.principalId,
             input.sessionId,
@@ -516,6 +607,10 @@ export class GatewayService {
              (project_id, observation_id, evidence_id, created_at)
              SELECT ?, ?, evidence_id, ? FROM evidence
              WHERE project_id = ? AND source_type = ? AND locator = ? AND excerpt_hash = ?
+               AND evidence_id = ? AND commit_sha IS ?
+               AND repository_id IS ? AND repository_ref IS ?
+               AND repository_path IS NULL AND repository_authority IS ?
+               AND sensitivity_status = 'clear'
                AND EXISTS (
                  SELECT 1 FROM observations
                  WHERE project_id = ? AND principal_id = ? AND session_id = ?
@@ -526,9 +621,14 @@ export class GatewayService {
             candidateId,
             now,
             this.principal.projectId,
-            item.source_type,
-            locator,
-            excerptHash,
+            record.sourceType,
+            record.locator,
+            record.excerptHash,
+            record.evidenceId,
+            record.commitSha,
+            record.repositoryId,
+            record.repositoryRef,
+            record.repositoryAuthority,
             this.principal.projectId,
             this.principal.principalId,
             input.sessionId,
@@ -556,7 +656,9 @@ export class GatewayService {
           response.status,
           inspection.accepted ? input.content : null,
           candidateContentSha,
-          inspection.accepted ? canonicalJson(evidence) : "[]",
+          inspection.accepted
+            ? canonicalJson(evidenceRecords.map((record) => record.input))
+            : "[]",
           now,
           this.principal.projectId,
           this.principal.principalId,
@@ -620,7 +722,9 @@ export class GatewayService {
       ]);
       assertMutationGuardResult(results[0]);
     } catch (error) {
-      const mutationError = await this.translateGatewayMutationError(error);
+      const mutationError = isCandidateEvidenceDatabaseConflict(error)
+        ? candidateEvidenceConflict()
+        : await this.translateGatewayMutationError(error);
       if (
         mutationError instanceof EdgeMnemeError &&
         mutationError.code === "PROJECT_UNAVAILABLE"
@@ -1246,6 +1350,25 @@ function assertMutationGuardResult(result: D1Result | undefined): void {
   if ((result?.meta.changes ?? 0) !== 1) {
     throw new EdgeMnemeError("PROJECT_UNAVAILABLE", "The project is unavailable.");
   }
+}
+
+function candidateEvidenceConflict(): EdgeMnemeError {
+  return new EdgeMnemeError(
+    "VALIDATION_FAILED",
+    "The submitted evidence conflicts with existing immutable provenance."
+  );
+}
+
+function isCandidateEvidenceDatabaseConflict(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+  return (
+    error.message.includes("evidence identity is immutable") ||
+    error.message.includes("evidence repository context is immutable") ||
+    (error.message.includes("CHECK constraint failed") &&
+      error.message.includes("sensitivity_status"))
+  );
 }
 
 function sessionCloseClaimTimestamp(recordedAt: string, eventId: string): string {

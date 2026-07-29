@@ -30,6 +30,14 @@ interface CurrentHeadRow {
   evidence_ids: string | null;
 }
 
+interface AuthorizedSnapshotRow {
+  authorized_snapshot_version: number;
+}
+
+const D1_MAX_BINDINGS_PER_QUERY = 100;
+const CURRENT_HEAD_AUTHORITY_BINDINGS = 3;
+const CURRENT_HEAD_PAIR_BINDINGS = 2;
+
 export class D1CurrentHeadValidator implements CurrentHeadValidator {
   constructor(private readonly database: D1Database) {}
 
@@ -40,16 +48,33 @@ export class D1CurrentHeadValidator implements CurrentHeadValidator {
     }
     const candidates = uniqueCandidates(input.candidates);
     const requestedPairs = uniquePairs(candidates);
-    const pairSql = requestedPairs
-      .map(() => "(m.memory_id = ? AND v.revision_id = ?)")
-      .join(" OR ");
-    const pairBindings = requestedPairs.flatMap((pair) => [pair.memoryId, pair.revisionId]);
-    const hardFilters = authoritativeFilters(input.filters);
-    const repositoryCeiling = authoritativeRepositoryCeiling(input.filters);
+    let hardFilters = authoritativeFilters(input.filters);
+    let repositoryCeiling = authoritativeRepositoryCeiling(input.filters);
+    if (
+      availablePairBindings(hardFilters, repositoryCeiling) <
+      CURRENT_HEAD_PAIR_BINDINGS
+    ) {
+      // Preserve every ACL and hard-filter value while reducing scalar bindings.
+      hardFilters = authoritativeFilters(input.filters, true);
+      repositoryCeiling = authoritativeRepositoryCeiling(input.filters, true);
+    }
+    const pairsPerBatch = Math.floor(
+      availablePairBindings(hardFilters, repositoryCeiling) /
+        CURRENT_HEAD_PAIR_BINDINGS
+    );
+    if (pairsPerBatch < 1) {
+      throw new Error("The current-head filters exceed D1's binding limit.");
+    }
     const session = this.database.withSession("first-primary");
-    const result = await session
-      .prepare(
-        `SELECT m.project_id, m.memory_id, v.revision_id, m.memory_version,
+    // Keep every pair query and the closing authority fence in one D1 transaction.
+    const statements = chunkPairs(requestedPairs, pairsPerBatch).map((pairs) => {
+      const pairSql = pairs
+        .map(() => "(m.memory_id = ? AND v.revision_id = ?)")
+        .join(" OR ");
+      const pairBindings = pairs.flatMap((pair) => [pair.memoryId, pair.revisionId]);
+      return session
+        .prepare(
+          `SELECT m.project_id, m.memory_id, v.revision_id, m.memory_version,
                 v.content, v.content_sha256, m.kind, m.memory_class, m.scope, m.scope_id,
                 m.status, v.valid_from, v.valid_until,
                 group_concat(CASE WHEN e.sensitivity_status = 'clear'
@@ -79,21 +104,65 @@ export class D1CurrentHeadValidator implements CurrentHeadValidator {
                   v.content, v.content_sha256, m.kind, m.memory_class, m.scope,
                   m.scope_id, m.status, v.valid_from, v.valid_until
          ORDER BY m.memory_id ASC, v.revision_id ASC`
-      )
-      .bind(
-        input.principalId,
-        input.projectId,
-        input.snapshotVersion,
-        ...repositoryCeiling.bindings,
-        ...hardFilters.bindings,
-        ...pairBindings
-      )
-      .all<CurrentHeadRow>();
-    return validateCurrentHeads(result.results, candidates, input);
+        )
+        .bind(
+          input.principalId,
+          input.projectId,
+          input.snapshotVersion,
+          ...repositoryCeiling.bindings,
+          ...hardFilters.bindings,
+          ...pairBindings
+        );
+    });
+    statements.push(
+      session
+        .prepare(
+          `SELECT project.project_version AS authorized_snapshot_version
+           FROM projects project
+           JOIN project_grants grant_row
+             ON grant_row.project_id = project.project_id
+            AND grant_row.principal_id = ?
+            AND grant_row.revoked_at IS NULL
+           JOIN principals principal
+             ON principal.principal_id = grant_row.principal_id
+            AND principal.revoked_at IS NULL
+           WHERE project.project_id = ? AND project.project_version = ?
+           LIMIT 1`
+        )
+        .bind(input.principalId, input.projectId, input.snapshotVersion)
+    );
+    const results = await session.batch<CurrentHeadRow | AuthorizedSnapshotRow>(
+      statements
+    );
+    const snapshotResult = results.at(-1);
+    if (!confirmsAuthorizedSnapshot(snapshotResult?.results, input.snapshotVersion)) {
+      return [];
+    }
+    const candidateResults = results.slice(0, -1);
+    const rows = deduplicateAndSortCurrentHeadRows(
+      candidateResults.flatMap((result) => result.results as CurrentHeadRow[]),
+      candidateResults.length > 1
+    );
+    return validateCurrentHeads(rows, candidates, input);
   }
 }
 
-function authoritativeRepositoryCeiling(filters: HardFilterPlan): {
+function availablePairBindings(
+  hardFilters: { bindings: readonly unknown[] },
+  repositoryCeiling: { bindings: readonly unknown[] }
+): number {
+  return (
+    D1_MAX_BINDINGS_PER_QUERY -
+    CURRENT_HEAD_AUTHORITY_BINDINGS -
+    hardFilters.bindings.length -
+    repositoryCeiling.bindings.length
+  );
+}
+
+function authoritativeRepositoryCeiling(
+  filters: HardFilterPlan,
+  compactLists = false
+): {
   sql: string;
   bindings: unknown[];
 } {
@@ -104,32 +173,51 @@ function authoritativeRepositoryCeiling(filters: HardFilterPlan): {
   if (filters.authorizedRepositoryIds.length === 0) {
     return { sql: projectMemory, bindings: [] };
   }
+  const repositoryIds = compactLists
+    ? {
+        sql: "SELECT CAST(value AS TEXT) FROM json_each(?)",
+        bindings: [JSON.stringify(filters.authorizedRepositoryIds)]
+      }
+    : {
+        sql: filters.authorizedRepositoryIds.map(() => "?").join(", "),
+        bindings: [...filters.authorizedRepositoryIds]
+      };
   return {
     sql:
       `(${projectMemory} OR EXISTS (` +
       `SELECT 1 FROM memory_repository_contexts AS request_memory_context ` +
       `WHERE request_memory_context.project_id = m.project_id ` +
       `AND request_memory_context.memory_id = m.memory_id ` +
-      `AND request_memory_context.repository_id IN (` +
-      filters.authorizedRepositoryIds.map(() => "?").join(", ") +
-      ")))" ,
-    bindings: [...filters.authorizedRepositoryIds]
+      `AND request_memory_context.repository_id IN (${repositoryIds.sql})))`,
+    bindings: repositoryIds.bindings
   };
 }
 
-function authoritativeFilters(filters: HardFilterPlan): {
+function authoritativeFilters(filters: HardFilterPlan, compactLists = false): {
   sql: string;
   bindings: unknown[];
 } {
   const conditions: string[] = [];
   const bindings: unknown[] = [];
-  appendInFilter(conditions, bindings, "m.status", filters.statuses);
-  appendInFilter(conditions, bindings, "m.kind", filters.kinds);
-  appendInFilter(conditions, bindings, "m.memory_class", filters.memoryClasses);
+  appendInFilter(conditions, bindings, "m.status", filters.statuses, compactLists);
+  appendInFilter(conditions, bindings, "m.kind", filters.kinds, compactLists);
+  appendInFilter(
+    conditions,
+    bindings,
+    "m.memory_class",
+    filters.memoryClasses,
+    compactLists
+  );
   if (filters.scope !== undefined) {
     conditions.push("m.scope = ?");
     bindings.push(filters.scope.type);
-    appendInFilter(conditions, bindings, "m.scope_id", filters.scope.ids);
+    appendInFilter(
+      conditions,
+      bindings,
+      "m.scope_id",
+      filters.scope.ids,
+      compactLists
+    );
   }
   conditions.push("(v.valid_from IS NULL OR julianday(v.valid_from) <= julianday(?))");
   conditions.push("(v.valid_until IS NULL OR julianday(v.valid_until) > julianday(?))");
@@ -141,7 +229,8 @@ function appendInFilter(
   conditions: string[],
   bindings: unknown[],
   column: string,
-  values: readonly string[] | undefined
+  values: readonly string[] | undefined,
+  compact = false
 ): void {
   if (values === undefined) {
     return;
@@ -149,8 +238,63 @@ function appendInFilter(
   if (values.length === 0) {
     throw new TypeError(`${column} requires at least one filter value.`);
   }
+  if (compact) {
+    conditions.push(
+      `${column} IN (SELECT CAST(value AS TEXT) FROM json_each(?))`
+    );
+    bindings.push(JSON.stringify(values));
+    return;
+  }
   conditions.push(`${column} IN (${values.map(() => "?").join(", ")})`);
   bindings.push(...values);
+}
+
+function chunkPairs(
+  pairs: readonly { memoryId: string; revisionId: string }[],
+  size: number
+): Array<Array<{ memoryId: string; revisionId: string }>> {
+  const chunks: Array<Array<{ memoryId: string; revisionId: string }>> = [];
+  for (let index = 0; index < pairs.length; index += size) {
+    chunks.push(pairs.slice(index, index + size));
+  }
+  return chunks;
+}
+
+function confirmsAuthorizedSnapshot(
+  rows: readonly (CurrentHeadRow | AuthorizedSnapshotRow)[] | undefined,
+  expectedVersion: number
+): boolean {
+  if (rows?.length !== 1) {
+    return false;
+  }
+  const row = rows[0] as Partial<AuthorizedSnapshotRow>;
+  return row.authorized_snapshot_version === expectedVersion;
+}
+
+function deduplicateAndSortCurrentHeadRows(
+  rows: readonly CurrentHeadRow[],
+  sortGlobally: boolean
+): CurrentHeadRow[] {
+  const unique = new Map<string, CurrentHeadRow>();
+  for (const row of rows) {
+    const key = pairKey(String(row.memory_id), String(row.revision_id));
+    if (unique.has(key)) {
+      throw new Error("A current-head pair was returned more than once.");
+    }
+    unique.set(key, row);
+  }
+  const deduplicated = [...unique.values()];
+  return sortGlobally
+    ? deduplicated.sort(
+        (left, right) =>
+          compareIdentifiers(String(left.memory_id), String(right.memory_id)) ||
+          compareIdentifiers(String(left.revision_id), String(right.revision_id))
+      )
+    : deduplicated;
+}
+
+function compareIdentifiers(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function validateAuthorityInput(input: HeadValidationInput): void {

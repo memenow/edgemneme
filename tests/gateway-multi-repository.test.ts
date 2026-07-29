@@ -3,6 +3,7 @@ import { DatabaseSync, type SQLInputValue, type StatementSync } from "node:sqlit
 import { describe, expect, it } from "vitest";
 import { GatewayService, type GatewayEnv } from "../src/gateway/service";
 import type { AuthenticatedPrincipal } from "../src/security/auth";
+import { sha256 } from "../src/security/crypto";
 
 const NOW = "2026-07-27T12:00:00.000Z";
 const PROJECT_ID = "project-1";
@@ -110,6 +111,306 @@ describe("GatewayService multi-repository isolation", () => {
     ).rejects.toMatchObject({ code: "PROJECT_UNAVAILABLE" });
     expect(tableCount(fixture.database, "sessions")).toBe(sessionsBeforeDeniedOpen);
   });
+
+  it("deduplicates repeated candidate evidence with identical provenance", async () => {
+    const fixture = createFixture();
+    const service = fixture.service(repoWriterPrincipal());
+    const opened = await service.openSession({
+      projectRef: PROJECT_REF,
+      agentMeta: { name: "repository-writer" },
+      worktreeMeta: {
+        repository_id: "repository-a",
+        ref: "refs/heads/feature-a"
+      }
+    });
+    const evidence = {
+      source_type: "repository_file",
+      locator: "docs/architecture.md",
+      commit_sha: "a".repeat(40),
+      excerpt_hash: "e".repeat(64)
+    };
+
+    const input = {
+      projectRef: PROJECT_REF,
+      sessionId: String(opened.session_id),
+      content: "Repository A uses D1 as its memory authority.",
+      evidence: [evidence, evidence],
+      idempotencyKey: "candidate-duplicate-evidence"
+    };
+    const candidate = await service.submitCandidate(input);
+    const replay = await service.submitCandidate(input);
+
+    expect(candidate.status).toBe("queued");
+    expect(replay).toEqual(candidate);
+    expect(tableCount(fixture.database, "evidence")).toBe(1);
+    expect(tableCount(fixture.database, "observation_evidence")).toBe(1);
+    const observation = fixture.database
+      .prepare("SELECT evidence_json FROM observations WHERE observation_id = ?")
+      .get(String(candidate.candidate_id)) as { evidence_json: string };
+    expect(JSON.parse(observation.evidence_json)).toEqual([evidence]);
+  });
+
+  it("rejects duplicate candidate evidence with conflicting provenance", async () => {
+    const fixture = createFixture();
+    const service = fixture.service(repoWriterPrincipal());
+    const opened = await service.openSession({
+      projectRef: PROJECT_REF,
+      agentMeta: { name: "repository-writer" },
+      worktreeMeta: {
+        repository_id: "repository-a",
+        ref: "refs/heads/feature-a"
+      }
+    });
+
+    await expect(
+      service.submitCandidate({
+        projectRef: PROJECT_REF,
+        sessionId: String(opened.session_id),
+        content: "Repository A uses D1 as its memory authority.",
+        evidence: [
+          {
+            source_type: "repository_file",
+            locator: "docs/architecture.md",
+            commit_sha: "a".repeat(40),
+            excerpt_hash: "e".repeat(64)
+          },
+          {
+            source_type: "repository_file",
+            locator: "docs/architecture.md",
+            commit_sha: "b".repeat(40),
+            excerpt_hash: "e".repeat(64)
+          }
+        ],
+        idempotencyKey: "candidate-conflicting-duplicate-evidence"
+      })
+    ).rejects.toMatchObject({
+      code: "VALIDATION_FAILED",
+      message: "The submitted evidence conflicts with existing immutable provenance."
+    });
+    expect(tableCount(fixture.database, "observations")).toBe(0);
+    expect(tableCount(fixture.database, "evidence")).toBe(0);
+    expect(tableCount(fixture.database, "observation_evidence")).toBe(0);
+    expect(tableCount(fixture.database, "idempotency_records")).toBe(0);
+    expect(tableCount(fixture.database, "outbox_events")).toBe(0);
+  });
+
+  it("links an exact evidence replay without changing its recorded provenance", async () => {
+    const fixture = createFixture();
+    const service = fixture.service(repoWriterPrincipal());
+    const opened = await service.openSession({
+      projectRef: PROJECT_REF,
+      agentMeta: { name: "repository-writer" },
+      worktreeMeta: {
+        repository_id: "repository-a",
+        ref: "refs/heads/feature-a"
+      }
+    });
+    const excerptHash = "e".repeat(64);
+    const locator = "repository:repository-a:docs/architecture.md";
+    const evidenceId = await sha256(
+      `${PROJECT_ID}\nrepository_file\n${locator}\n${excerptHash}`
+    );
+    const originalRecordedAt = "2026-01-01T00:00:00.000Z";
+    fixture.database
+      .prepare(
+        `INSERT INTO evidence
+         (evidence_id, project_id, source_type, locator, commit_sha, excerpt_hash,
+          sensitivity_status, recorded_at, repository_id, repository_ref,
+          repository_path, repository_authority)
+         VALUES (?, ?, 'repository_file', ?, ?, ?, 'clear', ?, 'repository-a',
+                 'refs/heads/feature-a', NULL, 'agent_supplied')`
+      )
+      .run(
+        evidenceId,
+        PROJECT_ID,
+        locator,
+        "a".repeat(40),
+        excerptHash,
+        originalRecordedAt
+      );
+
+    const candidate = await service.submitCandidate({
+      projectRef: PROJECT_REF,
+      sessionId: String(opened.session_id),
+      content: "Repository A uses D1 as its memory authority.",
+      evidence: [
+        {
+          source_type: "repository_file",
+          locator: "docs/architecture.md",
+          commit_sha: "a".repeat(40),
+          excerpt_hash: excerptHash
+        }
+      ],
+      idempotencyKey: "candidate-exact-evidence-replay"
+    });
+
+    expect(candidate.status).toBe("queued");
+    expect(
+      fixture.database
+        .prepare(
+          `SELECT recorded_at, sensitivity_status FROM evidence
+           WHERE evidence_id = ?`
+        )
+        .get(evidenceId)
+    ).toEqual({
+      recorded_at: originalRecordedAt,
+      sensitivity_status: "clear"
+    });
+    expect(tableCount(fixture.database, "evidence")).toBe(1);
+    expect(tableCount(fixture.database, "observation_evidence")).toBe(1);
+  });
+
+  it.each([
+    ["commit", { commit_sha: "b".repeat(40) }],
+    ["repository", { repository_id: "repository-b" }],
+    ["ref", { repository_ref: "refs/heads/other" }],
+    ["path", { repository_path: "docs/architecture.md" }],
+    ["authority", { repository_authority: "tracked_ref" }],
+    ["sensitivity", { sensitivity_status: "quarantined" }]
+  ] as const)(
+    "rejects existing candidate evidence with conflicting immutable %s provenance",
+    async (_name, conflict) => {
+      const stored = conflict as {
+        commit_sha?: string;
+        repository_id?: string;
+        repository_ref?: string;
+        repository_path?: string;
+        repository_authority?: string;
+        sensitivity_status?: string;
+      };
+      const fixture = createFixture();
+      const service = fixture.service(repoWriterPrincipal());
+      const opened = await service.openSession({
+        projectRef: PROJECT_REF,
+        agentMeta: { name: "repository-writer" },
+        worktreeMeta: {
+          repository_id: "repository-a",
+          ref: "refs/heads/feature-a"
+        }
+      });
+      fixture.database
+        .prepare(
+          `INSERT INTO evidence
+           (evidence_id, project_id, source_type, locator, commit_sha, excerpt_hash,
+            sensitivity_status, recorded_at, repository_id, repository_ref,
+            repository_path, repository_authority)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          await sha256(
+            `${PROJECT_ID}\nrepository_file\nrepository:repository-a:docs/architecture.md\n${"e".repeat(64)}`
+          ),
+          PROJECT_ID,
+          "repository_file",
+          "repository:repository-a:docs/architecture.md",
+          stored.commit_sha ?? "a".repeat(40),
+          "e".repeat(64),
+          stored.sensitivity_status ?? "clear",
+          NOW,
+          stored.repository_id ?? "repository-a",
+          stored.repository_ref ?? "refs/heads/feature-a",
+          stored.repository_path ?? null,
+          stored.repository_authority ?? "agent_supplied"
+        );
+
+      await expect(
+        service.submitCandidate({
+          projectRef: PROJECT_REF,
+          sessionId: String(opened.session_id),
+          content: "Repository A uses D1 as its memory authority.",
+          evidence: [
+            {
+              source_type: "repository_file",
+              locator: "docs/architecture.md",
+              commit_sha: "a".repeat(40),
+              excerpt_hash: "e".repeat(64)
+            }
+          ],
+          idempotencyKey: `candidate-existing-conflict-${_name}`
+        })
+      ).rejects.toMatchObject({
+        code: "VALIDATION_FAILED",
+        message: "The submitted evidence conflicts with existing immutable provenance."
+      });
+      expect(tableCount(fixture.database, "observations")).toBe(0);
+      expect(tableCount(fixture.database, "evidence")).toBe(1);
+      expect(tableCount(fixture.database, "observation_evidence")).toBe(0);
+      expect(tableCount(fixture.database, "idempotency_records")).toBe(0);
+      expect(tableCount(fixture.database, "outbox_events")).toBe(0);
+    }
+  );
+
+  it.each([
+    ["commit", "b".repeat(40), "clear"],
+    ["sensitivity", "a".repeat(40), "quarantined"]
+  ] as const)(
+    "rolls back a candidate when evidence %s provenance conflicts after preflight",
+    async (conflictName, storedCommitSha, storedSensitivity) => {
+      const fixture = createFixture();
+      const service = fixture.service(repoWriterPrincipal());
+      const opened = await service.openSession({
+        projectRef: PROJECT_REF,
+        agentMeta: { name: "repository-writer" },
+        worktreeMeta: {
+          repository_id: "repository-a",
+          ref: "refs/heads/feature-a"
+        }
+      });
+      const expectedEvidenceId = await sha256(
+        `${PROJECT_ID}\nrepository_file\nrepository:repository-a:docs/architecture.md\n${"e".repeat(64)}`
+      );
+      fixture.memoryDb.beforeBatch = (batchNumber) => {
+        if (batchNumber !== 3) {
+          return;
+        }
+        fixture.database
+          .prepare(
+            `INSERT INTO evidence
+             (evidence_id, project_id, source_type, locator, commit_sha, excerpt_hash,
+              sensitivity_status, recorded_at, repository_id, repository_ref,
+              repository_path, repository_authority)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'agent_supplied')`
+          )
+          .run(
+            expectedEvidenceId,
+            PROJECT_ID,
+            "repository_file",
+            "repository:repository-a:docs/architecture.md",
+            storedCommitSha,
+            "e".repeat(64),
+            storedSensitivity,
+            NOW,
+            "repository-a",
+            "refs/heads/feature-a"
+          );
+      };
+
+      await expect(
+        service.submitCandidate({
+          projectRef: PROJECT_REF,
+          sessionId: String(opened.session_id),
+          content: "Repository A uses D1 as its memory authority.",
+          evidence: [
+            {
+              source_type: "repository_file",
+              locator: "docs/architecture.md",
+              commit_sha: "a".repeat(40),
+              excerpt_hash: "e".repeat(64)
+            }
+          ],
+          idempotencyKey: `candidate-racing-evidence-${conflictName}-conflict`
+        })
+      ).rejects.toMatchObject({
+        code: "VALIDATION_FAILED",
+        message: "The submitted evidence conflicts with existing immutable provenance."
+      });
+      expect(tableCount(fixture.database, "observations")).toBe(0);
+      expect(tableCount(fixture.database, "evidence")).toBe(1);
+      expect(tableCount(fixture.database, "observation_evidence")).toBe(0);
+      expect(tableCount(fixture.database, "idempotency_records")).toBe(0);
+      expect(tableCount(fixture.database, "outbox_events")).toBe(0);
+    }
+  );
 
   it("returns project memory plus only the authorized repository before pagination", async () => {
     const fixture = createFixture();
@@ -367,7 +668,10 @@ function createFixture(): {
     "migrations/0003_validity_interval_guard.sql",
     "migrations/0004_synthetic_cleanup_registry_and_validity_preflight.sql",
     "migrations/0005_synthetic_cleanup_fence.sql",
-    "migrations/0006_repository_scope_context.sql"
+    "migrations/0006_repository_scope_context.sql",
+    "migrations/0007_repository_scope_hardening.sql",
+    "migrations/0008_canonical_repository_scope_ownership.sql",
+    "migrations/0009_repository_scope_runtime_guards.sql"
   ]) {
     database.exec(readFileSync(migration, "utf8"));
   }

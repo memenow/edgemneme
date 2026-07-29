@@ -1,6 +1,11 @@
 import { readFileSync } from "node:fs";
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import { describe, expect, it } from "vitest";
+import {
+  MEMORY_CLASSES,
+  MEMORY_KINDS,
+  MEMORY_STATUSES
+} from "../src/contracts/taxonomy";
 import { D1CurrentHeadValidator } from "../src/search/cloudflare";
 import { SearchPipeline } from "../src/search/pipeline";
 import { planHardFilters } from "../src/search/planning";
@@ -67,6 +72,37 @@ describe("D1 current-head repository authorization", () => {
         candidates: [hit("memory-x")]
       })
     ).rejects.toThrow("project or generation boundary");
+  });
+
+  it("executes compact JSON filters for maximum legal filter lists", async () => {
+    const fixture = createFixture();
+    const repositoryIds = [
+      "repository-a",
+      ...Array.from(
+        { length: 49 },
+        (_, index) => `repository-extra-${String(index).padStart(2, "0")}`
+      )
+    ];
+    const results = await new D1CurrentHeadValidator(
+      new SqliteD1(fixture.database) as unknown as D1Database
+    ).validate({
+      projectId: "project-1",
+      principalId: "principal-a",
+      snapshotVersion: 3,
+      filters: planHardFilters({
+        projectId: "project-1",
+        authorizedRepositoryIds: repositoryIds,
+        statuses: MEMORY_STATUSES,
+        kinds: MEMORY_KINDS,
+        memoryClasses: MEMORY_CLASSES,
+        scope: { type: "repository", ids: repositoryIds },
+        indexGeneration: GENERATION,
+        validAt: NOW
+      }),
+      candidates: [hit("memory-a")]
+    });
+
+    expect(results.map((result) => result.memoryId)).toEqual(["memory-a"]);
   });
 
   it("abstains for quarantined or tombstone-only evidence and accepts a clear citation", async () => {
@@ -381,6 +417,23 @@ class SqliteD1 {
 
   prepare(sql: string): SqliteD1Statement {
     return new SqliteD1Statement(this.database, sql);
+  }
+
+  async batch<T>(
+    statements: SqliteD1Statement[]
+  ): Promise<Array<{ results: T[] }>> {
+    this.database.exec("BEGIN");
+    try {
+      const results: Array<{ results: T[] }> = [];
+      for (const statement of statements) {
+        results.push(await statement.all<T>());
+      }
+      this.database.exec("COMMIT");
+      return results;
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   withSession(_constraint: "first-primary"): SqliteD1 {

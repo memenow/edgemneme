@@ -44,6 +44,9 @@ import {
 } from "../../src/search/indexing";
 import { reapSearchVectorCleanupReceipts } from "../../src/search/vector-cleanup-janitor";
 import {
+  calculateProjectionSnapshotCapacityAfterChange,
+  checkProjectionSnapshotCapacity,
+  readProjectionSnapshotAuthority,
   runProjectionRebuild,
   type ProjectionRebuildRequest
 } from "../../src/projection/rebuild";
@@ -389,6 +392,51 @@ function mutationEvidenceConflict(): EdgeMnemeError {
   );
 }
 
+function projectionCapacityExceeded(): EdgeMnemeError {
+  return new EdgeMnemeError(
+    "VALIDATION_FAILED",
+    "The project cannot accept this formal memory because projection capacity would be exceeded."
+  );
+}
+
+async function requireFormalProjectionCapacity(input: {
+  database: D1Database;
+  projectId: string;
+  expectedProjectVersion: number;
+  content: string;
+  addsMemory: boolean;
+  scopeId: string | null;
+}): Promise<void> {
+  const authority = await readProjectionSnapshotAuthority(
+    input.database.withSession("first-primary"),
+    input.projectId,
+    input.expectedProjectVersion,
+    input.scopeId
+  );
+  if (authority === null) {
+    throw new EdgeMnemeError("VERSION_CONFLICT", "The expected version is stale.");
+  }
+  if (authority.scope_exists !== 0 && authority.scope_exists !== 1) {
+    throw projectionCapacityExceeded();
+  }
+  try {
+    const capacity = calculateProjectionSnapshotCapacityAfterChange(authority, {
+      memoryCount: input.addsMemory ? 1 : 0,
+      revisionCount: 1,
+      scopeCount: input.addsMemory && authority.scope_exists === 0 ? 1 : 0,
+      contentBytes: new TextEncoder().encode(input.content).byteLength
+    });
+    if (!capacity.accepted) {
+      throw projectionCapacityExceeded();
+    }
+  } catch (error) {
+    if (error instanceof EdgeMnemeError) {
+      throw error;
+    }
+    throw projectionCapacityExceeded();
+  }
+}
+
 export class ProjectCoordinator extends DurableObject<Env> {
   override async fetch(request: Request): Promise<Response> {
     const requestId = crypto.randomUUID();
@@ -490,6 +538,14 @@ export class ProjectCoordinator extends DurableObject<Env> {
           "The submitted data cannot be persisted safely."
         );
       }
+      await requireFormalProjectionCapacity({
+        database: this.env.MEMORY_DB,
+        projectId: input.project_id,
+        expectedProjectVersion: input.expected_project_version,
+        content: revision.content,
+        addsMemory: false,
+        scopeId: null
+      });
       const now = new Date().toISOString();
       const revisionId = crypto.randomUUID();
       const nextProjectVersion = input.expected_project_version + 1;
@@ -863,6 +919,14 @@ export class ProjectCoordinator extends DurableObject<Env> {
           "The memory validity interval is invalid."
         );
       }
+      await requireFormalProjectionCapacity({
+        database: this.env.MEMORY_DB,
+        projectId: input.project_id,
+        expectedProjectVersion: current.project_version,
+        content,
+        addsMemory: true,
+        scopeId
+      });
       plan = buildCandidatePromotionPlan({
         projectId: input.project_id,
         expectedProjectVersion: current.project_version,
@@ -1206,6 +1270,14 @@ export class MemoryWorkflow extends WorkflowEntrypoint<Env, WorkflowPayload> {
             event.payload.type === "memory.changed" &&
             event.payload.projectVersion !== undefined
           ) {
+            const projectionCurrent = await checkProjectionSnapshotCapacity(
+              this.env.MEMORY_DB,
+              event.payload.projectId,
+              event.payload.projectVersion
+            );
+            if (!projectionCurrent) {
+              return null;
+            }
             await publishProjectProjection({
               memoryDb: this.env.MEMORY_DB,
               projections: this.env.PROJECTIONS,

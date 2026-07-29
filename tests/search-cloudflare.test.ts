@@ -38,9 +38,19 @@ function fakeDatabase(
           return this;
         },
         async all() {
-          return { results: rows, success: true, meta: {} };
+          return {
+            results:
+              sql.includes("authorized_snapshot_version")
+                ? [{ authorized_snapshot_version: record.bindings.at(-1) }]
+                : rows,
+            success: true,
+            meta: {}
+          };
         }
       };
+    },
+    async batch(statements: Array<{ all(): Promise<unknown> }>) {
+      return Promise.all(statements.map((statement) => statement.all()));
     },
     withSession(mode: string) {
       options.sessionModes?.push(mode);

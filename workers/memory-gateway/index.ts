@@ -23,6 +23,21 @@ interface Env extends GatewayEnv {
   MCP_PRINCIPAL_LIMITER: RateLimit;
 }
 
+const CORS_ALLOWED_METHODS = "GET, POST, DELETE";
+const CORS_ALLOWED_HEADERS = [
+  "Authorization",
+  "Content-Type",
+  "Accept",
+  "MCP-Protocol-Version",
+  "MCP-Session-Id",
+  "Last-Event-ID"
+].join(", ");
+const CORS_EXPOSED_HEADERS = [
+  "MCP-Protocol-Version",
+  "MCP-Session-Id",
+  "Retry-After"
+].join(", ");
+
 const projectRef = z.string().min(8).max(256);
 const identifier = z.string().uuid();
 const idempotencyKey = z.string().min(8).max(256);
@@ -73,12 +88,17 @@ const evidence = z.array(
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const requestId = crypto.randomUUID();
+    let corsOrigin: string | null = null;
     try {
       const url = new URL(request.url);
       if (url.pathname !== "/mcp") {
         return new Response("Not Found", { status: 404 });
       }
       validateOrigin(request, env.ALLOWED_ORIGINS);
+      corsOrigin = request.headers.get("origin");
+      if (isCorsPreflight(request, corsOrigin)) {
+        return corsPreflightResponse(corsOrigin);
+      }
       const edgeLimit = await env.MCP_EDGE_LIMITER.limit({ key: "/mcp" });
       const clientLimit = await env.MCP_CLIENT_LIMITER.limit({
         key: request.headers.get("cf-connecting-ip") ?? "unidentified-client"
@@ -104,10 +124,13 @@ export default {
         });
       }
       const server = createServer(env, principal, requestId);
-      return await createMcpHandler(server, {
-        route: "/mcp",
-        enableJsonResponse: true
-      })(request, env, ctx);
+      return withCorsHeaders(
+        await createMcpHandler(server, {
+          route: "/mcp",
+          enableJsonResponse: true
+        })(request, env, ctx),
+        corsOrigin
+      );
     } catch (error) {
       const body = errorBody(error, requestId);
       const status =
@@ -118,13 +141,69 @@ export default {
               ? 429
               : 500
           : 500;
-      return Response.json(body, {
-        status,
-        headers: { "cache-control": "no-store" }
-      });
+      return withCorsHeaders(
+        Response.json(body, {
+          status,
+          headers: { "cache-control": "no-store" }
+        }),
+        corsOrigin
+      );
     }
   }
 } satisfies ExportedHandler<Env>;
+
+function isCorsPreflight(request: Request, origin: string | null): origin is string {
+  return (
+    request.method === "OPTIONS" &&
+    origin !== null &&
+    request.headers.has("access-control-request-method")
+  );
+}
+
+function corsPreflightResponse(origin: string): Response {
+  const headers = new Headers({
+    "access-control-allow-headers": CORS_ALLOWED_HEADERS,
+    "access-control-allow-methods": CORS_ALLOWED_METHODS,
+    "access-control-max-age": "600"
+  });
+  appendVary(headers, "Access-Control-Request-Method", "Access-Control-Request-Headers");
+  return withCorsHeaders(new Response(null, { status: 204, headers }), origin);
+}
+
+function withCorsHeaders(response: Response, origin: string | null): Response {
+  if (origin === null) {
+    return response;
+  }
+  const headers = new Headers(response.headers);
+  headers.set("access-control-allow-origin", origin);
+  headers.set("access-control-expose-headers", CORS_EXPOSED_HEADERS);
+  appendVary(headers, "Origin");
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers
+  });
+}
+
+function appendVary(headers: Headers, ...values: string[]): void {
+  const existing = headers
+    .get("vary")
+    ?.split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+  if (existing?.includes("*")) {
+    return;
+  }
+  const vary = existing ?? [];
+  const normalized = new Set(vary.map((value) => value.toLowerCase()));
+  for (const value of values) {
+    if (!normalized.has(value.toLowerCase())) {
+      vary.push(value);
+      normalized.add(value.toLowerCase());
+    }
+  }
+  headers.set("vary", vary.join(", "));
+}
 
 function createServer(
   env: Env,

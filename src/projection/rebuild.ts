@@ -71,12 +71,20 @@ interface ProjectionRebuildEnvironment {
   AI: Ai;
 }
 
-interface SnapshotAuthorityRow {
+export interface ProjectionSnapshotAuthority {
   project_version: number;
   memory_count: number;
   revision_count: number;
   scope_count: number;
   content_bytes: number;
+  scope_exists: number;
+}
+
+export interface ProjectionSnapshotCapacityDelta {
+  memoryCount: number;
+  revisionCount: number;
+  scopeCount: number;
+  contentBytes: number;
 }
 
 interface SnapshotHeadRow {
@@ -205,27 +213,11 @@ async function requireSnapshotAuthority(
 ): Promise<void> {
   await requireProjectAdmission(env.MEMORY_DB, projectId);
   const session = env.MEMORY_DB.withSession("first-primary");
-  const authority = await session
-    .prepare(
-      `SELECT p.project_version,
-              (SELECT COUNT(*) FROM memories m
-               WHERE m.project_id = p.project_id
-                 AND m.current_revision_id IS NOT NULL) AS memory_count,
-              (SELECT COUNT(*) FROM memory_versions v
-               WHERE v.project_id = p.project_id) AS revision_count,
-              (SELECT COUNT(DISTINCT m.scope_id) FROM memories m
-               WHERE m.project_id = p.project_id
-                 AND m.current_revision_id IS NOT NULL) AS scope_count,
-              COALESCE((
-                SELECT SUM(length(CAST(v.content AS BLOB)))
-                FROM memory_versions v
-                WHERE v.project_id = p.project_id
-              ), 0) AS content_bytes
-       FROM projects p
-       WHERE p.project_id = ?`
-    )
-    .bind(projectId)
-    .first<SnapshotAuthorityRow>();
+  const authority = await readProjectionSnapshotAuthority(
+    session,
+    projectId,
+    projectVersion
+  );
   const heads = await session
     .prepare(
       `SELECT m.memory_id, m.current_revision_id AS revision_id,
@@ -269,7 +261,7 @@ async function requireSnapshotAuthority(
   ) {
     throw new Error("The projection rebuild authority changed.");
   }
-  requireSnapshotCapacity(authority);
+  requireSnapshotCapacityAuthority(authority);
   await requireActiveGeneration(env.SEARCH_DB, request.searchGenerationId);
 }
 
@@ -363,7 +355,71 @@ export function calculateProjectionRebuildSnapshotCapacity(
   };
 }
 
-function requireSnapshotCapacity(authority: SnapshotAuthorityRow): void {
+export function calculateProjectionSnapshotCapacityAfterChange(
+  authority: ProjectionSnapshotAuthority,
+  delta: ProjectionSnapshotCapacityDelta
+): ProjectionRebuildSnapshotCapacity {
+  return calculateProjectionRebuildSnapshotCapacity({
+    memoryCount: authority.memory_count + delta.memoryCount,
+    revisionCount: authority.revision_count + delta.revisionCount,
+    scopeCount: authority.scope_count + delta.scopeCount,
+    contentBytes: authority.content_bytes + delta.contentBytes
+  });
+}
+
+export async function readProjectionSnapshotAuthority(
+  database: Pick<D1Database, "prepare">,
+  projectId: string,
+  expectedProjectVersion: number,
+  scopeId: string | null = null
+): Promise<ProjectionSnapshotAuthority | null> {
+  return database
+    .prepare(
+      `SELECT p.project_version,
+              (SELECT COUNT(*) FROM memories m
+               WHERE m.project_id = p.project_id
+                 AND m.current_revision_id IS NOT NULL) AS memory_count,
+              (SELECT COUNT(*) FROM memory_versions v
+               WHERE v.project_id = p.project_id) AS revision_count,
+              (SELECT COUNT(DISTINCT m.scope_id) FROM memories m
+               WHERE m.project_id = p.project_id
+                 AND m.current_revision_id IS NOT NULL) AS scope_count,
+              COALESCE((
+                SELECT SUM(length(CAST(v.content AS BLOB)))
+                FROM memory_versions v
+                WHERE v.project_id = p.project_id
+              ), 0) AS content_bytes,
+              EXISTS(
+                SELECT 1 FROM memories m
+                WHERE m.project_id = p.project_id
+                  AND m.current_revision_id IS NOT NULL
+                  AND m.scope_id = ?
+              ) AS scope_exists
+       FROM projects p
+       WHERE p.project_id = ? AND p.project_version = ?`
+    )
+    .bind(scopeId ?? "", projectId, expectedProjectVersion)
+    .first<ProjectionSnapshotAuthority>();
+}
+
+export async function checkProjectionSnapshotCapacity(
+  database: D1Database,
+  projectId: string,
+  expectedProjectVersion: number
+): Promise<boolean> {
+  const authority = await readProjectionSnapshotAuthority(
+    database.withSession("first-primary"),
+    projectId,
+    expectedProjectVersion
+  );
+  if (authority === null) {
+    return false;
+  }
+  requireSnapshotCapacityAuthority(authority);
+  return true;
+}
+
+function requireSnapshotCapacityAuthority(authority: ProjectionSnapshotAuthority): void {
   const capacity = calculateProjectionRebuildSnapshotCapacity({
     memoryCount: authority.memory_count,
     revisionCount: authority.revision_count,
