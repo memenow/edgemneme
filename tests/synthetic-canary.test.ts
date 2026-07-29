@@ -320,8 +320,17 @@ describe("synthetic production canary support", () => {
       revisionId: "revision-1",
       chunkId: "chunk-0",
       generationId: "generation-1",
-      repositoryPartition: "*"
+      repositoryPartition: "*",
+      kind: "fact",
+      memoryClass: "semantic",
+      scope: "project",
+      scopeId: "project-1",
+      validFromEpochMs: Number.MIN_SAFE_INTEGER,
+      validUntilEpochMs: Number.MAX_SAFE_INTEGER
     };
+    const scopeKey = createHash("sha256")
+      .update(JSON.stringify(["edgemneme.vector.scope", "project", "project-1"]))
+      .digest("hex");
     const vector = {
       id: "vector-1",
       namespace: "project-1",
@@ -333,7 +342,14 @@ describe("synthetic production canary support", () => {
         chunk_id: "chunk-0",
         model_generation: "generation-1",
         status: "active",
-        repository_partition: "*"
+        repository_partition: "*",
+        kind: "fact",
+        memory_class: "semantic",
+        scope: "project",
+        scope_id: "project-1",
+        scope_key: scopeKey,
+        valid_from_epoch_ms: Number.MIN_SAFE_INTEGER,
+        valid_until_epoch_ms: Number.MAX_SAFE_INTEGER
       }
     };
 

@@ -941,7 +941,7 @@ describe("synthetic cleanup work admission", () => {
     });
   });
 
-  it("completes a stale memory change without writing any projection", async () => {
+  it("skips a stale project snapshot while attempting the memory search projection", async () => {
     const database = new FakeDatabase({
       admissions: [1, 1, 1]
     });
@@ -957,6 +957,9 @@ describe("synthetic cleanup work admission", () => {
     ).resolves.toBeUndefined();
 
     expect(env.PROJECTIONS.put).not.toHaveBeenCalled();
+    expect(env.SEARCH_DB.prepare).toHaveBeenCalledWith(
+      expect.stringContaining("FROM search_generations")
+    );
     expect(database.workflowRun).toMatchObject({
       status: "complete",
       last_error_code: null
@@ -1584,7 +1587,7 @@ function environment(
   workflowGet = vi.fn(),
   ai: unknown = {}
 ) {
-  const emptySearchStatement = {
+  const emptySearchStatement = (sql: string) => ({
     bind() {
       return this;
     },
@@ -1597,15 +1600,30 @@ function environment(
       };
     },
     async all() {
-      return { results: [] };
+      return {
+        results: sql.includes("FROM search_generations")
+          ? [
+              {
+                generation_id: "qwen3-embedding-0.6b-chunk-2026-07-25",
+                embedding_model: "@cf/qwen/qwen3-embedding-0.6b",
+                embedding_dimensions: 1024,
+                distance_metric: "cosine",
+                instruction_version: "query-schema-2026-07-25",
+                chunk_schema_version: "chunk-schema-2026-07-25",
+                reranker_model: "@cf/baai/bge-reranker-base",
+                activated_at: "2026-07-25T00:00:00.000Z"
+              }
+            ]
+          : []
+      };
     },
     async run() {
       return { meta: { changes: 1 } };
     }
-  };
+  });
   return {
     MEMORY_DB: database,
-    SEARCH_DB: { prepare: vi.fn(() => ({ ...emptySearchStatement })) },
+    SEARCH_DB: { prepare: vi.fn((sql: string) => emptySearchStatement(sql)) },
     PROJECTIONS: {
       put: vi.fn(() => {
         throw new Error("A fenced Workflow attempted an R2 projection.");

@@ -119,6 +119,28 @@ physical deployment per repository or project.
 - A separately approved, expiring GitHub PAT (classic) if private-repository
   sync is enabled
 
+The production `edgemneme-memory` Vectorize index uses exactly eight metadata
+indexes. `model_generation`, `status`, `repository_partition`, `kind`,
+`memory_class`, and `scope_key` are String indexes;
+`valid_from_epoch_ms` and `valid_until_epoch_ms` are Number indexes. Project
+isolation uses the Vectorize namespace, so `project_id` must not be a metadata
+index. The fixed-width `scope_key` is a SHA-256 digest of the memory scope tuple,
+which preserves exact filtering for public scope IDs up to 2,048 characters.
+Unbounded validity is indexed with the JavaScript safe-integer minimum or
+maximum so every semantic query can apply inclusive-start, exclusive-end time
+filters before `topK`.
+
+Create the metadata indexes before the first vector is inserted. When adding
+them to an index that already contains vectors, rebuild every projection from
+D1 and verify the backfill before serving the filtered semantic query path.
+Project namespace names, active generation IDs, and internal repository IDs
+must each fit within 64 UTF-8 bytes; runtime publication, query planning, and
+rebuild preflight reject wider values. Each project consumes one Vectorize
+namespace, so account plan namespace limits are a capacity boundary. The deploy
+workflow creates only missing required indexes, fails closed on incompatible or
+unexpected index drift, and completes the D1-authoritative rebuild before
+deploying the public gateway.
+
 ## Install and verify
 
 ```bash

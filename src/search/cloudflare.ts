@@ -2,6 +2,11 @@ import { normalizeLexicalQuery } from "./lexical";
 import { SearchPipeline } from "./pipeline";
 import { defineIndexGenerationMetadata } from "./ranking";
 import { D1CurrentHeadValidator } from "./current-head";
+import { requireVectorizeIndexedString } from "./vector-metadata";
+import {
+  planSemanticVectorFilters,
+  vectorMetadataMatchesFilter
+} from "./vector-filtering";
 import type {
   ExactReference,
   HardFilterPlan,
@@ -28,6 +33,7 @@ const MAX_RERANK_CANDIDATES = 20;
 const MAX_EMBEDDING_QUERY_CHARACTERS = 4_096;
 const MAX_RERANK_CONTEXT_CHARACTERS = 16_384;
 const D1_MAX_BINDINGS_PER_QUERY = 100;
+type VectorizeMetadataFilter = NonNullable<VectorizeQueryOptions["filter"]>;
 
 interface ActiveGenerationRow {
   generation_id: string;
@@ -89,7 +95,10 @@ export async function readActiveSearchGeneration(
     throw new Error("The active search generation is incompatible with this runtime.");
   }
   return defineIndexGenerationMetadata({
-    id: requireIdentifier(row.generation_id, "generation ID"),
+    id: requireVectorizeIndexedString(
+      requireIdentifier(row.generation_id, "generation ID"),
+      "generation ID"
+    ),
     embeddingModel: row.embedding_model,
     embeddingDimensions: row.embedding_dimensions,
     distanceMetric: "cosine",
@@ -194,6 +203,8 @@ export class QwenVectorRecallProvider implements RecallProvider {
   ) {}
 
   async recall(input: RecallInput): Promise<RecallHit[]> {
+    const limit = normalizeLimit(input.limit);
+    const filters = await planSemanticVectorFilters(input.filters);
     const query = requireModelText(
       input.query,
       "semantic query",
@@ -204,24 +215,18 @@ export class QwenVectorRecallProvider implements RecallProvider {
       instruction: QUERY_INSTRUCTION
     });
     const embedding = parseEmbedding(rawEmbedding);
-    const rawMatches: unknown = await this.vectors.query(embedding, {
-      topK: normalizeLimit(input.limit),
-      namespace: input.filters.projectId,
-      returnValues: false,
-      returnMetadata: "all",
-      filter: {
-        project_id: input.filters.projectId,
-        model_generation: input.filters.indexGeneration,
-        ...(input.filters.authorizedRepositoryIds === undefined
-          ? {}
-          : {
-              repository_partition: {
-                $in: ["*", ...input.filters.authorizedRepositoryIds]
-              }
-            })
-      }
-    });
-    const matches = parseVectorMatches(rawMatches, input);
+    const recalled: RecallHit[] = [];
+    for (const filter of filters) {
+      const rawMatches: unknown = await this.vectors.query(embedding, {
+        topK: limit,
+        namespace: input.filters.projectId,
+        returnValues: false,
+        returnMetadata: "all",
+        filter
+      });
+      recalled.push(...parseVectorMatches(rawMatches, input, filter));
+    }
+    const matches = mergeSemanticRecallHits(recalled).slice(0, limit);
     return validateSemanticProjectionTuples(this.searchDatabase, matches, input);
   }
 }
@@ -522,7 +527,11 @@ function parseEmbedding(raw: unknown): number[] {
   return vector;
 }
 
-function parseVectorMatches(raw: unknown, input: RecallInput): RecallHit[] {
+function parseVectorMatches(
+  raw: unknown,
+  input: RecallInput,
+  filter: VectorizeMetadataFilter
+): RecallHit[] {
   const record = requireRecord(raw, "Vectorize output");
   if (
     !Array.isArray(record.matches) ||
@@ -551,6 +560,9 @@ function parseVectorMatches(raw: unknown, input: RecallInput): RecallHit[] {
       )
     ) {
       throw new Error("A Vectorize match crossed its repository boundary.");
+    }
+    if (!vectorMetadataMatchesFilter(metadata, filter)) {
+      throw new Error("A Vectorize match violated its semantic hard filters.");
     }
     if (
       typeof match.score !== "number" ||
@@ -685,6 +697,29 @@ function normalizeLimit(value: number): number {
     throw new TypeError("The recall limit must be a positive safe integer.");
   }
   return Math.min(value, MAX_RECALL_RESULTS);
+}
+
+function mergeSemanticRecallHits(hits: readonly RecallHit[]): RecallHit[] {
+  const bestByProjection = new Map<string, RecallHit>();
+  for (const hit of hits) {
+    const key = projectionTupleKey(hit);
+    const existing = bestByProjection.get(key);
+    if (
+      existing === undefined ||
+      (hit.sourceScore ?? Number.NEGATIVE_INFINITY) >
+        (existing.sourceScore ?? Number.NEGATIVE_INFINITY)
+    ) {
+      bestByProjection.set(key, hit);
+    }
+  }
+  return [...bestByProjection.values()].sort(
+    (left, right) =>
+      (right.sourceScore ?? Number.NEGATIVE_INFINITY) -
+        (left.sourceScore ?? Number.NEGATIVE_INFINITY) ||
+      compareIdentifiers(left.memoryId, right.memoryId) ||
+      compareIdentifiers(left.revisionId, right.revisionId) ||
+      compareIdentifiers(left.chunkId, right.chunkId)
+  );
 }
 
 function requireRecord(value: unknown, label: string): Record<string, unknown> {

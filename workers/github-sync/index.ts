@@ -30,6 +30,9 @@ import {
   maintainGitHubTreeManifestRetention
 } from "../../src/github/tree-manifest-retention";
 import {
+  buildGitHubBlobEvidenceId,
+  buildGitHubClearEvidenceLocator,
+  buildGitHubTombstoneEvidenceLocator,
   prepareGitHubCandidateStatements,
   type PersistableGitHubCandidate
 } from "../../src/github/candidate-persistence";
@@ -1099,25 +1102,24 @@ export async function buildGitHubBlobCandidate(input: {
   const pathInspection = inspectSensitivePath(input.path);
   const pathAccepted = pathInspection.accepted && !isSensitiveGitHubPath(input.path);
   const pathHash = await sha256(input.path);
-  const safePath = encodeRepositoryPath(repositoryPath);
-  const locator =
-    `github://${input.externalRepositoryId}/${input.observedSha}/${safePath}`;
-  const evidenceId = await sha256(
-    [
-      input.projectId,
-      input.repositoryId,
-      String(input.externalRepositoryId),
-      input.observedSha,
-      input.path,
-      input.blobSha
-    ].join("\n")
-  );
+  const evidenceId = await buildGitHubBlobEvidenceId({
+    projectId: input.projectId,
+    repositoryId: input.repositoryId,
+    externalRepositoryId: input.externalRepositoryId,
+    repositoryRef: input.ref,
+    observedSha: input.observedSha,
+    repositoryPath,
+    blobSha: input.blobSha
+  });
   if (!contentInspection.accepted || !pathAccepted) {
     return {
       evidenceId,
-      locator:
-        `github://${input.externalRepositoryId}/${input.observedSha}/` +
-        `path-sha256/${pathHash}`,
+      locator: await buildGitHubTombstoneEvidenceLocator({
+        externalRepositoryId: input.externalRepositoryId,
+        repositoryRef: input.ref,
+        observedSha: input.observedSha,
+        repositoryPath
+      }),
       repositoryId: input.repositoryId,
       repositoryRef: input.ref,
       repositoryPath: null,
@@ -1127,6 +1129,12 @@ export async function buildGitHubBlobCandidate(input: {
     };
   }
   const contentSha256 = await sha256(input.content);
+  const locator = await buildGitHubClearEvidenceLocator({
+    externalRepositoryId: input.externalRepositoryId,
+    repositoryRef: input.ref,
+    observedSha: input.observedSha,
+    repositoryPath
+  });
   const observationId = await stableUuid(
     [
       "github.candidate",
@@ -1205,9 +1213,6 @@ function validateRepositoryPath(path: string): string {
   return path;
 }
 
-function encodeRepositoryPath(path: string): string {
-  return path.split("/").map(encodeURIComponent).join("/");
-}
 
 async function stableUuid(value: string): Promise<string> {
   const digest = await sha256(value);

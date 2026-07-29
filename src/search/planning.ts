@@ -9,6 +9,7 @@ import {
   type MemoryStatus
 } from "../contracts/taxonomy";
 import { asIndexGeneration } from "./ranking";
+import { requireVectorizeIndexedString } from "./vector-metadata";
 import type {
   HardFilterInput,
   HardFilterPlan,
@@ -18,11 +19,14 @@ import type {
 const MAX_FILTER_VALUES = 50;
 
 export function planHardFilters(input: HardFilterInput): HardFilterPlan {
-  const projectId = requireIdentifier(input.projectId, "projectId");
+  const projectId = requireVectorizeIndexedString(
+    requireIdentifier(input.projectId, "projectId"),
+    "project namespace"
+  );
   const authorizedRepositoryIds =
     input.authorizedRepositoryIds === undefined
       ? undefined
-      : normalizeIdentifiers(input.authorizedRepositoryIds, "authorized repository", true);
+      : normalizeAuthorizedRepositoryIds(input.authorizedRepositoryIds);
   const statuses = normalizeEnumValues(
     input.statuses ?? ["active"],
     MEMORY_STATUSES,
@@ -45,7 +49,7 @@ export function planHardFilters(input: HardFilterInput): HardFilterPlan {
       ? undefined
       : {
           type: normalizeEnumValue(input.scope.type, MEMORY_SCOPES, "scope"),
-          ids: normalizeIdentifiers(input.scope.ids, "scope")
+          ids: normalizeIdentifiers(input.scope.ids, "scope", false, 2_048)
         };
 
   return {
@@ -58,7 +62,12 @@ export function planHardFilters(input: HardFilterInput): HardFilterPlan {
     validAt: new Date(validAt).toISOString(),
     currentHeadsOnly: true,
     excludeExpired: true,
-    indexGeneration: asIndexGeneration(input.indexGeneration ?? "unconfigured")
+    indexGeneration: asIndexGeneration(
+      requireVectorizeIndexedString(
+        input.indexGeneration ?? "unconfigured",
+        "index generation"
+      )
+    )
   };
 }
 
@@ -103,7 +112,8 @@ export function passesHardFilters(
 function normalizeIdentifiers(
   values: readonly string[],
   name: string,
-  allowEmpty = false
+  allowEmpty = false,
+  maximumIdentifierLength = 512
 ): string[] {
   const minimum = allowEmpty ? 0 : 1;
   if (values.length < minimum || values.length > MAX_FILTER_VALUES) {
@@ -111,12 +121,35 @@ function normalizeIdentifiers(
       `${name} must contain between ${minimum} and ${MAX_FILTER_VALUES} identifiers.`
     );
   }
-  return [...new Set(values.map((value) => requireIdentifier(value, name)))].sort();
+  return [
+    ...new Set(
+      values.map((value) =>
+        requireIdentifier(value, name, maximumIdentifierLength)
+      )
+    )
+  ].sort();
 }
 
-function requireIdentifier(value: string, name: string): string {
+function normalizeAuthorizedRepositoryIds(values: readonly string[]): string[] {
+  return [
+    ...new Set(
+      values.map((value) =>
+        requireVectorizeIndexedString(
+          requireIdentifier(value, "authorized repository"),
+          "authorized repository"
+        )
+      )
+    )
+  ].sort();
+}
+
+function requireIdentifier(
+  value: string,
+  name: string,
+  maximumLength = 512
+): string {
   const normalized = value.trim();
-  if (normalized.length === 0 || normalized.length > 512) {
+  if (normalized.length === 0 || normalized.length > maximumLength) {
     throw new TypeError(`${name} must be a non-empty identifier.`);
   }
   return normalized;

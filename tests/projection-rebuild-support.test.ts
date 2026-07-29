@@ -37,6 +37,7 @@ const {
   PROJECTION_REBUILD_PAGE_SIZE,
   loadRebuildTargets,
   parseProjectionRebuildArguments,
+  projectionRebuildCleanupDebtQuery,
   projectionRebuildHeadQuery,
   projectionRebuildHistoryQuery,
   projectionRebuildSearchHeadQuery,
@@ -246,6 +247,39 @@ describe("projection rebuild fanout support", () => {
       descriptor.projectionMode === "delete"
     )).toHaveLength(1);
     expect(projectionRebuildDescriptors(structuredClone(target))).toEqual(descriptors);
+  });
+
+  it("rejects oversized Vectorize namespace and metadata values on every rebuild boundary", () => {
+    const oversized = "仓".repeat(22);
+    expect(() => projectionRebuildDescriptors({
+      ...structuredClone(target),
+      project_id: oversized
+    })).toThrow(/64 UTF-8 bytes/iu);
+    expect(() => projectionRebuildDescriptors({
+      ...structuredClone(target),
+      search_generation_id: oversized
+    })).toThrow(/64 UTF-8 bytes/iu);
+
+    const oversizedPartition = structuredClone(target);
+    oversizedPartition.memory_heads[1]!.repository_partition = oversized;
+    expect(() => projectionRebuildDescriptors(oversizedPartition))
+      .toThrow(/64 UTF-8 bytes/iu);
+
+    const [descriptor] = projectionRebuildDescriptors(target);
+    expect(() => projectionRebuildEvent({
+      ...descriptor,
+      projectId: oversized
+    }, 0)).toThrow(/64 UTF-8 bytes/iu);
+    expect(() => projectionRebuildEvent({
+      ...descriptor,
+      searchGenerationId: oversized
+    }, 0)).toThrow(/64 UTF-8 bytes/iu);
+
+    const searchDescriptor = projectionRebuildDescriptors(target)[1];
+    expect(() => projectionRebuildEvent({
+      ...searchDescriptor,
+      repositoryPartition: oversized
+    }, 0)).toThrow(/64 UTF-8 bytes/iu);
   });
 
   it("strictly binds event identity and payload to its logical target and ordinal", () => {
@@ -590,6 +624,24 @@ describe("projection rebuild fanout support", () => {
     expect(() => projectionRebuildHeadQuery({
       cursor: { memoryId: "memory-alpha" }
     })).toThrow(/cursor project ID/iu);
+    const oversized = "仓".repeat(22);
+    for (const query of [
+      () => projectionRebuildTargetQuery({ projectId: oversized }),
+      () => projectionRebuildHeadQuery({ projectId: oversized }),
+      () => projectionRebuildSearchHeadQuery({
+        projectId: oversized,
+        searchGenerationId: "generation-alpha"
+      }),
+      () => projectionRebuildCleanupDebtQuery({
+        projectId: oversized,
+        searchGenerationId: "generation-alpha"
+      }),
+      () => projectionRebuildTargetQuery({
+        cursor: { projectId: oversized }
+      })
+    ]) {
+      expect(query).toThrow(/64 UTF-8 bytes/iu);
+    }
 
     const memoryPlan = createDatabase().prepare(
       `EXPLAIN QUERY PLAN ${projectionRebuildHeadQuery({
@@ -1098,6 +1150,11 @@ describe("projection rebuild fanout support", () => {
       .toThrow(/verify/iu);
     expect(() => parseProjectionRebuildArguments(["enqueue", "--max-wait-seconds", "-1"]))
       .toThrow(/maximum wait/iu);
+    expect(() => parseProjectionRebuildArguments([
+      "plan",
+      "--project-id",
+      "仓".repeat(22)
+    ])).toThrow(/64 UTF-8 bytes/iu);
   });
 
   it("keeps real pnpm script argument forwarding intact", () => {
@@ -1128,6 +1185,9 @@ describe("projection rebuild fanout support", () => {
       { generation_id: "generation-alpha" },
       { generation_id: "generation-beta" }
     ])).toThrow(/exactly one/iu);
+    expect(() => requireActiveSearchGeneration([
+      { generation_id: "仓".repeat(22) }
+    ])).toThrow(/64 UTF-8 bytes/iu);
     expect(decodeD1Rows(JSON.stringify([
       { success: true, results: [{ project_id: "project:alpha" }] }
     ]))).toEqual([{ project_id: "project:alpha" }]);

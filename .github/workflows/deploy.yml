@@ -180,40 +180,146 @@ jobs:
           pnpm exec wrangler deploy --dry-run --config wrangler/.wrangler/memory-gateway.generated.jsonc
           pnpm exec wrangler deploy --dry-run --config wrangler/.wrangler/github-sync.generated.jsonc
 
-      - name: Require repository Vectorize metadata index
+      - name: Ensure semantic Vectorize metadata indexes
+        timeout-minutes: 5
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         shell: bash
         run: |
           set -euo pipefail
-          if ! metadata_indexes="$(
-            pnpm exec wrangler vectorize list-metadata-index edgemneme-memory --json
-          )"; then
-            echo "Unable to verify Vectorize metadata indexes; deployment is blocked." >&2
-            exit 1
-          fi
-          METADATA_INDEXES_JSON="$metadata_indexes" node --input-type=module <<'NODE'
+          vectorize_index_name="edgemneme-memory"
+          max_poll_attempts=30
+          poll_interval_seconds=2
+
+          list_metadata_indexes() {
+            local output
+            if ! output="$(
+              pnpm exec wrangler vectorize list-metadata-index \
+                "$vectorize_index_name" --json
+            )"; then
+              echo "Unable to list Vectorize metadata indexes; deployment is blocked." >&2
+              return 1
+            fi
+            printf '%s' "$output"
+          }
+
+          inspect_metadata_indexes() {
+            local metadata_indexes_json="$1"
+            local validation_mode="$2"
+            METADATA_INDEXES_JSON="$metadata_indexes_json" \
+              METADATA_INDEX_VALIDATION_MODE="$validation_mode" \
+              node --input-type=module <<'NODE'
+          const requiredIndexes = new Map([
+            ["model_generation", "string"],
+            ["status", "string"],
+            ["repository_partition", "string"],
+            ["kind", "string"],
+            ["memory_class", "string"],
+            ["scope_key", "string"],
+            ["valid_from_epoch_ms", "number"],
+            ["valid_until_epoch_ms", "number"]
+          ]);
+          const validationMode = process.env.METADATA_INDEX_VALIDATION_MODE;
+          if (validationMode !== "allow-missing" && validationMode !== "exact") {
+            throw new Error("Vectorize metadata index validation mode is invalid.");
+          }
           let indexes;
           try {
             indexes = JSON.parse(process.env.METADATA_INDEXES_JSON ?? "");
           } catch {
             throw new Error("Vectorize metadata index output is not valid JSON.");
           }
-          const matches = Array.isArray(indexes)
-            ? indexes.filter(
-                (index) =>
-                  index?.propertyName === "repository_partition" &&
-                  typeof index?.indexType === "string" &&
-                  index.indexType.toLowerCase() === "string"
-              )
-            : [];
-          if (matches.length !== 1) {
+          if (!Array.isArray(indexes)) {
+            throw new Error("Vectorize metadata index output must be a JSON array.");
+          }
+          const configuredIndexes = new Map();
+          for (const index of indexes) {
+            if (
+              index === null ||
+              typeof index !== "object" ||
+              typeof index.propertyName !== "string" ||
+              index.propertyName.length === 0 ||
+              typeof index.indexType !== "string" ||
+              index.indexType.length === 0
+            ) {
+              throw new Error("Vectorize metadata index output contains a malformed entry.");
+            }
+            const propertyName = index.propertyName;
+            const indexType = index.indexType.toLowerCase();
+            if (configuredIndexes.has(propertyName)) {
+              throw new Error(`Vectorize contains duplicate metadata index ${propertyName}.`);
+            }
+            const requiredType = requiredIndexes.get(propertyName);
+            if (requiredType === undefined) {
+              throw new Error(`Vectorize contains unexpected metadata index ${propertyName}.`);
+            }
+            if (indexType !== requiredType) {
+              throw new Error(
+                `Vectorize metadata index ${propertyName} must use type ${requiredType}, found ${indexType}.`
+              );
+            }
+            configuredIndexes.set(propertyName, indexType);
+          }
+          const missingIndexes = [...requiredIndexes].filter(
+            ([propertyName]) => !configuredIndexes.has(propertyName)
+          );
+          if (validationMode === "exact" && missingIndexes.length > 0) {
             throw new Error(
-              "Vectorize must contain exactly one repository_partition string metadata index."
+              `Vectorize is missing required metadata indexes: ${missingIndexes
+                .map(([propertyName]) => propertyName)
+                .join(", ")}.`
             );
           }
+          for (const [propertyName, indexType] of missingIndexes) {
+            process.stdout.write(`${propertyName}\t${indexType}\n`);
+          }
           NODE
+          }
+
+          metadata_indexes="$(list_metadata_indexes)"
+          missing_indexes="$(inspect_metadata_indexes "$metadata_indexes" "allow-missing")"
+          if [[ -z "$missing_indexes" ]]; then
+            inspect_metadata_indexes "$metadata_indexes" "exact" >/dev/null
+            echo "Vectorize metadata index set already satisfies the exact required contract."
+            exit 0
+          fi
+
+          while IFS=$'\t' read -r property_name index_type; do
+            if [[ -z "$property_name" ]]; then
+              continue
+            fi
+            if [[ "$index_type" != "string" && "$index_type" != "number" ]]; then
+              echo "Unsupported required Vectorize metadata index type; deployment is blocked." >&2
+              exit 1
+            fi
+            if ! pnpm exec wrangler vectorize create-metadata-index \
+              "$vectorize_index_name" \
+              --property-name="$property_name" \
+              --type="$index_type"; then
+              echo "Unable to create Vectorize metadata index $property_name; deployment is blocked." >&2
+              exit 1
+            fi
+          done <<< "$missing_indexes"
+
+          metadata_indexes_ready=false
+          for ((attempt = 1; attempt <= max_poll_attempts; attempt++)); do
+            metadata_indexes="$(list_metadata_indexes)"
+            missing_indexes="$(inspect_metadata_indexes "$metadata_indexes" "allow-missing")"
+            if [[ -z "$missing_indexes" ]]; then
+              inspect_metadata_indexes "$metadata_indexes" "exact" >/dev/null
+              metadata_indexes_ready=true
+              break
+            fi
+            if (( attempt < max_poll_attempts )); then
+              sleep "$poll_interval_seconds"
+            fi
+          done
+          if [[ "$metadata_indexes_ready" != "true" ]]; then
+            echo "Vectorize metadata indexes did not reach the exact required contract after $max_poll_attempts polling attempts; deployment is blocked." >&2
+            exit 1
+          fi
+          echo "Vectorize metadata index set satisfies the exact required contract."
 
       - name: Prepare isolated canary identity
         shell: bash

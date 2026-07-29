@@ -282,6 +282,24 @@ export function assertSyntheticVectorProjection(
     expected?.repositoryPartition,
     "expected vector repository partition"
   );
+  const kind = requireIdentifier(expected?.kind, "expected vector kind");
+  const memoryClass = requireIdentifier(
+    expected?.memoryClass,
+    "expected vector memory class"
+  );
+  const scope = requireIdentifier(expected?.scope, "expected vector scope");
+  const scopeId = requireIdentifier(expected?.scopeId, "expected vector scope ID");
+  const scopeKey = createHash("sha256")
+    .update(JSON.stringify(["edgemneme.vector.scope", scope, scopeId]))
+    .digest("hex");
+  const validFromEpochMs = requireSafeInteger(
+    expected?.validFromEpochMs,
+    "expected vector valid-from epoch"
+  );
+  const validUntilEpochMs = requireSafeInteger(
+    expected?.validUntilEpochMs,
+    "expected vector valid-until epoch"
+  );
   if (
     typeof vector !== "object" ||
     vector === null ||
@@ -297,7 +315,14 @@ export function assertSyntheticVectorProjection(
     vector.metadata.chunk_id !== chunkId ||
     vector.metadata.model_generation !== generationId ||
     vector.metadata.status !== "active" ||
-    vector.metadata.repository_partition !== repositoryPartition
+    vector.metadata.repository_partition !== repositoryPartition ||
+    vector.metadata.kind !== kind ||
+    vector.metadata.memory_class !== memoryClass ||
+    vector.metadata.scope !== scope ||
+    vector.metadata.scope_id !== scopeId ||
+    vector.metadata.scope_key !== scopeKey ||
+    vector.metadata.valid_from_epoch_ms !== validFromEpochMs ||
+    vector.metadata.valid_until_epoch_ms !== validUntilEpochMs
   ) {
     throw new Error("The synthetic Vectorize metadata is invalid.");
   }
@@ -464,6 +489,12 @@ function requireIdentifier(value, label) {
   return value;
 }
 
+function requireSafeInteger(value, label) {
+  if (!Number.isSafeInteger(value)) {
+    throw new Error(`The ${label} is invalid.`);
+  }
+  return value;
+}
 
 function pathSegment(value) {
   return encodeURIComponent(value).replaceAll(".", "%2E");

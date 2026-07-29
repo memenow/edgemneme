@@ -36,6 +36,63 @@ interface CandidateTargetRow {
   external_id: number;
 }
 
+export async function buildGitHubBlobEvidenceId(input: {
+  projectId: string;
+  repositoryId: string;
+  externalRepositoryId: number;
+  repositoryRef: string;
+  observedSha: string;
+  repositoryPath: string;
+  blobSha: string;
+}): Promise<string> {
+  return await sha256(
+    [
+      "github.blob.evidence",
+      input.projectId,
+      input.repositoryId,
+      String(input.externalRepositoryId),
+      input.repositoryRef,
+      input.observedSha,
+      input.repositoryPath,
+      input.blobSha
+    ].join("\n")
+  );
+}
+
+export async function buildGitHubClearEvidenceLocator(input: {
+  externalRepositoryId: number;
+  repositoryRef: string;
+  observedSha: string;
+  repositoryPath: string;
+}): Promise<string> {
+  const encodedPath = input.repositoryPath
+    .split("/")
+    .map(encodeURIComponent)
+    .join("/");
+  const refDigest = await sha256(
+    ["github.ref", input.repositoryRef].join("\n")
+  );
+  return (
+    `github://${input.externalRepositoryId}/${input.observedSha}/` +
+    `ref-sha256/${refDigest}/${encodedPath}`
+  );
+}
+
+export async function buildGitHubTombstoneEvidenceLocator(input: {
+  externalRepositoryId: number;
+  repositoryRef: string;
+  observedSha: string;
+  repositoryPath: string;
+}): Promise<string> {
+  const pathIdentityDigest = await sha256(
+    ["github.blob.path", input.repositoryRef, input.repositoryPath].join("\n")
+  );
+  return (
+    `github://${input.externalRepositoryId}/${input.observedSha}/path-sha256/` +
+    pathIdentityDigest
+  );
+}
+
 export async function persistGitHubCandidates(input: {
   database: D1Database;
   projectId: string;
@@ -110,11 +167,12 @@ export async function prepareGitHubCandidateStatements(input: {
           (candidate.observation === undefined ||
             candidate.repositoryPath === null ||
             candidate.locator !==
-              clearLocator(
-                input.externalRepositoryId,
-                input.observedSha,
-                candidate.repositoryPath
-              )))
+              (await buildGitHubClearEvidenceLocator({
+                externalRepositoryId: input.externalRepositoryId,
+                repositoryRef: input.repositoryRef,
+                observedSha: input.observedSha,
+                repositoryPath: candidate.repositoryPath
+              }))))
       ) {
         throw new GitHubSyncError("GITHUB_RECONCILIATION_REQUIRED");
       }
@@ -150,15 +208,6 @@ export async function prepareGitHubCandidateStatements(input: {
     statements.push(...buildChunkStatements(input, chunk));
   }
   return statements;
-}
-
-function clearLocator(
-  externalRepositoryId: number,
-  observedSha: string,
-  repositoryPath: string
-): string {
-  const encodedPath = repositoryPath.split("/").map(encodeURIComponent).join("/");
-  return `github://${externalRepositoryId}/${observedSha}/${encodedPath}`;
 }
 
 function hasDigestOnlyLocator(
@@ -236,7 +285,18 @@ function buildChunkStatements(
                manifest.observed_sha || '/path-sha256/' ||
                substr(json_extract(value, '$[1]'), -64)
            )
-         ON CONFLICT(project_id, source_type, locator, excerpt_hash) DO NOTHING`
+         ON CONFLICT(project_id, source_type, locator, excerpt_hash) DO UPDATE SET
+           evidence_id = CASE
+             WHEN evidence.evidence_id IS excluded.evidence_id
+              AND evidence.repository_id IS excluded.repository_id
+              AND evidence.repository_ref IS excluded.repository_ref
+              AND evidence.repository_path IS excluded.repository_path
+              AND evidence.repository_authority IS excluded.repository_authority
+              AND evidence.commit_sha IS excluded.commit_sha
+              AND evidence.sensitivity_status IS excluded.sensitivity_status
+             THEN evidence.evidence_id
+             ELSE evidence.evidence_id || ':conflict'
+           END`
       )
       .bind(
         input.projectId,

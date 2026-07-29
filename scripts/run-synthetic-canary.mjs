@@ -303,15 +303,18 @@ async function verifyFormalProjection(syntheticProjectId) {
     revisionId: head.revision_id,
     chunkId: "chunk-0",
     generationId: searchRows[0]?.generation_id,
-    repositoryPartition: "*"
+    repositoryPartition: "*",
+    kind: "fact",
+    memoryClass: "semantic",
+    scope: "project",
+    scopeId: syntheticProjectId,
+    validFromEpochMs: Number.MIN_SAFE_INTEGER,
+    validUntilEpochMs: Number.MAX_SAFE_INTEGER
   };
   assertSyntheticVectorProjection(vector, expectedVector);
-  const filteredMatches = queryVectorizeRepositoryPartition(
-    vectorIds[0],
-    syntheticProjectId
-  );
+  const filteredMatches = queryVectorizeHardFilters(vectorIds[0], expectedVector);
   if (filteredMatches.length !== 1) {
-    throw new Error("The synthetic Vectorize repository filter did not match project memory.");
+    throw new Error("The synthetic Vectorize hard filters did not match project memory.");
   }
   assertSyntheticVectorProjection(filteredMatches[0], expectedVector, {
     requireValues: false
@@ -733,7 +736,11 @@ function readVectorizeVectors(vectorIds) {
   }
 }
 
-function queryVectorizeRepositoryPartition(vectorId, syntheticProjectId) {
+function queryVectorizeHardFilters(vectorId, expected) {
+  const scopeKey = sha256Text(
+    JSON.stringify(["edgemneme.vector.scope", expected.scope, expected.scopeId])
+  );
+  const validAtEpochMs = Date.now();
   const output = runProcessCapture(
     "pnpm",
     [
@@ -749,17 +756,24 @@ function queryVectorizeRepositoryPartition(vectorId, syntheticProjectId) {
       "--return-metadata",
       "all",
       "--namespace",
-      syntheticProjectId,
+      expected.projectId,
       "--filter",
       JSON.stringify({
+        model_generation: expected.generationId,
+        status: "active",
         repository_partition: {
-          $in: ["*", `repository.synthetic.${syntheticProjectId}`]
-        }
+          $in: ["*", `repository.synthetic.${expected.projectId}`]
+        },
+        kind: expected.kind,
+        memory_class: expected.memoryClass,
+        scope_key: scopeKey,
+        valid_from_epoch_ms: { $lte: validAtEpochMs },
+        valid_until_epoch_ms: { $gt: validAtEpochMs }
       }),
       "--config",
       configPath
     ],
-    "Synthetic Vectorize repository filter query"
+    "Synthetic Vectorize hard-filter query"
   );
   const jsonStart = output.lastIndexOf("\n{");
   const jsonText =
@@ -769,7 +783,7 @@ function queryVectorizeRepositoryPartition(vectorId, syntheticProjectId) {
         ? output.trim()
         : null;
   if (jsonText === null) {
-    throw new Error("Synthetic Vectorize repository filter returned no JSON result.");
+    throw new Error("Synthetic Vectorize hard-filter query returned no JSON result.");
   }
   try {
     const parsed = JSON.parse(jsonText);
@@ -784,7 +798,7 @@ function queryVectorizeRepositoryPartition(vectorId, syntheticProjectId) {
     }
     return parsed.matches;
   } catch {
-    throw new Error("Synthetic Vectorize repository filter returned invalid JSON.");
+    throw new Error("Synthetic Vectorize hard-filter query returned invalid JSON.");
   }
 }
 

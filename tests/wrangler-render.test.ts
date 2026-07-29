@@ -277,7 +277,7 @@ describe("production workflow secret isolation", () => {
   it("exposes production secrets only to their minimum deployment steps", () => {
     const allowedDeploySteps = [
       "Require fully migrated remote D1 databases",
-      "Require repository Vectorize metadata index",
+      "Ensure semantic Vectorize metadata indexes",
       "Check projection rebuild deployment budget",
       "Capture pre-deployment Worker versions",
       "Rebuild and verify projections",
@@ -337,20 +337,31 @@ describe("production workflow secret isolation", () => {
       .toBeLessThan(orchestratorDeploy);
   });
 
-  it("requires the repository partition metadata index before deploying the orchestrator", () => {
-    const gate = workflowStep(deploy, "Require repository Vectorize metadata index");
+  it("ensures the exact semantic-filter metadata indexes before deploying the orchestrator", () => {
+    const gate = workflowStep(deploy, "Ensure semantic Vectorize metadata indexes");
     const orchestratorDeploy = deploy.indexOf("      - name: Deploy memory orchestrator\n");
     const secretPattern = /\$\{\{ secrets\.[A-Z0-9_]+ \}\}/gu;
 
-    expect(gate).toContain("vectorize list-metadata-index edgemneme-memory --json");
+    expect(gate).toContain("vectorize list-metadata-index \\");
+    expect(gate).toContain('"$vectorize_index_name" --json');
+    expect(gate).toContain("model_generation");
+    expect(gate).toContain("status");
     expect(gate).toContain("repository_partition");
-    expect(gate).toContain('typeof index?.indexType === "string"');
-    expect(gate).toContain('index.indexType.toLowerCase() === "string"');
+    expect(gate).toContain("kind");
+    expect(gate).toContain("memory_class");
+    expect(gate).toContain("scope_key");
+    expect(gate).toContain("valid_from_epoch_ms");
+    expect(gate).toContain("valid_until_epoch_ms");
+    expect(gate).toContain('typeof index.indexType !== "string"');
+    expect(gate).toContain("index.indexType.toLowerCase()");
+    expect(gate).toContain("vectorize create-metadata-index");
+    expect(gate).toContain("--property-name=\"$property_name\"");
+    expect(gate).toContain("--type=\"$index_type\"");
     expect(gate.match(secretPattern)?.sort()).toEqual([
       "${{ secrets.CLOUDFLARE_ACCOUNT_ID }}",
       "${{ secrets.CLOUDFLARE_API_TOKEN }}"
     ]);
-    expect(deploy.indexOf("      - name: Require repository Vectorize metadata index\n"))
+    expect(deploy.indexOf("      - name: Ensure semantic Vectorize metadata indexes\n"))
       .toBeLessThan(orchestratorDeploy);
   });
 

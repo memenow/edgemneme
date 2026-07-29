@@ -337,6 +337,182 @@ describe("candidate review evidence-to-scope provenance", () => {
     expect(database.batches).toHaveLength(0);
   });
 
+  it("does not treat malformed stored analysis as deferred maintainer recovery", async () => {
+    const database = new ReviewDatabase("repository-a", {
+      analysisJson: "{}"
+    });
+    const coordinator = Object.assign(Object.create(ProjectCoordinator.prototype), {
+      env: reviewEnvironment(database)
+    });
+    const response = await ProjectCoordinator.prototype.fetch.call(
+      coordinator,
+      candidateReviewRequest("repository-a", {
+        content: "Repository A uses pnpm."
+      })
+    );
+
+    expect(response.status).toBe(400);
+    expect(database.batches).toHaveLength(0);
+  });
+
+  it("allows a maintainer to recover deferred analysis with complete explicit edits", async () => {
+    const database = new ReviewDatabase("repository-a", {
+      analysisJson: null,
+      evidenceRows: [
+        evidenceRow("evidence-a", "repository-a"),
+        evidenceRow("evidence-b", "repository-a")
+      ]
+    });
+    const coordinator = Object.assign(Object.create(ProjectCoordinator.prototype), {
+      env: reviewEnvironment(database)
+    });
+    const response = await ProjectCoordinator.prototype.fetch.call(
+      coordinator,
+      candidateReviewRequest("repository-a", {
+        content: "Repository A uses pnpm."
+      })
+    );
+
+    expect(response.status).toBe(200);
+    expect(database.batches).toHaveLength(1);
+    expect(database.reads).toContainEqual({
+      sql: expect.stringContaining("FROM observation_evidence"),
+      bindings: ["project-1", "00000000-0000-4000-8000-000000000001"]
+    });
+    expect(database.batches[0]?.flatMap((statement) => statement.bindings)).toEqual(
+      expect.arrayContaining(["evidence-a", "evidence-b"])
+    );
+  });
+
+  it.each([1, 50])(
+    "allows deferred approval with %i clear evidence record(s)",
+    async (evidenceCount) => {
+      const evidenceRows = Array.from({ length: evidenceCount }, (_, index) =>
+        evidenceRow(`evidence-${String(index).padStart(2, "0")}`, "repository-a")
+      );
+      const database = new ReviewDatabase("repository-a", {
+        analysisJson: null,
+        evidenceRows
+      });
+      const coordinator = Object.assign(Object.create(ProjectCoordinator.prototype), {
+        env: reviewEnvironment(database)
+      });
+      const response = await ProjectCoordinator.prototype.fetch.call(
+        coordinator,
+        candidateReviewRequest("repository-a", {
+          content: "Repository A uses pnpm."
+        })
+      );
+
+      expect(response.status).toBe(200);
+      expect(database.batches).toHaveLength(1);
+      expect(
+        database.batches[0]?.filter((statement) =>
+          statement.sql.includes("INSERT INTO version_evidence")
+        )
+      ).toHaveLength(evidenceCount);
+    }
+  );
+
+  it("uses only clear evidence when deferred evidence includes a tombstone", async () => {
+    const database = new ReviewDatabase("repository-a", {
+      analysisJson: null,
+      evidenceRows: [
+        evidenceRow("evidence-clear", "repository-a", "clear"),
+        evidenceRow("evidence-tombstone", "repository-a", "tombstone")
+      ]
+    });
+    const coordinator = Object.assign(Object.create(ProjectCoordinator.prototype), {
+      env: reviewEnvironment(database)
+    });
+    const response = await ProjectCoordinator.prototype.fetch.call(
+      coordinator,
+      candidateReviewRequest("repository-a", {
+        content: "Repository A uses pnpm."
+      })
+    );
+
+    expect(response.status).toBe(200);
+    expect(database.batches).toHaveLength(1);
+    const bindings = database.batches[0]?.flatMap((statement) => statement.bindings);
+    expect(bindings).toContain("evidence-clear");
+    expect(bindings).not.toContain("evidence-tombstone");
+  });
+
+  it("rejects deferred approval when only tombstone evidence exists", async () => {
+    const database = new ReviewDatabase("repository-a", {
+      analysisJson: null,
+      evidenceRows: [evidenceRow("evidence-tombstone", "repository-a", "tombstone")]
+    });
+    const coordinator = Object.assign(Object.create(ProjectCoordinator.prototype), {
+      env: reviewEnvironment(database)
+    });
+    const response = await ProjectCoordinator.prototype.fetch.call(
+      coordinator,
+      candidateReviewRequest("repository-a", {
+        content: "Repository A uses pnpm."
+      })
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({ code: "VALIDATION_FAILED" });
+    expect(database.batches).toHaveLength(0);
+  });
+
+  it.each(["content", "kind", "memory_class", "scope", "scope_id"] as const)(
+    "requires an explicit %s edit for deferred approval",
+    async (missingField) => {
+      const completeEdits: Record<string, unknown> = {
+        content: "Repository A uses pnpm.",
+        kind: "fact",
+        memory_class: "semantic",
+        scope: "repository",
+        scope_id: "repository-a"
+      };
+      delete completeEdits[missingField];
+      const database = new ReviewDatabase("repository-a", {
+        analysisJson: null
+      });
+      const coordinator = Object.assign(Object.create(ProjectCoordinator.prototype), {
+        env: reviewEnvironment(database)
+      });
+      const response = await ProjectCoordinator.prototype.fetch.call(
+        coordinator,
+        candidateReviewRequest("repository-a", {}, { edits: completeEdits })
+      );
+
+      expect(response.status).toBe(400);
+      expect(database.batches).toHaveLength(0);
+    }
+  );
+
+  it.each([
+    ["no", []],
+    [
+      "more than fifty",
+      Array.from({ length: 51 }, (_, index) =>
+        evidenceRow(`evidence-${String(index).padStart(2, "0")}`, "repository-a")
+      )
+    ]
+  ] as const)("rejects deferred approval with %s clear evidence", async (_label, evidenceRows) => {
+    const database = new ReviewDatabase("repository-a", {
+      analysisJson: null,
+      evidenceRows: [...evidenceRows]
+    });
+    const coordinator = Object.assign(Object.create(ProjectCoordinator.prototype), {
+      env: reviewEnvironment(database)
+    });
+    const response = await ProjectCoordinator.prototype.fetch.call(
+      coordinator,
+      candidateReviewRequest("repository-a", {
+        content: "Repository A uses pnpm."
+      })
+    );
+
+    expect(response.status).toBe(400);
+    expect(database.batches).toHaveLength(0);
+  });
+
   it("rejects sensitive maintainer edits before any formal write", async () => {
     const database = new ReviewDatabase("repository-a");
     const coordinator = Object.assign(Object.create(ProjectCoordinator.prototype), {
@@ -455,6 +631,7 @@ class ReviewDatabase {
   readonly batches: CapturedStatement[][] = [];
   readonly reads: CapturedStatement[] = [];
   private readonly citedEvidenceIds: unknown;
+  private readonly analysisJson: string | null;
   private readonly evidenceRows: Array<Record<string, unknown>>;
   private readonly snapshotAuthority: {
     memory_count: number;
@@ -468,6 +645,7 @@ class ReviewDatabase {
     private readonly targetRepositoryId: string,
     options: {
       citedEvidenceIds?: unknown;
+      analysisJson?: string | null;
       evidenceRows?: Array<Record<string, unknown>>;
       snapshotAuthority?: {
         memory_count: number;
@@ -479,6 +657,12 @@ class ReviewDatabase {
     } = {}
   ) {
     this.citedEvidenceIds = options.citedEvidenceIds ?? ["evidence-a"];
+    this.analysisJson = Object.hasOwn(options, "analysisJson")
+      ? (options.analysisJson ?? null)
+      : JSON.stringify({
+          persistent_value: true,
+          evidence_source_ids: this.citedEvidenceIds
+        });
     this.evidenceRows = options.evidenceRows ?? [evidenceRow("evidence-a", "repository-a")];
     this.snapshotAuthority = options.snapshotAuthority ?? {
       memory_count: 1,
@@ -516,6 +700,7 @@ class ReviewDatabase {
           return null;
         }
         if (sql.includes("JOIN observations o")) {
+          const deferred = database.analysisJson === null;
           return {
             project_version: 0,
             audit_head_hash: null,
@@ -523,20 +708,17 @@ class ReviewDatabase {
             status: "pending_review",
             content: "Repository A uses pnpm.",
             reviewed_content: null,
-            kind: "fact",
-            memory_class: "semantic",
-            scope: "repository",
-            scope_id: "repository-a",
+            kind: deferred ? null : "fact",
+            memory_class: deferred ? null : "semantic",
+            scope: deferred ? null : "repository",
+            scope_id: deferred ? null : "repository-a",
             valid_from: null,
             valid_until: null,
             session_id: "session-a",
             session_repository_id: "repository-a",
             session_repository_ref: "refs/heads/main",
             session_worktree_id: "worktree-a",
-            analysis_json: JSON.stringify({
-              persistent_value: true,
-              evidence_source_ids: database.citedEvidenceIds
-            }),
+            analysis_json: database.analysisJson,
             review_request_id: "review-1"
           };
         }
@@ -553,11 +735,24 @@ class ReviewDatabase {
       },
       async all() {
         if (sql.includes("FROM observation_evidence")) {
+          const normalizedSql = sql.replace(/\s+/g, " ").trim();
+          if (!normalizedSql.includes("AND e.sensitivity_status = 'clear'")) {
+            throw new Error("The evidence query must exclude non-clear evidence.");
+          }
+          const limit = normalizedSql.match(/\bLIMIT\s+(\d+)\b/i);
+          if (limit?.[1] !== "51") {
+            throw new Error("The evidence query must use LIMIT 51.");
+          }
           const citedIds = new Set(statement.bindings.slice(2));
-          return {
-            results: database.evidenceRows.filter((row) =>
-              citedIds.has(row.evidence_id)
+          const evidenceRows = database.evidenceRows
+            .filter((row) => row.sensitivity_status === "clear")
+            .filter((row) => citedIds.size === 0 || citedIds.has(row.evidence_id))
+            .sort((left, right) =>
+              String(left.evidence_id).localeCompare(String(right.evidence_id))
             )
+            .slice(0, 51);
+          return {
+            results: evidenceRows
           };
         }
         return { results: [] };
@@ -574,7 +769,11 @@ class ReviewDatabase {
   }
 }
 
-function evidenceRow(evidenceId: string, repositoryId: string) {
+function evidenceRow(
+  evidenceId: string,
+  repositoryId: string,
+  sensitivityStatus: "clear" | "quarantined" | "tombstone" = "clear"
+) {
   return {
     evidence_id: evidenceId,
     source_type: "maintainer",
@@ -584,6 +783,7 @@ function evidenceRow(evidenceId: string, repositoryId: string) {
     repository_id: repositoryId,
     repository_ref: "refs/heads/main",
     repository_path: "package.json",
-    repository_authority: "default_branch"
+    repository_authority: "default_branch",
+    sensitivity_status: sensitivityStatus
   };
 }

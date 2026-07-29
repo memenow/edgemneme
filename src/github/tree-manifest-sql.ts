@@ -119,7 +119,7 @@ export function deletionEvidenceSql(): string {
             delta.new_manifest_id || ':' || delta.path_digest,
           delta.project_id, 'repository_path_absent',
           'github://' || repository.external_id || '/' || manifest.observed_sha ||
-            '/path-sha256/' || delta.path_digest,
+            '/ref-sha256/' || ? || '/path-sha256/' || delta.path_digest,
           delta.repository_id, delta.ref, delta.safe_path,
           manifest.repository_authority, manifest.observed_sha, delta.path_digest,
           NULL, 'tombstone', ?

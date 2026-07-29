@@ -10,15 +10,35 @@ gates. Normal source deployment can then run from the protected GitHub
    environment variables. Never edit the tracked Wrangler placeholders.
 2. Create the private projection R2 bucket.
 3. Create the Vectorize index with 1,024 dimensions and cosine distance. Before
-   inserting any vector, create a string metadata index for
-   `repository_partition`, wait for it to appear in the metadata-index list,
-   and verify the selected embedding model returns exactly 1,024 values.
+   inserting any vector, create String metadata indexes for `model_generation`,
+   `status`, `repository_partition`, `kind`, `memory_class`, and `scope_key`,
+   plus Number metadata indexes for `valid_from_epoch_ms` and
+   `valid_until_epoch_ms`. Do not create a `project_id` metadata index; the
+   project boundary uses the Vectorize namespace. After each create command,
+   wait for that index to appear in the metadata-index list before continuing.
+   Verify the selected embedding model returns exactly 1,024 values.
 
    ```bash
    pnpm exec wrangler vectorize create edgemneme-memory \
      --dimensions=1024 --metric=cosine
    pnpm exec wrangler vectorize create-metadata-index edgemneme-memory \
+     --property-name=model_generation --type=string
+   pnpm exec wrangler vectorize list-metadata-index edgemneme-memory
+   pnpm exec wrangler vectorize create-metadata-index edgemneme-memory \
+     --property-name=status --type=string
+   pnpm exec wrangler vectorize list-metadata-index edgemneme-memory
+   pnpm exec wrangler vectorize create-metadata-index edgemneme-memory \
      --property-name=repository_partition --type=string
+   pnpm exec wrangler vectorize create-metadata-index edgemneme-memory \
+     --property-name=kind --type=string
+   pnpm exec wrangler vectorize create-metadata-index edgemneme-memory \
+     --property-name=memory_class --type=string
+   pnpm exec wrangler vectorize create-metadata-index edgemneme-memory \
+     --property-name=scope_key --type=string
+   pnpm exec wrangler vectorize create-metadata-index edgemneme-memory \
+     --property-name=valid_from_epoch_ms --type=number
+   pnpm exec wrangler vectorize create-metadata-index edgemneme-memory \
+     --property-name=valid_until_epoch_ms --type=number
    pnpm exec wrangler vectorize list-metadata-index edgemneme-memory
    ```
 4. Create the main Queue and dead-letter Queue.
@@ -35,13 +55,30 @@ gates. Normal source deployment can then run from the protected GitHub
 10. Run one isolated `system.synthetic.<uuid>` canary before enabling real
     traffic.
 
-The `repository_partition` metadata index is an authorization prefilter, not an
-authority. Project memory is written with partition `*`; other memory is written
-with its normalized repository ID. Every hit is still revalidated against D1.
+The eight metadata indexes are query prefilters, not authority. The namespace
+provides the project filter. `repository_partition` narrows authorization;
+project memory is written with partition `*`, while other memory uses its
+normalized repository ID. `model_generation`, `status`, `kind`, and
+`memory_class` select the active semantic projection. `scope_key` is the
+lowercase SHA-256 digest of the canonical scope tuple
+`["edgemneme.vector.scope", scope, scope_id]`, so long scope IDs never rely on
+Vectorize String truncation. Null `valid_from` and `valid_until` values map to
+`Number.MIN_SAFE_INTEGER` and `Number.MAX_SAFE_INTEGER`; bounded values use
+epoch milliseconds. Queries therefore apply `valid_from <= validAt` and
+`valid_until > validAt` before `topK`.
+
+Because Vectorize String indexes cover only the first 64 UTF-8 bytes, project
+namespace names, active generation IDs, and internal repository IDs must each
+fit within that bound. Runtime publication, query planning, and rebuild
+enumeration fail closed on wider values. Each project consumes one namespace;
+monitor the account's namespace capacity. Every hit is still revalidated
+against D1 for ACL, current revision, taxonomy, scope, status, and validity.
+
 Cloudflare does not retroactively add metadata to an index for vectors inserted
-before a metadata index exists. If the Vectorize index already contains vectors,
-create the metadata index and rebuild or re-upsert every vector from D1 before
-serving search. See
+before a metadata index exists. If any required metadata index is added to a
+Vectorize index that already contains vectors, keep the new filtered query path
+disabled, create all eight indexes, and rebuild or re-upsert every vector from
+D1. Verify the rebuild before allowing filtered queries. See
 [Cloudflare Vectorize metadata filtering](https://developers.cloudflare.com/vectorize/reference/metadata-filtering/).
 
 ## Deployment and rollback
@@ -65,14 +102,20 @@ Before any Worker deployment, the workflow queries both remote D1 bindings with
 that `MEMORY_DB` and `SEARCH_DB` each have no migrations to apply. A command
 failure, pending migration, or unrecognized result blocks deployment. The gate
 never applies a migration; use the separately confirmed migration workflow.
-The workflow also requires exactly one `repository_partition` string metadata
-index on Vectorize before it deploys the orchestrator. It also runs a read-only
-projection rebuild plan with `--resume` and rejects work whose estimated
-completion time exceeds 3,600 seconds. After the orchestrator deploys, the
-workflow creates a fresh immutable rebuild execution with `--resume` and verifies
-it with the same 3,600-second budget before it deploys the gateway. This deliberate
-release gate reconstructs projections even when an unchanged target's previous
-execution completed successfully.
+The workflow ensures Vectorize contains exactly the six String and two Number
+metadata indexes listed above before it deploys the orchestrator. It creates
+only missing required indexes and polls their asynchronous creation. A wrong
+type, duplicate, unexpected extra index, malformed control-plane response, or
+readiness timeout blocks deployment; the workflow never deletes or replaces an
+index. It also runs a read-only projection rebuild plan with `--resume` and
+rejects work whose estimated completion time exceeds 3,600 seconds. After the
+orchestrator deploys, the workflow creates a fresh immutable rebuild execution
+with `--resume` and verifies it with the same 3,600-second budget before it
+deploys the gateway. This ordering creates the indexes first, re-upserts every
+current vector with complete hard-filter metadata, and exposes the filtered
+query implementation only after rebuild verification. The release gate
+reconstructs projections even when an unchanged target's previous execution
+completed successfully.
 
 A normal push to `main`, or a manual run with `bootstrap_expected_empty=false`,
 requires both dedicated core Workers to exist. The workflow captures the current
@@ -367,8 +410,10 @@ WHERE repository_partition IS NULL OR trim(repository_partition) = '';
 ```
 
 The result must be zero. Do not manually derive partitions from FTS content.
-Create and verify the Vectorize `repository_partition` metadata index before
-re-upserting vectors.
+Create and verify all eight required Vectorize metadata indexes before
+re-upserting vectors. The rebuild must replace every current vector so the five
+new taxonomy, scope, and validity fields are indexed; creating metadata indexes
+does not retroactively index existing vectors.
 
 Migration `migrations/search/0005_memory_fts_chunk_ledger.sql` requires an empty
 legacy search projection and aborts if either `memory_fts` or

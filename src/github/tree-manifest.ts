@@ -314,6 +314,7 @@ export async function activateGitHubTreeManifest(input: {
   const now = new Date().toISOString();
   const scheduledAt = new Date(input.scheduledTime).toISOString();
   const expectedManifestId = expectedHead?.manifestId ?? null;
+  const refDigest = await sha256(["github.ref", descriptor.ref].join("\n"));
   if (descriptor.repositoryAuthority === "tracked_ref") {
     const ownership = await database
       .withSession("first-primary")
@@ -414,6 +415,7 @@ export async function activateGitHubTreeManifest(input: {
     database
       .prepare(deletionEvidenceSql())
       .bind(
+        refDigest,
         now,
         descriptor.projectId,
         descriptor.repositoryId,

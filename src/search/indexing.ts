@@ -1,5 +1,17 @@
 import { readActiveSearchGeneration, QWEN_EMBEDDING_MODEL } from "./cloudflare";
 import { sha256 } from "../security/crypto";
+import {
+  MEMORY_CLASSES,
+  MEMORY_KINDS,
+  MEMORY_SCOPES,
+  MEMORY_STATUSES
+} from "../contracts/taxonomy";
+import {
+  deriveVectorScopeKey,
+  requireVectorizeIndexedString,
+  vectorizeValidFromEpochMs,
+  vectorizeValidUntilEpochMs
+} from "./vector-metadata";
 
 interface SearchProjectionEnv {
   memoryDb: D1Database;
@@ -75,6 +87,13 @@ interface ExpectedVectorMetadata extends Record<string, VectorizeVectorMetadata>
   model_generation: string;
   status: string;
   repository_partition: string;
+  kind: string;
+  memory_class: string;
+  scope: string;
+  scope_id: string;
+  scope_key: string;
+  valid_from_epoch_ms: number;
+  valid_until_epoch_ms: number;
 }
 
 interface ExpectedVectorProjection {
@@ -110,7 +129,7 @@ export const SEARCH_VECTOR_CLEANUP_HOLDER_TIMEOUT = "15 minutes" as const;
 export const SEARCH_VECTOR_CLEANUP_HOLDER_TIMEOUT_MS = 15 * 60 * 1_000;
 export const SEARCH_VECTOR_CLEANUP_CLAIM_TTL_MS = 2 * 60 * 60 * 1_000;
 const GITHUB_LOCATOR =
-  /^github:\/\/[1-9][0-9]{0,19}\/([a-f0-9]{7,64})\/([A-Za-z0-9_.@+-]+(?:\/[A-Za-z0-9_.@+-]+)*)$/iu;
+  /^github:\/\/[1-9][0-9]{0,19}\/([a-f0-9]{7,64})\/(?:ref-sha256\/[a-f0-9]{64}\/)?((?:[A-Za-z0-9_.!~*'()@+-]|%[0-9A-F]{2})+(?:\/(?:[A-Za-z0-9_.!~*'()@+-]|%[0-9A-F]{2})+)*)$/iu;
 const SAFE_COMMIT_SHA = /^[a-f0-9]{7,64}$/iu;
 const INLINE_CANONICAL_SYMBOL =
   /`([A-Za-z_$][A-Za-z0-9_$]{0,127}(?:(?:\.|::)[A-Za-z_$][A-Za-z0-9_$]{0,127})+)(?:\(\))?`/gu;
@@ -129,10 +148,12 @@ export async function publishMemorySearchProjection(
     projectVersion: number;
   }
 ): Promise<boolean> {
+  requireVectorizeIndexedString(env.projectId, "project namespace");
   if (!Number.isSafeInteger(env.projectVersion) || env.projectVersion < 0) {
     throw new TypeError("The project version must be a nonnegative safe integer.");
   }
   const generation = await readActiveSearchGeneration(env.searchDb);
+  requireVectorizeIndexedString(generation.id, "model generation");
   await cleanupRetiredProjectionVectors(
     env,
     generation.id,
@@ -177,6 +198,17 @@ export async function publishMemorySearchProjection(
     head.scope === "project" && head.scope_id === env.projectId
       ? "*"
       : requireRepositoryPartition(head.repository_id);
+  const status = requireTaxonomyValue(head.status, MEMORY_STATUSES, "memory status");
+  const kind = requireTaxonomyValue(head.kind, MEMORY_KINDS, "memory kind");
+  const memoryClass = requireTaxonomyValue(
+    head.memory_class,
+    MEMORY_CLASSES,
+    "memory class"
+  );
+  const scope = requireTaxonomyValue(head.scope, MEMORY_SCOPES, "memory scope");
+  const scopeKey = await deriveVectorScopeKey(scope, head.scope_id);
+  const validFromEpochMilliseconds = vectorizeValidFromEpochMs(head.valid_from);
+  const validUntilEpochMilliseconds = vectorizeValidUntilEpochMs(head.valid_until);
   const chunks = chunkMemoryContent(head.content);
   const locatorIndex = buildLocatorIndex(head.locators, head.commit_shas);
   const symbolIndex = buildSymbolIndex(head.content);
@@ -199,8 +231,15 @@ export async function publishMemorySearchProjection(
       revision_id: head.revision_id,
       chunk_id: chunkId,
       model_generation: generation.id,
-      status: head.status,
-      repository_partition: repositoryPartition
+      status,
+      repository_partition: repositoryPartition,
+      kind,
+      memory_class: memoryClass,
+      scope,
+      scope_id: head.scope_id,
+      scope_key: scopeKey,
+      valid_from_epoch_ms: validFromEpochMilliseconds,
+      valid_until_epoch_ms: validUntilEpochMilliseconds
     };
     candidateVectors.push({
       id,
@@ -1443,7 +1482,12 @@ function isValidExpectedVector(vector: ExpectedVectorProjection): boolean {
     vector.metadata.chunk_id,
     vector.metadata.model_generation,
     vector.metadata.status,
-    vector.metadata.repository_partition
+    vector.metadata.repository_partition,
+    vector.metadata.kind,
+    vector.metadata.memory_class,
+    vector.metadata.scope,
+    vector.metadata.scope_id,
+    vector.metadata.scope_key
   ];
   return (
     vector.namespace === vector.metadata.project_id &&
@@ -1453,7 +1497,9 @@ function isValidExpectedVector(vector: ExpectedVectorProjection): boolean {
         value.length > 0 &&
         value.trim() === value &&
         !value.includes("\0")
-    )
+    ) &&
+    Number.isSafeInteger(vector.metadata.valid_from_epoch_ms) &&
+    Number.isSafeInteger(vector.metadata.valid_until_epoch_ms)
   );
 }
 
@@ -1475,7 +1521,14 @@ function hasAuthoritativeVectorMetadata(
     metadata.chunk_id === expected.metadata.chunk_id &&
     metadata.model_generation === expected.metadata.model_generation &&
     metadata.status === expected.metadata.status &&
-    metadata.repository_partition === expected.metadata.repository_partition
+    metadata.repository_partition === expected.metadata.repository_partition &&
+    metadata.kind === expected.metadata.kind &&
+    metadata.memory_class === expected.metadata.memory_class &&
+    metadata.scope === expected.metadata.scope &&
+    metadata.scope_id === expected.metadata.scope_id &&
+    metadata.scope_key === expected.metadata.scope_key &&
+    metadata.valid_from_epoch_ms === expected.metadata.valid_from_epoch_ms &&
+    metadata.valid_until_epoch_ms === expected.metadata.valid_until_epoch_ms
   );
 }
 
@@ -1520,11 +1573,22 @@ export function parseQwenEmbedding(value: unknown): number[] {
   return value.data[0] as number[];
 }
 
+function requireTaxonomyValue<T extends string>(
+  value: string,
+  allowed: readonly T[],
+  label: string
+): T {
+  if (!allowed.includes(value as T)) {
+    throw new Error(`The ${label} is invalid.`);
+  }
+  return value as T;
+}
+
 function requireRepositoryPartition(value: string | null): string {
   if (value === null || value.length === 0 || value.trim() !== value || value.includes("\0")) {
     throw new Error("A non-project memory requires a trusted repository partition.");
   }
-  return value;
+  return requireVectorizeIndexedString(value, "repository partition");
 }
 
 export async function deriveMemorySearchVectorId(

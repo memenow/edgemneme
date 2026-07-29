@@ -515,7 +515,13 @@ describe("GitHub sync policy", () => {
 
     expect(second).toEqual(first);
     expect(first).toMatchObject({
-      locator: `github://42/${OBSERVED_SHA}/docs/architecture%20%231%3F.md`,
+      locator: expect.stringMatching(
+        new RegExp(
+          `^github://42/${OBSERVED_SHA}/ref-sha256/[a-f0-9]{64}/` +
+            "docs/architecture%20%231%3F\\.md$",
+          "u"
+        )
+      ),
       repositoryId: "repository-1",
       repositoryRef: "refs/heads/main",
       repositoryPath: "docs/architecture #1?.md",

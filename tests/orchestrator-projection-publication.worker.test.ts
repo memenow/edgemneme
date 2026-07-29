@@ -85,18 +85,92 @@ describe("ordinary memory projection publication", () => {
     ]);
     expect(database.workflowStatus).toBe("complete");
   });
+
+  it("repairs a late memory search head without publishing a stale project snapshot", async () => {
+    const currentProjectVersion = PROJECT_VERSION + 1;
+    const currentMemoryId = "memory-2";
+    const database = new ProjectionPublicationDatabase(currentProjectVersion);
+    const projections = {} as R2Bucket;
+    const searchDatabase = {} as D1Database;
+    const vectors = {} as VectorizeIndex;
+    const ai = {} as Ai;
+
+    await MemoryWorkflow.prototype.run.call(
+      {
+        env: {
+          MEMORY_DB: database,
+          SEARCH_DB: searchDatabase,
+          PROJECTIONS: projections,
+          MEMORY_VECTORS: vectors,
+          AI: ai,
+          MEMORY_WORKFLOW: {},
+          MEMORY_OUTBOX: {}
+        }
+      },
+      workflowEvent(currentMemoryId, currentProjectVersion) as never,
+      workflowStep([])
+    );
+    await MemoryWorkflow.prototype.run.call(
+      {
+        env: {
+          MEMORY_DB: database,
+          SEARCH_DB: searchDatabase,
+          PROJECTIONS: projections,
+          MEMORY_VECTORS: vectors,
+          AI: ai,
+          MEMORY_WORKFLOW: {},
+          MEMORY_OUTBOX: {}
+        }
+      },
+      workflowEvent() as never,
+      workflowStep([])
+    );
+
+    expect(mocks.publishProjectProjection).toHaveBeenCalledTimes(1);
+    expect(mocks.publishProjectProjection).toHaveBeenCalledWith({
+      memoryDb: database,
+      projections,
+      projectId: PROJECT_ID,
+      projectVersion: currentProjectVersion
+    });
+    expect(mocks.publishMemorySearchProjection.mock.calls).toEqual([
+      [
+        {
+          memoryDb: database,
+          searchDb: searchDatabase,
+          vectors,
+          ai,
+          projectId: PROJECT_ID,
+          memoryId: currentMemoryId,
+          projectVersion: currentProjectVersion
+        }
+      ],
+      [
+        {
+          memoryDb: database,
+          searchDb: searchDatabase,
+          vectors,
+          ai,
+          projectId: PROJECT_ID,
+          memoryId: MEMORY_ID,
+          projectVersion: PROJECT_VERSION
+        }
+      ]
+    ]);
+    expect(database.workflowStatus).toBe("complete");
+  });
 });
 
-function workflowEvent() {
+function workflowEvent(memoryId = MEMORY_ID, projectVersion = PROJECT_VERSION) {
   return {
-    instanceId: `projection-${PROJECT_ID}-${PROJECT_VERSION}`,
+    instanceId: `projection-${PROJECT_ID}-${projectVersion}`,
     timestamp: new Date("2026-07-29T00:00:00.000Z"),
     payload: {
-      eventId: `${PROJECT_ID}:${PROJECT_VERSION}`,
+      eventId: `${PROJECT_ID}:${projectVersion}`,
       projectId: PROJECT_ID,
       type: "memory.changed" as const,
-      subjectId: MEMORY_ID,
-      projectVersion: PROJECT_VERSION
+      subjectId: memoryId,
+      projectVersion
     }
   };
 }
@@ -123,6 +197,8 @@ class ProjectionPublicationDatabase {
   readonly reads: CapturedStatement[] = [];
   workflowStatus: "idle" | "running" | "complete" = "idle";
 
+  constructor(private readonly projectVersion = PROJECT_VERSION) {}
+
   withSession(_constraint: "first-primary"): ProjectionPublicationDatabase {
     return this;
   }
@@ -141,8 +217,11 @@ class ProjectionPublicationDatabase {
           return { admitted: 1 };
         }
         if (sql.includes("AS memory_count")) {
+          if (statement.bindings.at(-1) !== database.projectVersion) {
+            return null;
+          }
           return {
-            project_version: PROJECT_VERSION,
+            project_version: database.projectVersion,
             memory_count: 1,
             revision_count: 1,
             scope_count: 1,

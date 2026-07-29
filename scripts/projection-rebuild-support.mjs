@@ -12,6 +12,7 @@ export const PROJECTION_REBUILD_MAX_SNAPSHOT_CONTENT_BYTES = 16 * 1024 * 1024;
 export const PROJECTION_REBUILD_PROJECT_SNAPSHOT_FIXED_WRITES = 29;
 export const PROJECTION_REBUILD_PROJECT_SNAPSHOT_FIXED_SUBREQUESTS = 14;
 export const PROJECTION_REBUILD_WORKFLOW_FIXED_RETRIED_SUBREQUESTS = 14;
+export const MAX_VECTORIZE_INDEXED_STRING_BYTES = 64;
 const PROJECTION_MODES = new Set(["snapshot", "search", "delete"]);
 const TERMINAL_WORKFLOW_STATUSES = new Set(["complete", "failed", "terminated"]);
 const PROJECTION_REBUILD_CONTROL_PLANE_UNKNOWN =
@@ -124,7 +125,17 @@ export function requireActiveSearchGeneration(rows) {
   if (!Array.isArray(rows) || rows.length !== 1) {
     throw new Error("SEARCH_DB must contain exactly one active search generation.");
   }
-  return requireIdentifier(rows[0]?.generation_id, "active search generation ID");
+  return requireVectorizeIndexedString(
+    requireIdentifier(rows[0]?.generation_id, "active search generation ID"),
+    "active search generation ID"
+  );
+}
+
+export function requireVectorizeIndexedString(value, label) {
+  if (new TextEncoder().encode(value).byteLength > MAX_VECTORIZE_INDEXED_STRING_BYTES) {
+    throw new TypeError(`The ${label} must not exceed 64 UTF-8 bytes.`);
+  }
+  return value;
 }
 export function calculateProjectionRebuildSnapshotCapacity(input) {
   if (typeof input !== "object" || input === null) {
@@ -816,12 +827,21 @@ function requireTarget(target) {
   if (typeof target !== "object" || target === null) {
     throw new TypeError("The projection rebuild target is invalid.");
   }
-  requireIdentifier(target.project_id, "project ID");
-  requireIdentifier(target.search_generation_id, "search generation ID");
+  requireVectorizeIndexedString(
+    requireIdentifier(target.project_id, "project ID"),
+    "project namespace"
+  );
+  requireVectorizeIndexedString(
+    requireIdentifier(target.search_generation_id, "search generation ID"),
+    "search generation ID"
+  );
   requireProjectVersion(target.project_version);
   requireHeadList(target.memory_heads, "memory", (head) => {
     requireIdentifier(head.revision_id, "revision ID");
-    requireIdentifier(head.repository_partition, "repository partition");
+    requireVectorizeIndexedString(
+      requireIdentifier(head.repository_partition, "repository partition"),
+      "repository partition"
+    );
   });
   requireHeadList(target.search_heads, "search", (head) => {
     if (head.generation_id !== target.search_generation_id) {
@@ -841,6 +861,12 @@ function requireTarget(target) {
       typeof head.repository_partition !== "string"
     ) {
       throw new TypeError("The projection rebuild repository partition is invalid.");
+    }
+    if (typeof head.repository_partition === "string") {
+      requireVectorizeIndexedString(
+        requireIdentifier(head.repository_partition, "repository partition"),
+        "repository partition"
+      );
     }
   });
   const capacity = requireSnapshotCapacityAuthority({
@@ -902,9 +928,15 @@ function requireDescriptor(descriptor) {
   if (Object.keys(descriptor).sort().join("\n") !== expectedKeys.join("\n")) {
     throw new TypeError("The projection rebuild descriptor fields are invalid.");
   }
-  requireIdentifier(descriptor.projectId, "project ID");
+  requireVectorizeIndexedString(
+    requireIdentifier(descriptor.projectId, "project ID"),
+    "project namespace"
+  );
   requireProjectVersion(descriptor.projectVersion);
-  requireIdentifier(descriptor.searchGenerationId, "search generation ID");
+  requireVectorizeIndexedString(
+    requireIdentifier(descriptor.searchGenerationId, "search generation ID"),
+    "search generation ID"
+  );
   requireSha256(descriptor.projectionTargetId, "projection target ID");
   if (descriptor.projectionMode === "snapshot") {
     const capacity = requireSnapshotCapacityAuthority({
@@ -921,7 +953,10 @@ function requireDescriptor(descriptor) {
     requireIdentifier(descriptor.memoryId, "memory ID");
     requireIdentifier(descriptor.revisionId, "revision ID");
     if (descriptor.projectionMode === "search") {
-      requireIdentifier(descriptor.repositoryPartition, "repository partition");
+      requireVectorizeIndexedString(
+        requireIdentifier(descriptor.repositoryPartition, "repository partition"),
+        "repository partition"
+      );
     }
     if (descriptor.projectionMode === "delete") {
       requireProjectVersion(descriptor.searchProjectVersion);

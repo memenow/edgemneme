@@ -136,6 +136,13 @@ one guarded D1 batch. A non-project scope must resolve to one normalized
 repository, and evidence or session provenance from another repository rejects
 the approval. Only a project maintainer may generalize evidence into project
 memory. Rejection and request-changes decisions are immutable and audited.
+When model analysis is unavailable, the candidate remains `pending_review` with
+no validated citation subset. A maintainer may approve that deferred candidate
+only by explicitly resubmitting `content`, `kind`, `memory_class`, `scope`, and
+`scope_id` in the approval. The coordinator then requires between one and fifty
+clear evidence records attached to the candidate and cites all of them. This
+manual recovery path is unavailable when stored model analysis is malformed,
+empty, or cites evidence that is not attached.
 Session consolidation freezes its input set, accepts only schema-validated model
 suggestions that select a server-generated opaque scope option and cite its
 frozen evidence subset, and creates `pending_review` candidates. A model never

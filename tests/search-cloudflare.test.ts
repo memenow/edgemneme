@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import {
   createCloudflareSearchPipeline,
@@ -17,6 +18,30 @@ import type {
 } from "../src/search/types";
 
 const generation = asIndexGeneration("generation-blue");
+const DEFAULT_VALID_AT_MS = Date.parse("2026-07-25T12:00:00.000Z");
+const REPOSITORY_SCOPE_KEY = createHash("sha256")
+  .update(JSON.stringify(["edgemneme.vector.scope", "repository", "repo-1"]))
+  .digest("hex");
+
+function semanticVectorMetadata(
+  overrides: Record<string, unknown> = {}
+): Record<string, unknown> {
+  return {
+    project_id: "project-1",
+    memory_id: "memory-1",
+    revision_id: "revision-1",
+    chunk_id: "chunk-1",
+    model_generation: "generation-blue",
+    status: "active",
+    repository_partition: "repo-1",
+    kind: "fact",
+    memory_class: "semantic",
+    scope_key: REPOSITORY_SCOPE_KEY,
+    valid_from_epoch_ms: Number.MIN_SAFE_INTEGER,
+    valid_until_epoch_ms: Number.MAX_SAFE_INTEGER,
+    ...overrides
+  };
+}
 
 interface QueryRecord {
   sql: string;
@@ -162,6 +187,25 @@ describe("Cloudflare search adapters", () => {
         )
       )
     ).rejects.toThrow("incompatible");
+    await expect(
+      readActiveSearchGeneration(
+        fakeDatabase(
+          [
+            {
+              generation_id: "g".repeat(65),
+              embedding_model: "@cf/qwen/qwen3-embedding-0.6b",
+              embedding_dimensions: 1024,
+              distance_metric: "cosine",
+              instruction_version: "query-schema-2026-07-25",
+              chunk_schema_version: "chunk-schema-2026-07-25",
+              reranker_model: "@cf/baai/bge-reranker-base",
+              activated_at: "2026-07-25T00:00:00.000Z"
+            }
+          ],
+          []
+        )
+      )
+    ).rejects.toThrow("64 UTF-8 bytes");
   });
 
   it("does not query SEARCH_DB when an exact or lexical channel has no expression", async () => {
@@ -304,6 +348,9 @@ describe("Cloudflare search adapters", () => {
     const vectors = {
       async query(vector: number[], options: VectorizeQueryOptions) {
         vectorCalls.push({ vector, options });
+        if (options.filter?.repository_partition === "*") {
+          return { count: 0, matches: [] };
+        }
         return {
           count: 1,
           matches: [
@@ -311,14 +358,7 @@ describe("Cloudflare search adapters", () => {
               id: "vector-1",
               score: 0.9,
               namespace: "project-1",
-              metadata: {
-                project_id: "project-1",
-                memory_id: "memory-1",
-                revision_id: "revision-1",
-                chunk_id: "chunk-1",
-                model_generation: "generation-blue",
-                repository_partition: "repo-1"
-              }
+              metadata: semanticVectorMetadata()
             }
           ]
         };
@@ -359,21 +399,278 @@ describe("Cloudflare search adapters", () => {
         }
       }
     ]);
-    expect(vectorCalls[0]).toMatchObject({
-      vector: expect.any(Array),
-      options: {
-        topK: 20,
+    expect(vectorCalls).toEqual([
+      {
+        vector: expect.any(Array),
+        options: {
+          topK: 20,
+          namespace: "project-1",
+          returnValues: false,
+          returnMetadata: "all",
+          filter: {
+            model_generation: "generation-blue",
+            status: "active",
+            valid_from_epoch_ms: { $lte: DEFAULT_VALID_AT_MS },
+            valid_until_epoch_ms: { $gt: DEFAULT_VALID_AT_MS },
+            scope_key: REPOSITORY_SCOPE_KEY,
+            repository_partition: "*"
+          }
+        }
+      },
+      {
+        vector: expect.any(Array),
+        options: {
+          topK: 20,
+          namespace: "project-1",
+          returnValues: false,
+          returnMetadata: "all",
+          filter: {
+            model_generation: "generation-blue",
+            status: "active",
+            valid_from_epoch_ms: { $lte: DEFAULT_VALID_AT_MS },
+            valid_until_epoch_ms: { $gt: DEFAULT_VALID_AT_MS },
+            scope_key: REPOSITORY_SCOPE_KEY,
+            repository_partition: "repo-1"
+          }
+        }
+      }
+    ]);
+    expect(vectorCalls[0]?.vector).toHaveLength(1024);
+  });
+
+  it("applies explicit single and multiple statuses before semantic top-K selection", async () => {
+    const vectorCalls: VectorizeQueryOptions[] = [];
+    const ai = {
+      async run() {
+        return { data: [Array.from({ length: 1024 }, () => 0.25)], shape: [1, 1024] };
+      }
+    } as unknown as Ai;
+    const vectors = {
+      async query(_vector: number[], options: VectorizeQueryOptions) {
+        vectorCalls.push(options);
+        return { count: 0, matches: [] };
+      }
+    } as unknown as VectorizeIndex;
+    const provider = new QwenVectorRecallProvider(
+      ai,
+      vectors,
+      fakeDatabase([], [])
+    );
+
+    await provider.recall(
+      recallInput({
+        filters: planHardFilters({
+          projectId: "project-1",
+          statuses: ["contested"],
+          validAt: "2026-07-25T12:00:00.000Z",
+          indexGeneration: generation
+        })
+      })
+    );
+    await provider.recall(
+      recallInput({
+        filters: planHardFilters({
+          projectId: "project-1",
+          authorizedRepositoryIds: ["repo-2", "repo-1"],
+          statuses: ["invalidated", "active"],
+          validAt: "2026-07-25T12:00:00.000Z",
+          indexGeneration: generation
+        })
+      })
+    );
+    await provider.recall(
+      recallInput({
+        filters: planHardFilters({
+          projectId: "project-1",
+          authorizedRepositoryIds: [],
+          validAt: "2026-07-25T12:00:00.000Z",
+          indexGeneration: generation
+        })
+      })
+    );
+
+    expect(vectorCalls.map((options) => options.filter)).toEqual([
+      {
+        model_generation: "generation-blue",
+        status: "contested",
+        valid_from_epoch_ms: { $lte: DEFAULT_VALID_AT_MS },
+        valid_until_epoch_ms: { $gt: DEFAULT_VALID_AT_MS }
+      },
+      {
+        model_generation: "generation-blue",
+        status: { $in: ["active", "invalidated"] },
+        valid_from_epoch_ms: { $lte: DEFAULT_VALID_AT_MS },
+        valid_until_epoch_ms: { $gt: DEFAULT_VALID_AT_MS },
+        repository_partition: "*"
+      },
+      {
+        model_generation: "generation-blue",
+        status: { $in: ["active", "invalidated"] },
+        valid_from_epoch_ms: { $lte: DEFAULT_VALID_AT_MS },
+        valid_until_epoch_ms: { $gt: DEFAULT_VALID_AT_MS },
+        repository_partition: { $in: ["repo-1", "repo-2"] }
+      },
+      {
+        model_generation: "generation-blue",
+        status: "active",
+        valid_from_epoch_ms: { $lte: DEFAULT_VALID_AT_MS },
+        valid_until_epoch_ms: { $gt: DEFAULT_VALID_AT_MS },
+        repository_partition: "*"
+      }
+    ]);
+  });
+
+  it("batches every authorized repository below the strict Vectorize filter limit", async () => {
+    const statuses = [
+      "active",
+      "archived",
+      "contested",
+      "invalidated",
+      "superseded"
+    ] as const;
+    const firstBatch = Array.from(
+      { length: 26 },
+      (_, index) => `a-${String(index).padStart(2, "0")}-${"x".repeat(59)}`
+    );
+    const equalityTriggerRepositoryId = `b-${"y".repeat(62)}`;
+    const trailingRepositoryIds = Array.from(
+      { length: 53 },
+      (_, index) => `z-${String(index).padStart(2, "0")}-${"z".repeat(59)}`
+    );
+    const sortedRepositoryIds = [
+      ...firstBatch,
+      equalityTriggerRepositoryId,
+      ...trailingRepositoryIds
+    ];
+    const repositoryIds = [...sortedRepositoryIds].reverse();
+    const filterByteLength = (filter: unknown) =>
+      new TextEncoder().encode(JSON.stringify(filter)).byteLength;
+    const exactLimitCandidate = {
+      model_generation: "generation-blue",
+      status: { $in: [...statuses] },
+      valid_from_epoch_ms: { $lte: DEFAULT_VALID_AT_MS },
+      valid_until_epoch_ms: { $gt: DEFAULT_VALID_AT_MS },
+      repository_partition: {
+        $in: [...firstBatch, equalityTriggerRepositoryId]
+      }
+    };
+
+    expect(filterByteLength(exactLimitCandidate)).toBe(2_048);
+    expect(repositoryIds).toHaveLength(80);
+    expect(new Set(repositoryIds).size).toBe(80);
+    for (const repositoryId of repositoryIds) {
+      expect(new TextEncoder().encode(repositoryId).byteLength).toBeLessThanOrEqual(64);
+    }
+
+    const vectorCalls: VectorizeQueryOptions[] = [];
+    const ai = {
+      run: vi.fn(async () => ({
+        data: [Array.from({ length: 1024 }, () => 0.25)],
+        shape: [1, 1024]
+      }))
+    } as unknown as Ai;
+    const targetRepositoryId = sortedRepositoryIds.at(-1)!;
+    const targetMatch = {
+      id: "vector-late-batch",
+      score: 0.99,
+      namespace: "project-1",
+      metadata: semanticVectorMetadata({
+        memory_id: "memory-late-batch",
+        revision_id: "revision-memory-late-batch",
+        chunk_id: "chunk-memory-late-batch",
+        repository_partition: targetRepositoryId
+      })
+    };
+    const repositoryIdsFromFilter = (options: VectorizeQueryOptions): string[] => {
+      const partition = options.filter?.repository_partition;
+      if (typeof partition === "string") {
+        return [partition];
+      }
+      if (
+        typeof partition === "object" &&
+        partition !== null &&
+        "$in" in partition &&
+        Array.isArray(partition.$in) &&
+        partition.$in.every(
+          (value): value is string => typeof value === "string"
+        )
+      ) {
+        return partition.$in;
+      }
+      throw new Error("Unexpected repository partition filter.");
+    };
+    const vectors = {
+      async query(_vector: number[], options: VectorizeQueryOptions) {
+        vectorCalls.push(options);
+        if (repositoryIdsFromFilter(options).includes(targetRepositoryId)) {
+          return { count: 1, matches: [targetMatch] };
+        }
+        return { count: 0, matches: [] };
+      }
+    } as unknown as VectorizeIndex;
+    const provider = new QwenVectorRecallProvider(
+      ai,
+      vectors,
+      fakeDatabase(
+        ["memory-late-batch"].map((memoryId) => ({
+          generation_id: "generation-blue",
+          project_id: "project-1",
+          memory_id: memoryId,
+          revision_id: `revision-${memoryId}`,
+          chunk_id: `chunk-${memoryId}`
+        })),
+        []
+      )
+    );
+
+    const hits = await provider.recall(
+      recallInput({
+        filters: planHardFilters({
+          projectId: "project-1",
+          authorizedRepositoryIds: repositoryIds,
+          statuses,
+          validAt: "2026-07-25T12:00:00.000Z",
+          indexGeneration: generation
+        }),
+        limit: 5
+      })
+    );
+
+    expect(ai.run).toHaveBeenCalledTimes(1);
+    expect(vectorCalls.length).toBeGreaterThan(2);
+    const recalledRepositoryIds = vectorCalls
+      .slice(1)
+      .flatMap(repositoryIdsFromFilter);
+    expect(recalledRepositoryIds).toEqual(sortedRepositoryIds);
+    expect(new Set(recalledRepositoryIds).size).toBe(80);
+    expect(vectorCalls[1]?.filter?.repository_partition).toEqual({
+      $in: firstBatch
+    });
+    expect(
+      vectorCalls.findIndex((options) =>
+        repositoryIdsFromFilter(options).includes(targetRepositoryId)
+      )
+    ).toBeGreaterThan(2);
+    for (const options of vectorCalls) {
+      expect(options).toMatchObject({
+        topK: 5,
         namespace: "project-1",
         returnValues: false,
         returnMetadata: "all",
         filter: {
-          project_id: "project-1",
           model_generation: "generation-blue",
-          repository_partition: { $in: ["*", "repo-1"] }
+          status: { $in: [...statuses] }
         }
-      }
-    });
-    expect(vectorCalls[0]?.vector).toHaveLength(1024);
+      });
+      expect(options.filter).not.toHaveProperty("project_id");
+      expect(filterByteLength(options.filter)).toBeLessThan(2_048);
+    }
+    expect(hits).toEqual([
+      expect.objectContaining({
+        memoryId: "memory-late-batch",
+        sourceScore: 0.99
+      })
+    ]);
   });
 
   it("fails closed on malformed embeddings and cross-boundary vector matches", async () => {
@@ -396,7 +693,10 @@ describe("Cloudflare search adapters", () => {
       }
     } as unknown as Ai;
     const crossNamespace = {
-      async query() {
+      async query(_vector: number[], options: VectorizeQueryOptions) {
+        if (options.filter?.repository_partition === "*") {
+          return { count: 0, matches: [] };
+        }
         return {
           count: 1,
           matches: [
@@ -423,7 +723,10 @@ describe("Cloudflare search adapters", () => {
     ).rejects.toThrow("namespace");
 
     const unregisteredTuple = {
-      async query() {
+      async query(_vector: number[], options: VectorizeQueryOptions) {
+        if (options.filter?.repository_partition === "*") {
+          return { count: 0, matches: [] };
+        }
         return {
           count: 1,
           matches: [
@@ -431,14 +734,9 @@ describe("Cloudflare search adapters", () => {
               id: "vector-1",
               score: 0.8,
               namespace: "project-1",
-              metadata: {
-                project_id: "project-1",
-                memory_id: "memory-1",
-                revision_id: "revision-1",
-                chunk_id: "unregistered-chunk",
-                model_generation: "generation-blue",
-                repository_partition: "repo-1"
-              }
+              metadata: semanticVectorMetadata({
+                chunk_id: "unregistered-chunk"
+              })
             }
           ]
         };
@@ -451,7 +749,10 @@ describe("Cloudflare search adapters", () => {
     ).resolves.toEqual([]);
 
     const partiallyPublished = {
-      async query() {
+      async query(_vector: number[], options: VectorizeQueryOptions) {
+        if (options.filter?.repository_partition === "*") {
+          return { count: 0, matches: [] };
+        }
         return {
           count: 2,
           matches: [
@@ -459,27 +760,13 @@ describe("Cloudflare search adapters", () => {
               id: "vector-published",
               score: 0.9,
               namespace: "project-1",
-              metadata: {
-                project_id: "project-1",
-                memory_id: "memory-1",
-                revision_id: "revision-1",
-                chunk_id: "chunk-published",
-                model_generation: "generation-blue",
-                repository_partition: "repo-1"
-              }
+              metadata: semanticVectorMetadata({ chunk_id: "chunk-published" })
             },
             {
               id: "vector-unpublished",
               score: 0.8,
               namespace: "project-1",
-              metadata: {
-                project_id: "project-1",
-                memory_id: "memory-1",
-                revision_id: "revision-1",
-                chunk_id: "chunk-unpublished",
-                model_generation: "generation-blue",
-                repository_partition: "repo-1"
-              }
+              metadata: semanticVectorMetadata({ chunk_id: "chunk-unpublished" })
             }
           ]
         };

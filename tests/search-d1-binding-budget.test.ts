@@ -68,7 +68,7 @@ function maximumFilters(): HardFilterPlan {
   return planHardFilters({
     projectId: "project-1",
     authorizedRepositoryIds: Array.from(
-      { length: 50 },
+      { length: 75 },
       (_, index) => `repository-${String(index).padStart(2, "0")}`
     ),
     statuses: MEMORY_STATUSES,
@@ -221,6 +221,8 @@ describe("D1 search binding budgets", () => {
 
   it("keeps semantic tuple validation below the D1 limit at maximum recall", async () => {
     const records: QueryRecord[] = [];
+    const filters = maximumFilters();
+    const vectorCalls: VectorizeQueryOptions[] = [];
     const matches = Array.from({ length: 20 }, (_, index) => {
       const suffix = String(index).padStart(2, "0");
       return {
@@ -233,7 +235,13 @@ describe("D1 search binding budgets", () => {
           revision_id: `revision-${suffix}`,
           chunk_id: `chunk-${suffix}`,
           model_generation: "generation-blue",
-          repository_partition: "*"
+          status: "active",
+          repository_partition: "*",
+          kind: "fact",
+          memory_class: "semantic",
+          scope_key: "placeholder",
+          valid_from_epoch_ms: Number.MIN_SAFE_INTEGER,
+          valid_until_epoch_ms: Number.MAX_SAFE_INTEGER
         }
       };
     });
@@ -252,8 +260,40 @@ describe("D1 search binding budgets", () => {
       }
     } as unknown as Ai;
     const vectors = {
-      async query() {
-        return { count: matches.length, matches };
+      async query(_vector: number[], options: VectorizeQueryOptions) {
+        vectorCalls.push(options);
+        const filter = options.filter;
+        if (filter === undefined) {
+          throw new Error("Expected a semantic hard filter.");
+        }
+        const firstString = (value: unknown): string => {
+          if (typeof value === "string") {
+            return value;
+          }
+          if (
+            typeof value === "object" &&
+            value !== null &&
+            "$in" in value &&
+            Array.isArray(value.$in) &&
+            typeof value.$in[0] === "string"
+          ) {
+            return value.$in[0];
+          }
+          throw new Error("Expected a nonempty Vectorize string filter.");
+        };
+        const filteredMatches = matches.map((match) => ({
+          ...match,
+          metadata: {
+            ...match.metadata,
+            model_generation: firstString(filter.model_generation),
+            status: firstString(filter.status),
+            repository_partition: firstString(filter.repository_partition),
+            kind: firstString(filter.kind),
+            memory_class: firstString(filter.memory_class),
+            scope_key: firstString(filter.scope_key)
+          }
+        }));
+        return { count: filteredMatches.length, matches: filteredMatches };
       }
     } as unknown as VectorizeIndex;
 
@@ -265,10 +305,64 @@ describe("D1 search binding budgets", () => {
       recallInput({
         query: "authoritative project memory",
         exactReferences: [],
-        filters: maximumFilters()
+        filters
       })
     );
 
+    expect(vectorCalls.length).toBeGreaterThan(1);
+    expect(vectorCalls[0]?.filter?.repository_partition).toBe("*");
+    const recalledRepositoryIds = vectorCalls.slice(1).flatMap((options) => {
+      const partition = options.filter?.repository_partition;
+      if (typeof partition === "string") {
+        return [partition];
+      }
+      if (
+        typeof partition === "object" &&
+        partition !== null &&
+        "$in" in partition &&
+        Array.isArray(partition.$in)
+      ) {
+        return partition.$in;
+      }
+      throw new Error("Unexpected repository partition filter.");
+    });
+    expect(new Set(recalledRepositoryIds.filter((value) => value !== "*"))).toEqual(
+      new Set(filters.authorizedRepositoryIds)
+    );
+    const scopedRepositoryPairs = vectorCalls
+      .filter((options) => options.filter?.repository_partition !== "*")
+      .flatMap((options) => {
+        const partition = options.filter?.repository_partition;
+        const scope = options.filter?.scope_key;
+        const repositories =
+          typeof partition === "string"
+            ? [partition]
+            : typeof partition === "object" &&
+                partition !== null &&
+                "$in" in partition &&
+                Array.isArray(partition.$in)
+              ? partition.$in
+              : [];
+        const scopeKeys =
+          typeof scope === "string"
+            ? [scope]
+            : typeof scope === "object" &&
+                scope !== null &&
+                "$in" in scope &&
+                Array.isArray(scope.$in)
+              ? scope.$in
+              : [];
+        return repositories.flatMap((repositoryId) =>
+          scopeKeys.map((scopeKey) => `${repositoryId}\u0000${scopeKey}`)
+        );
+      });
+    expect(new Set(scopedRepositoryPairs).size).toBe(75 * 50);
+    expect(scopedRepositoryPairs).toHaveLength(75 * 50);
+    for (const options of vectorCalls) {
+      expect(
+        new TextEncoder().encode(JSON.stringify(options.filter)).byteLength
+      ).toBeLessThan(2_048);
+    }
     expect(records).toHaveLength(1);
     expect(records[0]?.sql).toContain("json_each(?)");
     expect(records[0]?.bindings.length).toBeLessThanOrEqual(100);

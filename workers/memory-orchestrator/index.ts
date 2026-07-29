@@ -335,12 +335,25 @@ export function requireCandidatePromotionProvenance(
   return targetRepositoryId;
 }
 
-function requireCandidateCitedEvidenceIds(analysisJson: string | null): string[] {
+function requireCandidateCitedEvidenceIds(
+  analysisJson: string | null,
+  edits: z.infer<typeof candidateReviewSchema>["edits"]
+): string[] | null {
   if (analysisJson === null) {
-    throw new EdgeMnemeError(
-      "VALIDATION_FAILED",
-      "Approval requires a validated evidence citation set."
-    );
+    if (
+      edits === null ||
+      edits.content === undefined ||
+      edits.kind === undefined ||
+      edits.memory_class === undefined ||
+      edits.scope === undefined ||
+      edits.scope_id === undefined
+    ) {
+      throw new EdgeMnemeError(
+        "VALIDATION_FAILED",
+        "Deferred analysis approval requires complete maintainer edits."
+      );
+    }
+    return null;
   }
   try {
     return candidateReviewEvidenceSchema.parse(JSON.parse(analysisJson)).evidence_source_ids;
@@ -838,8 +851,14 @@ export class ProjectCoordinator extends DurableObject<Env> {
           "The formal memory scope does not belong to the project."
         );
       }
-      const citedEvidenceIds = requireCandidateCitedEvidenceIds(current.analysis_json);
-      const evidencePlaceholders = citedEvidenceIds.map(() => "?").join(", ");
+      const citedEvidenceIds = requireCandidateCitedEvidenceIds(
+        current.analysis_json,
+        input.edits
+      );
+      const evidenceFilter =
+        citedEvidenceIds === null
+          ? ""
+          : `AND e.evidence_id IN (${citedEvidenceIds.map(() => "?").join(", ")})`;
       const evidence = await this.env.MEMORY_DB.prepare(
         `SELECT e.evidence_id, e.source_type, e.locator, e.commit_sha, e.excerpt_hash,
                 e.repository_id, e.repository_ref, e.repository_path,
@@ -849,10 +868,11 @@ export class ProjectCoordinator extends DurableObject<Env> {
            ON e.project_id = oe.project_id AND e.evidence_id = oe.evidence_id
          WHERE oe.project_id = ? AND oe.observation_id = ?
            AND e.sensitivity_status = 'clear'
-           AND e.evidence_id IN (${evidencePlaceholders})
-         ORDER BY e.evidence_id ASC`
+           ${evidenceFilter}
+         ORDER BY e.evidence_id ASC
+         LIMIT 51`
       )
-        .bind(input.project_id, input.candidate_id, ...citedEvidenceIds)
+        .bind(input.project_id, input.candidate_id, ...(citedEvidenceIds ?? []))
         .all<{
           evidence_id: string;
           source_type: string;
@@ -864,14 +884,20 @@ export class ProjectCoordinator extends DurableObject<Env> {
           repository_path: string | null;
           repository_authority: string | null;
         }>();
+      const selectedEvidenceIds =
+        citedEvidenceIds ?? evidence.results.map((item) => item.evidence_id);
       const evidenceById = new Map(evidence.results.map((item) => [item.evidence_id, item]));
-      if (evidenceById.size !== citedEvidenceIds.length) {
+      if (
+        selectedEvidenceIds.length === 0 ||
+        selectedEvidenceIds.length > 50 ||
+        evidenceById.size !== selectedEvidenceIds.length
+      ) {
         throw new EdgeMnemeError(
           "VALIDATION_FAILED",
           "The candidate cited evidence is unavailable."
         );
       }
-      const citedEvidence = citedEvidenceIds.map((evidenceId) => {
+      const citedEvidence = selectedEvidenceIds.map((evidenceId) => {
         const item = evidenceById.get(evidenceId);
         if (item === undefined) {
           throw new EdgeMnemeError(
@@ -1275,15 +1301,14 @@ export class MemoryWorkflow extends WorkflowEntrypoint<Env, WorkflowPayload> {
               event.payload.projectId,
               event.payload.projectVersion
             );
-            if (!projectionCurrent) {
-              return null;
+            if (projectionCurrent) {
+              await publishProjectProjection({
+                memoryDb: this.env.MEMORY_DB,
+                projections: this.env.PROJECTIONS,
+                projectId: event.payload.projectId,
+                projectVersion: event.payload.projectVersion
+              });
             }
-            await publishProjectProjection({
-              memoryDb: this.env.MEMORY_DB,
-              projections: this.env.PROJECTIONS,
-              projectId: event.payload.projectId,
-              projectVersion: event.payload.projectVersion
-            });
             await publishMemorySearchProjection({
               memoryDb: this.env.MEMORY_DB,
               searchDb: this.env.SEARCH_DB,

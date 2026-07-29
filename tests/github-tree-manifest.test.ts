@@ -185,6 +185,327 @@ describe("GitHub tree manifest reconciliation", () => {
     ).rejects.toMatchObject({ code: "GITHUB_RECONCILIATION_REQUIRED" });
   });
 
+  it("keeps evidence provenance isolated when refs share the same Git object", async () => {
+    const fixture = createFixture();
+    const trackedRef = "refs/heads/feature";
+    const manifestEntries = await entries([
+      ["docs/context.md", SHA.keep, "text"]
+    ]);
+    const defaultManifest = await descriptor("2026-07-28T00:00:00.000Z");
+    await storeAndActivate(fixture.d1, defaultManifest, manifestEntries, null);
+
+    fixture.database
+      .prepare(
+        `INSERT INTO sync_cursors
+         (project_id, repository_id, ref, observed_sha, status, updated_at)
+         VALUES (?, ?, ?, ?, 'complete', ?)`
+      )
+      .run(PROJECT_ID, REPOSITORY_ID, trackedRef, SHA.commit, NOW);
+    const trackedManifest = await buildGitHubTreeManifestDescriptor({
+      projectId: PROJECT_ID,
+      repositoryId: REPOSITORY_ID,
+      ref: trackedRef,
+      observedSha: SHA.commit,
+      treeSha: SHA.tree,
+      repositoryAuthority: "tracked_ref",
+      collectionKey: "2026-07-28T06:00:00.000Z",
+      createdAt: "2026-07-28T06:00:00.000Z"
+    });
+    await beginGitHubTreeManifest(fixture.d1, trackedManifest);
+    await persistGitHubTreeManifestEntries(
+      fixture.d1,
+      trackedManifest,
+      manifestEntries
+    );
+    await completeGitHubTreeManifest(
+      fixture.d1,
+      trackedManifest,
+      manifestEntries,
+      NOW
+    );
+    await activate(fixture.d1, trackedManifest, null, [], SHA.commit);
+
+    const sharedInput = {
+      projectId: PROJECT_ID,
+      repositoryId: REPOSITORY_ID,
+      externalRepositoryId: 42,
+      defaultBranch: "main",
+      observedSha: SHA.commit,
+      path: "docs/context.md",
+      blobSha: SHA.keep,
+      content: "Durable project context."
+    } as const;
+    const defaultCandidate = await buildGitHubBlobCandidate({
+      ...sharedInput,
+      ref: REF
+    });
+    const trackedCandidate = await buildGitHubBlobCandidate({
+      ...sharedInput,
+      ref: trackedRef
+    });
+
+    expect(trackedCandidate.evidenceId).not.toBe(defaultCandidate.evidenceId);
+    expect(trackedCandidate.locator).not.toBe(defaultCandidate.locator);
+    for (const [manifest, candidate] of [
+      [trackedManifest, trackedCandidate],
+      [defaultManifest, defaultCandidate]
+    ] as const) {
+      const persist = async (): Promise<void> => {
+        await persistGitHubCandidates({
+          database: fixture.d1,
+          projectId: PROJECT_ID,
+          repositoryId: REPOSITORY_ID,
+          repositoryRef: manifest.ref,
+          externalRepositoryId: 42,
+          manifestId: manifest.manifestId,
+          observedSha: SHA.commit,
+          candidates: [candidate]
+        });
+      };
+      await persist();
+      await persist();
+    }
+
+    const linkedProvenance = fixture.database
+      .prepare(
+        `SELECT observation.observation_id, evidence.evidence_id,
+                evidence.repository_ref, evidence.repository_authority
+         FROM observations AS observation
+         JOIN observation_evidence AS link
+           ON link.project_id = observation.project_id
+          AND link.observation_id = observation.observation_id
+         JOIN evidence
+           ON evidence.project_id = link.project_id
+          AND evidence.evidence_id = link.evidence_id
+         WHERE observation.project_id = ? AND evidence.source_type = 'github_blob'
+         ORDER BY evidence.repository_ref`
+      )
+      .all(PROJECT_ID);
+    expect(linkedProvenance).toEqual([
+      {
+        observation_id: trackedCandidate.observation?.observationId,
+        evidence_id: trackedCandidate.evidenceId,
+        repository_ref: trackedRef,
+        repository_authority: "tracked_ref"
+      },
+      {
+        observation_id: defaultCandidate.observation?.observationId,
+        evidence_id: defaultCandidate.evidenceId,
+        repository_ref: REF,
+        repository_authority: "default_branch"
+      }
+    ]);
+    expect(
+      fixture.database
+        .prepare(
+          `SELECT
+             (SELECT COUNT(*) FROM evidence
+              WHERE project_id = ? AND source_type = 'github_blob') AS evidence,
+             (SELECT COUNT(*) FROM observations WHERE project_id = ?) AS observations,
+             (SELECT COUNT(*) FROM observation_evidence WHERE project_id = ?) AS links,
+             (SELECT COUNT(*) FROM outbox_events
+              WHERE project_id = ? AND event_type = 'candidate.submitted') AS outbox`
+        )
+        .get(PROJECT_ID, PROJECT_ID, PROJECT_ID, PROJECT_ID)
+    ).toEqual({ evidence: 2, observations: 2, links: 2, outbox: 2 });
+  });
+
+  it("keeps bodyless tombstones isolated across default and tracked refs", async () => {
+    const fixture = createFixture();
+    const trackedRef = "refs/heads/release";
+    const defaultManifest = await descriptor("2026-07-28T00:00:00.000Z");
+    await storeAndActivate(fixture.d1, defaultManifest, [], null);
+    fixture.database
+      .prepare(
+        `INSERT INTO sync_cursors
+         (project_id, repository_id, ref, observed_sha, status, updated_at)
+         VALUES (?, ?, ?, ?, 'complete', ?)`
+      )
+      .run(PROJECT_ID, REPOSITORY_ID, trackedRef, SHA.commit, NOW);
+    const trackedManifest = await buildGitHubTreeManifestDescriptor({
+      projectId: PROJECT_ID,
+      repositoryId: REPOSITORY_ID,
+      ref: trackedRef,
+      observedSha: SHA.commit,
+      treeSha: SHA.tree,
+      repositoryAuthority: "tracked_ref",
+      collectionKey: "2026-07-28T06:00:00.000Z",
+      createdAt: "2026-07-28T06:00:00.000Z"
+    });
+    await beginGitHubTreeManifest(fixture.d1, trackedManifest);
+    await persistGitHubTreeManifestEntries(fixture.d1, trackedManifest, []);
+    await completeGitHubTreeManifest(fixture.d1, trackedManifest, [], NOW);
+    await activate(fixture.d1, trackedManifest, null, [], SHA.commit);
+
+    const sharedInput = {
+      projectId: PROJECT_ID,
+      repositoryId: REPOSITORY_ID,
+      externalRepositoryId: 42,
+      defaultBranch: "main",
+      observedSha: SHA.commit,
+      path: ".env.production",
+      blobSha: SHA.sensitive,
+      content: "SYNTHETIC_SECRET=value"
+    } as const;
+    const candidates = [
+      [defaultManifest, await buildGitHubBlobCandidate({ ...sharedInput, ref: REF })],
+      [trackedManifest, await buildGitHubBlobCandidate({ ...sharedInput, ref: trackedRef })]
+    ] as const;
+    for (const [manifest, candidate] of candidates) {
+      expect(candidate.sensitivityStatus).toBe("tombstone");
+      expect(candidate.repositoryPath).toBeNull();
+      expect(candidate.observation).toBeUndefined();
+      await persistGitHubCandidates({
+        database: fixture.d1,
+        projectId: PROJECT_ID,
+        repositoryId: REPOSITORY_ID,
+        repositoryRef: manifest.ref,
+        externalRepositoryId: 42,
+        manifestId: manifest.manifestId,
+        observedSha: SHA.commit,
+        candidates: [candidate]
+      });
+    }
+
+    expect(candidates[0][1].evidenceId).not.toBe(candidates[1][1].evidenceId);
+    expect(candidates[0][1].locator).not.toBe(candidates[1][1].locator);
+    expect(
+      fixture.database
+        .prepare(
+          `SELECT
+             (SELECT COUNT(*) FROM evidence
+              WHERE project_id = ? AND source_type = 'github_blob'
+                AND sensitivity_status = 'tombstone') AS evidence,
+             (SELECT COUNT(*) FROM observations WHERE project_id = ?) AS observations,
+             (SELECT COUNT(*) FROM outbox_events
+              WHERE project_id = ? AND event_type = 'candidate.submitted') AS outbox`
+        )
+        .get(PROJECT_ID, PROJECT_ID, PROJECT_ID)
+    ).toEqual({ evidence: 2, observations: 0, outbox: 0 });
+  });
+
+  it.each([
+    ["repository ref", { repositoryRef: "refs/heads/attacker" }],
+    ["repository authority", { repositoryAuthority: "tracked_ref" as const }]
+  ])("fails closed when immutable evidence drifts only in %s", async (_label, drift) => {
+    const fixture = createFixture();
+    const activeManifest = await descriptor("2026-07-28T00:00:00.000Z");
+    await storeAndActivate(fixture.d1, activeManifest, [], null);
+    const candidate = await buildGitHubBlobCandidate({
+      projectId: PROJECT_ID,
+      repositoryId: REPOSITORY_ID,
+      externalRepositoryId: 42,
+      defaultBranch: "main",
+      ref: REF,
+      observedSha: SHA.commit,
+      path: "docs/context.md",
+      blobSha: SHA.keep,
+      content: "Durable project context."
+    });
+    fixture.database
+      .prepare(
+        `INSERT INTO evidence
+         (evidence_id, project_id, source_type, locator, repository_id,
+          repository_ref, repository_path, repository_authority, commit_sha,
+          excerpt_hash, sensitivity_status, recorded_at)
+         VALUES (?, ?, 'github_blob', ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        candidate.evidenceId,
+        PROJECT_ID,
+        candidate.locator,
+        candidate.repositoryId,
+        "repositoryRef" in drift ? drift.repositoryRef : candidate.repositoryRef,
+        candidate.repositoryPath,
+        "repositoryAuthority" in drift
+          ? drift.repositoryAuthority
+          : candidate.repositoryAuthority,
+        SHA.commit,
+        candidate.excerptHash,
+        candidate.sensitivityStatus,
+        NOW
+      );
+
+    await expect(
+      persistGitHubCandidates({
+        database: fixture.d1,
+        projectId: PROJECT_ID,
+        repositoryId: REPOSITORY_ID,
+        repositoryRef: REF,
+        externalRepositoryId: 42,
+        manifestId: activeManifest.manifestId,
+        observedSha: SHA.commit,
+        candidates: [candidate]
+      })
+    ).rejects.toThrow(/evidence identity is immutable/iu);
+    expect(
+      fixture.database
+        .prepare("SELECT COUNT(*) AS count FROM observations WHERE project_id = ?")
+        .get(PROJECT_ID)
+    ).toEqual({ count: 0 });
+  });
+
+  it("fails closed when a stored evidence tuple has a different immutable identity", async () => {
+    const fixture = createFixture();
+    const activeManifest = await descriptor("2026-07-28T00:00:00.000Z");
+    await storeAndActivate(fixture.d1, activeManifest, [], null);
+    const candidate = await buildGitHubBlobCandidate({
+      projectId: PROJECT_ID,
+      repositoryId: REPOSITORY_ID,
+      externalRepositoryId: 42,
+      defaultBranch: "main",
+      ref: REF,
+      observedSha: SHA.commit,
+      path: "docs/context.md",
+      blobSha: SHA.keep,
+      content: "Durable project context."
+    });
+    fixture.database
+      .prepare(
+        `INSERT INTO evidence
+         (evidence_id, project_id, source_type, locator, repository_id,
+          repository_ref, repository_path, repository_authority, commit_sha,
+          excerpt_hash, sensitivity_status, recorded_at)
+         VALUES ('preexisting-evidence', ?, 'github_blob', ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        PROJECT_ID,
+        candidate.locator,
+        candidate.repositoryId,
+        candidate.repositoryRef,
+        candidate.repositoryPath,
+        candidate.repositoryAuthority,
+        SHA.commit,
+        candidate.excerptHash,
+        candidate.sensitivityStatus,
+        NOW
+      );
+
+    await expect(
+      persistGitHubCandidates({
+        database: fixture.d1,
+        projectId: PROJECT_ID,
+        repositoryId: REPOSITORY_ID,
+        repositoryRef: REF,
+        externalRepositoryId: 42,
+        manifestId: activeManifest.manifestId,
+        observedSha: SHA.commit,
+        candidates: [candidate]
+      })
+    ).rejects.toThrow(/evidence identity is immutable/iu);
+    expect(
+      fixture.database
+        .prepare(
+          `SELECT
+             (SELECT COUNT(*) FROM observations WHERE project_id = ?) AS observations,
+             (SELECT COUNT(*) FROM observation_evidence WHERE project_id = ?) AS links,
+             (SELECT COUNT(*) FROM outbox_events
+              WHERE project_id = ? AND event_type = 'candidate.submitted') AS outbox`
+        )
+        .get(PROJECT_ID, PROJECT_ID, PROJECT_ID)
+    ).toEqual({ observations: 0, links: 0, outbox: 0 });
+  });
+
   it("detects deletion during an unchanged-SHA reconciliation and queues bodyless review", async () => {
     const fixture = createFixture();
     const oldEntries = await entries([
@@ -295,6 +616,134 @@ describe("GitHub tree manifest reconciliation", () => {
           PROJECT_ID
         )
     ).toEqual({ deltas: 4, observations: 2, reviews: 2 });
+  });
+
+  it("isolates deletion evidence when tracked refs converge on the same commit", async () => {
+    const fixture = createFixture();
+    const trackedRefs = ["refs/heads/feature-a", "refs/heads/feature-b"] as const;
+    const deletedPath = "private/shared-secret.env";
+    const oldObservedSha = "6".repeat(40);
+    const oldTreeSha = "7".repeat(40);
+    const deletedEntries = await entries([
+      [deletedPath, SHA.sensitive, "sensitive_tombstone"]
+    ]);
+    const deletedEntry = deletedEntries[0];
+    if (deletedEntry === undefined) {
+      throw new Error("The deletion fixture requires one manifest entry");
+    }
+
+    for (const [index, ref] of trackedRefs.entries()) {
+      fixture.database
+        .prepare(
+          `INSERT INTO sync_cursors
+           (project_id, repository_id, ref, observed_sha, status, updated_at)
+           VALUES (?, ?, ?, ?, 'complete', ?)`
+        )
+        .run(PROJECT_ID, REPOSITORY_ID, ref, oldObservedSha, NOW);
+      const oldManifest = await buildGitHubTreeManifestDescriptor({
+        projectId: PROJECT_ID,
+        repositoryId: REPOSITORY_ID,
+        ref,
+        observedSha: oldObservedSha,
+        treeSha: oldTreeSha,
+        repositoryAuthority: "tracked_ref",
+        collectionKey: `2026-07-27T0${index}:00:00.000Z`,
+        createdAt: `2026-07-27T0${index}:00:00.000Z`
+      });
+      await beginGitHubTreeManifest(fixture.d1, oldManifest);
+      await persistGitHubTreeManifestEntries(
+        fixture.d1,
+        oldManifest,
+        deletedEntries
+      );
+      await completeGitHubTreeManifest(
+        fixture.d1,
+        oldManifest,
+        deletedEntries,
+        NOW
+      );
+      await activate(fixture.d1, oldManifest, null, [], oldObservedSha);
+
+      const newManifest = await buildGitHubTreeManifestDescriptor({
+        projectId: PROJECT_ID,
+        repositoryId: REPOSITORY_ID,
+        ref,
+        observedSha: SHA.commit,
+        treeSha: SHA.tree,
+        repositoryAuthority: "tracked_ref",
+        collectionKey: `2026-07-29T0${index}:00:00.000Z`,
+        createdAt: `2026-07-29T0${index}:00:00.000Z`
+      });
+      const expectedHead = await readActiveGitHubTreeHead(
+        fixture.d1,
+        PROJECT_ID,
+        REPOSITORY_ID,
+        ref
+      );
+      await storeAndActivate(fixture.d1, newManifest, [], expectedHead);
+    }
+
+    const evidence = fixture.database
+      .prepare(
+        `SELECT locator, repository_ref, repository_path, sensitivity_status
+         FROM evidence
+         WHERE project_id = ? AND source_type = 'repository_path_absent'
+         ORDER BY repository_ref`
+      )
+      .all(PROJECT_ID) as Array<{
+      locator: string;
+      repository_ref: string;
+      repository_path: string | null;
+      sensitivity_status: string;
+    }>;
+    expect(evidence).toHaveLength(2);
+    expect(evidence.map((row) => row.repository_ref)).toEqual(trackedRefs);
+    expect(new Set(evidence.map((row) => row.locator)).size).toBe(2);
+    for (const [index, row] of evidence.entries()) {
+      const ref = trackedRefs[index];
+      if (ref === undefined) {
+        throw new Error("Every deletion evidence row must map to a tracked ref");
+      }
+      const refDigest = await sha256(["github.ref", ref].join("\n"));
+      expect(row.locator).toBe(
+        `github://42/${SHA.commit}/ref-sha256/${refDigest}/` +
+          `path-sha256/${deletedEntry.pathDigest}`
+      );
+      expect(row.repository_path).toBeNull();
+      expect(row.sensitivity_status).toBe("tombstone");
+    }
+    const serialized = JSON.stringify(
+      fixture.database
+        .prepare(
+          `SELECT evidence.locator, evidence.repository_path, observation.content
+           FROM evidence
+           JOIN observation_evidence AS link
+             ON link.project_id = evidence.project_id
+            AND link.evidence_id = evidence.evidence_id
+           JOIN observations AS observation
+             ON observation.project_id = link.project_id
+            AND observation.observation_id = link.observation_id
+           WHERE evidence.project_id = ?
+             AND evidence.source_type = 'repository_path_absent'`
+        )
+        .all(PROJECT_ID)
+    );
+    expect(serialized).not.toContain(deletedPath);
+    expect(serialized).not.toContain(trackedRefs[0]);
+    expect(serialized).not.toContain(trackedRefs[1]);
+    expect(
+      fixture.database
+        .prepare(
+          `SELECT
+             (SELECT COUNT(*) FROM observations
+              WHERE project_id = ? AND status = 'pending_review') AS observations,
+             (SELECT COUNT(*) FROM observation_evidence
+              WHERE project_id = ?) AS links,
+             (SELECT COUNT(*) FROM review_requests
+              WHERE project_id = ? AND status = 'pending') AS reviews`
+        )
+        .get(PROJECT_ID, PROJECT_ID, PROJECT_ID)
+    ).toEqual({ observations: 2, links: 2, reviews: 2 });
   });
 
   it("retains affected-memory IDs when an earlier clear path later became sensitive", async () => {

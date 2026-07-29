@@ -15,6 +15,7 @@ import {
   estimateProjectionRebuildEtaSeconds,
   projectionRebuildDescriptors,
   projectionRebuildEnqueueIssues,
+  requireVectorizeIndexedString,
   requireActiveSearchGeneration,
   requireProjectionRebuildCleanupDebt,
   sameProjectionRebuildTargets,
@@ -44,10 +45,14 @@ export function projectionRebuildTargetQuery(options = {}) {
   const limit = requirePageLimit(options.limit);
   const clauses = [admittedProjectPredicate("p")];
   if (options.projectId !== undefined) {
-    clauses.push(`p.project_id = ${sqlLiteral(requireIdentifier(options.projectId, "project ID"))}`);
+    clauses.push(
+      `p.project_id = ${sqlLiteral(
+        requireProjectNamespace(options.projectId, "project ID")
+      )}`
+    );
   }
   if (options.cursor !== undefined) {
-    requireCursor(options.cursor, "projectId", "project ID");
+    requireProjectCursor(options.cursor);
     clauses.push(`p.project_id > ${sqlLiteral(options.cursor.projectId)}`);
   }
   return `SELECT p.project_id, p.project_version,
@@ -78,7 +83,9 @@ export function projectionRebuildHeadQuery(options) {
   ];
   if (options?.projectId !== undefined) {
     clauses.push(
-      `p.project_id = ${sqlLiteral(requireIdentifier(options.projectId, "project ID"))}`
+      `p.project_id = ${sqlLiteral(
+        requireProjectNamespace(options.projectId, "project ID")
+      )}`
     );
   }
   if (options?.cursor !== undefined) {
@@ -103,8 +110,8 @@ export function projectionRebuildHeadQuery(options) {
 }
 
 export function projectionRebuildSearchHeadQuery(options) {
-  const generationId = requireIdentifier(
-    options?.searchGenerationId,
+  const generationId = requireVectorizeIndexedString(
+    requireIdentifier(options?.searchGenerationId, "search generation ID"),
     "search generation ID"
   );
   const limit = requirePageLimit(options?.limit);
@@ -114,7 +121,9 @@ export function projectionRebuildSearchHeadQuery(options) {
   ];
   if (options?.projectId !== undefined) {
     clauses.push(
-      `h.project_id = ${sqlLiteral(requireIdentifier(options.projectId, "project ID"))}`
+      `h.project_id = ${sqlLiteral(
+        requireProjectNamespace(options.projectId, "project ID")
+      )}`
     );
   }
   if (options?.cursor !== undefined) {
@@ -136,14 +145,14 @@ export function projectionRebuildSearchHeadQuery(options) {
 }
 
 export function projectionRebuildCleanupDebtQuery(options) {
-  const generationId = requireIdentifier(
-    options?.searchGenerationId,
+  const generationId = requireVectorizeIndexedString(
+    requireIdentifier(options?.searchGenerationId, "search generation ID"),
     "search generation ID"
   );
   const projectClause = options?.projectId === undefined
     ? ""
     : ` AND debt.project_id = ${sqlLiteral(
-        requireIdentifier(options.projectId, "project ID")
+        requireProjectNamespace(options.projectId, "project ID")
       )}`;
   const headlessOwner =
     `NOT EXISTS (
@@ -165,13 +174,16 @@ export function projectionRebuildCleanupDebtQuery(options) {
 }
 
 export function resolveProjectionRepositoryPartition(input) {
-  const projectId = requireIdentifier(input?.projectId, "project ID");
+  const projectId = requireProjectNamespace(input?.projectId, "project ID");
   const scope = requireIdentifier(input?.scope, "memory scope");
   const scopeId = requireIdentifier(input?.scopeId, "memory scope ID");
   if (scope === "project" && scopeId === projectId) {
     return "*";
   }
-  return requireIdentifier(input?.repositoryId, "repository partition");
+  return requireVectorizeIndexedString(
+    requireIdentifier(input?.repositoryId, "repository partition"),
+    "repository partition"
+  );
 }
 
 export function withProjectionRebuildEnumerationBudget(plan, input) {
@@ -305,7 +317,7 @@ export function parseProjectionRebuildArguments(args) {
       }
       parsed.config = value;
     } else if (argument === "--project-id") {
-      parsed.projectId = requireIdentifier(value, "project ID");
+      parsed.projectId = requireProjectNamespace(value, "project ID");
     } else if (argument === "--wait-seconds") {
       const seconds = Number(value);
       if (!Number.isSafeInteger(seconds) || seconds < 0 || seconds > 3_600) {
@@ -854,8 +866,15 @@ function requireCursor(cursor, key, label) {
   requireIdentifier(cursor[key], `cursor ${label}`);
 }
 
+function requireProjectCursor(cursor) {
+  if (typeof cursor !== "object" || cursor === null) {
+    throw new TypeError("The projection rebuild cursor is invalid.");
+  }
+  requireProjectNamespace(cursor.projectId, "cursor project ID");
+}
+
 function requireHeadCursor(cursor) {
-  requireCursor(cursor, "projectId", "project ID");
+  requireProjectCursor(cursor);
   requireCursor(cursor, "memoryId", "memory ID");
 }
 
@@ -877,6 +896,13 @@ function requireIdentifier(value, label) {
     throw new TypeError(`The ${label} is invalid.`);
   }
   return value;
+}
+
+function requireProjectNamespace(value, label) {
+  return requireVectorizeIndexedString(
+    requireIdentifier(value, label),
+    "project namespace"
+  );
 }
 
 function printUsage() {

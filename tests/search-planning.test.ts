@@ -51,6 +51,54 @@ describe("search planning", () => {
     ).toEqual([]);
   });
 
+  it("keeps complete repository authorization sets above the user-filter ceiling", () => {
+    const repositoryIds = Array.from(
+      { length: 51 },
+      (_, index) => `repository-${String(50 - index).padStart(2, "0")}`
+    );
+
+    expect(
+      planHardFilters({
+        projectId: "project-1",
+        authorizedRepositoryIds: repositoryIds
+      }).authorizedRepositoryIds
+    ).toEqual(
+      Array.from(
+        { length: 51 },
+        (_, index) => `repository-${String(index).padStart(2, "0")}`
+      )
+    );
+    expect(() =>
+      planHardFilters({
+        projectId: "project-1",
+        scope: {
+          type: "repository",
+          ids: Array.from({ length: 51 }, (_, index) => `repository-${index}`)
+        }
+      })
+    ).toThrow("scope must contain between 1 and 50 identifiers");
+  });
+
+  it("rejects repository partitions that exceed Vectorize's indexed string width", () => {
+    expect(() =>
+      planHardFilters({
+        projectId: "仓".repeat(22)
+      })
+    ).toThrow("64 UTF-8 bytes");
+    expect(() =>
+      planHardFilters({
+        projectId: "project-1",
+        authorizedRepositoryIds: ["仓".repeat(22)]
+      })
+    ).toThrow("64 UTF-8 bytes");
+    expect(() =>
+      planHardFilters({
+        projectId: "project-1",
+        indexGeneration: "g".repeat(65)
+      })
+    ).toThrow("64 UTF-8 bytes");
+  });
+
   it("detects exact memory IDs, paths, SHAs, and symbols without treating prose as exact", () => {
     const references = detectExactReferences(
       "Check memory-018fd, src/search/pipeline.ts, commit deadbeefcafebabe and SearchPipeline.run()."
