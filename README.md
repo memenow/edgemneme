@@ -16,7 +16,7 @@ The implementation includes the MCP contract, project and repository
 authorization, repository-bound sessions and evidence, guarded formal-memory
 commits, candidate review and session consolidation, hybrid FTS/Vectorize
 retrieval and reranking, immutable R2 snapshots, durable recovery for dispatched
-Workflow-backed outbox events, and a fail-closed scheduled GitHub reader. The
+Workflow-backed outbox events, and a fail-closed Workflow-backed GitHub reader. The
 open-source repository keeps only non-deployable Wrangler templates. GitHub
 Actions renders private deployment configuration from the protected
 `production` environment.
@@ -35,6 +35,9 @@ of the default deployment path.
   project bearer token, creates a fresh `McpServer` for every request, serves
   `/mcp`, applies project and repository grants before reads or writes, accepts
   candidates, and dispatches formal changes to a project-scoped Durable Object.
+  Authenticated POST bodies are limited to 2 MiB of request-body bytes visible
+  to the Worker and may use only the identity content coding before the MCP
+  transport parses them.
 - `memory-orchestrator` is the only Queue consumer. It owns the
   `ProjectCoordinator` Durable Object and `MemoryWorkflow`, commits formal
   changes through guarded D1 batches, and creates immutable R2 projections. Its
@@ -44,26 +47,38 @@ of the default deployment path.
   explicit terminal failures may use the stable base Workflow ID plus three
   bounded repair IDs. Projection rebuilds retain a separate reconciliation
   protocol and immutable execution history.
-- `github-sync` has only a six-hour UTC Scheduled Trigger. It is the only Worker
-  that receives the GitHub credential, and its client permits only fixed-origin
-  read requests. It verifies repository and owner numeric IDs, requires GitHub's
-  token-expiration response header, and emits durable 14-, 7-, and 1-day expiry
-  warnings without storing credential material. The 00:00 UTC poll reconciles
-  every current tree even when its ref SHA is unchanged. Each successful pass
-  atomically activates an immutable, checksummed D1 tree manifest; path deletions
-  create bodyless maintainer-review items and never mutate formal memory. Safe
-  text blobs no larger than 16 KiB become evidence-linked candidates. Secret, PII,
-  prompt-transcript, raw-log, and sensitive-path inputs create only a bodyless
-  tombstone with only a path digest in the manifest. Generated and binary blobs
-  remain represented by excluded manifest entries. Larger text or an exhausted
-  request budget fails the run with `GITHUB_PARTIAL_SYNC`; a failed staging
-  manifest never advances the active head or synchronization cursor. Failed
-  manifests and their immutable lifecycle events record only an enumerated code,
-  timestamps, entry count, and checksum. After 30 days, fair scheduled retention
-  removes entries in audited 500-entry transactions with persistent lane
-  rotation and retry backoff, then atomically leaves a bodyless `purged`
-  tombstone and terminal event. Complete and active manifests are never
-  eligible.
+- `github-sync` exposes no public route. Its six-hour UTC Scheduled Trigger only
+  creates or recovers stable dispatch and retention Workflow instances. The
+  dispatcher validates the credential and repository-access baseline,
+  materializes every due ref as a durable D1 item, and creates bounded per-ref
+  Workflow children in batches of at most 100. A D1 credential lane serializes
+  PAT access across Workflow isolates with claim and epoch fencing. Access
+  discovery is bounded to 900 GitHub requests; each ref attempt is independently
+  bounded to 2,005 requests, 2,000 inspected text files, and 16 MiB of retrieved
+  content. Every due ref is durably scheduled, but GitHub's shared PAT limits mean
+  completion within the same six-hour slot is not guaranteed. The first due item
+  for each ref on a UTC day performs a complete current-tree reconciliation, even
+  when its child starts later or the midnight trigger was missed. Each successful
+  pass atomically activates an immutable, checksummed D1 tree manifest. A
+  pre-state witness and immutable final-state receipt bind activation to the
+  claimed repository configuration, cursor, active head, ref, and synchronization
+  run. Safe text blobs no larger than 16 KiB become evidence-linked candidates;
+  secret, PII, prompt-transcript, raw-log, sensitive-path, generated, and binary
+  inputs never become model content. Failed or partial work never advances the
+  active head or cursor. Retention runs in a separate Workflow and purges eligible
+  failed manifests after 30 days in audited, bounded transactions; it cannot undo
+  or block a repository synchronization.
+- Session consolidation freezes deterministic batch indexes under an owner,
+  claim ID, and monotonic lease epoch. Each model batch runs in a separately
+  named Workflow step, renews its lease before receipt recovery or execution,
+  applies the sensitive-input gate to both individual and aggregate input, and commits its
+  candidate artifacts plus an immutable receipt in one fenced D1 batch. Empty
+  result batches also receive a receipt. Exact receipt recovery is the only
+  accepted replay after an ambiguous D1 response, and consolidation cannot
+  finish until the exact receipt coordinates and their frozen post-state are
+  validated from a compact D1 summary. A 9,000-batch application cap reserves
+  space below the pinned
+  10,000-step Workflow limit and fails closed before AI without truncation.
 - `claude-runner` is present as a disabled boundary only. It is not part of the
   default deployment path.
 
@@ -75,16 +90,23 @@ analysis and consolidation, `@cf/qwen/qwen3-embedding-0.6b` for 1,024-dimensiona
 embeddings, and `@cf/baai/bge-reranker-base` for reranking. Structured analysis
 uses one forced GLM function call and has no silent model fallback. The model
 receives server-generated opaque scope options instead of raw project or
-repository IDs and must cite evidence bound to the selected option. A
+repository IDs or refs and must cite evidence bound to the selected option. The
+complete canonical candidate payload is scanned for sensitive content before
+Workers AI is called. A
 single-repository claim may be proposed as reusable project memory, but that
 proposal always requires maintainer review. Model output never grants access or
 writes formal memory. It must pass local schema, scope, evidence, provenance, and
-temporal checks before it can create a review candidate. Cloudflare advertises a
-262,144-token GLM context window, while its Workers AI request path currently
-enforces a 256,000-token combined input and requested-completion ceiling.
-EdgeMneme assigns the largest safe completion allowance from that ceiling after
+temporal checks before it can create a review candidate. Cloudflare publishes a
+262,144-token context window for GLM-5.2. EdgeMneme uses that context window as
+the total request budget and assigns the largest safe completion allowance after
 subtracting UTF-8 upper bounds for messages and the function contract plus fixed
-chat-template overhead; it adds no smaller application output cap.
+chat-template overhead; it adds no smaller generation-token cap. Independently,
+non-streaming function arguments have a 1 MiB transport and parse-safety limit.
+After schema parsing, serialized UTF-8 JSON is limited to 256 KiB for candidate
+analysis and 1 MiB for consolidation suggestions. These are byte limits, not
+character estimates. Consolidation batch steps persist accepted results and
+return no model payload to Workflow storage; even the maximum 9,000-entry batch
+index result remains below Workflow's 1 MiB step-result limit.
 
 ## Repository boundaries
 
@@ -114,8 +136,9 @@ physical deployment per repository or project.
 
 - Node.js 24 or later
 - pnpm 10
-- A Cloudflare account with Workers, D1, R2, Queues, Workflows, Vectorize, and
-  Workers AI
+- A Cloudflare Workers Paid account with D1, R2, Queues, Workflows, Vectorize,
+  and Workers AI. The production contract requires Paid-plan GLM-5.2 access,
+  10,000 Workflow steps, and the configured subrequest and CPU limits.
 - A separately approved, expiring GitHub PAT (classic) if private-repository
   sync is enabled
 
@@ -190,25 +213,36 @@ secrets. `GITHUB_CLASSIC_TOKEN` is required only for an approved GitHub sync
 deployment. Never place secret values in tracked files, D1, R2, Queue messages,
 logs, artifacts, or issue comments.
 
-After rendering a deployment config locally, an operator can also rotate Worker
-secrets interactively on an existing Worker:
+After rendering a deployment config locally, an operator can rotate the gateway
+secrets interactively on the existing gateway Worker:
 
 ```bash
 pnpm exec wrangler secret put TOKEN_DIGEST_PEPPER \
   --config wrangler/.wrangler/memory-gateway.generated.jsonc
 pnpm exec wrangler secret put PAGE_TOKEN_HMAC_KEY \
   --config wrangler/.wrangler/memory-gateway.generated.jsonc
-pnpm exec wrangler secret put GITHUB_CLASSIC_TOKEN \
-  --config wrangler/.wrangler/github-sync.generated.jsonc
 ```
+
+Do not rotate `GITHUB_CLASSIC_TOKEN` with `wrangler secret put`. GitHub sync
+binds every dispatch and recovery receipt to `SYNC_CREDENTIAL_VERSION`, so the
+token and its new version must be promoted together through the drained
+deployment procedure in the operations runbook.
 
 The deploy workflow validates source templates, renders ignored configuration,
 deploys `memory-orchestrator` before `memory-gateway`, and reconciles
 `github-sync` to the explicit lifecycle gate. Enabling sync installs exactly one
-six-hour Cron Trigger and its Worker secret. Disabling sync leaves an absent
-Worker absent; an existing Worker is redeployed inert, stripped of Cron
-Triggers, and stripped of its Cloudflare secret. Production D1 migrations use
-the separate manual workflow and require the exact confirmation value `APPLY`.
+six-hour Cron Trigger, three private Workflow definitions, and its Worker secret.
+Disabling sync leaves an absent Worker absent. An existing Worker is first
+redeployed inert with no Cron while retaining its secret. The workflow then
+exhaustively drains Cloudflare Workflow instances. After proving the exact
+disabled Worker, empty schedule, and no nonterminal GitHub Workflow, the
+protected Action may reconcile only the GitHub synchronization ledgers through
+bounded, receipt-verified D1 transactions. It rechecks the control plane after
+every pass and requires two all-zero observations 60 seconds apart before
+deleting the Worker secret. This operational writer cannot change formal memory.
+Unknown, malformed, rate-limited, or drifting control-plane state fails closed.
+Production D1 migrations use the separate manual workflow and require the exact
+confirmation value `APPLY`.
 
 Each device or agent receives a separate random project token. Store only its
 HMAC digest in `principals.token_digest`; the plaintext token is shown once to
@@ -222,7 +256,7 @@ src/                         Shared contracts, security, storage, and projection
 tests/                       Deterministic unit and security contract tests
 workers/memory-gateway/      Public Streamable HTTP MCP Worker
 workers/memory-orchestrator/ Queue, Workflow, and Durable Object Worker
-workers/github-sync/         Scheduled-only GitHub reader
+workers/github-sync/         Private Workflow-backed GitHub reader
 workers/claude-runner/       Disabled optional escalation boundary
 wrangler/                    One source-of-truth configuration per Worker
 .github/workflows/           Validation, deployment, and manual migration workflows

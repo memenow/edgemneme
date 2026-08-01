@@ -19,6 +19,10 @@ const EVIDENCE_A = {
   repositoryAuthority: "default_branch" as const
 };
 
+const DELETION_CANDIDATE_ID =
+  `github-path-absent-observation:${"a".repeat(64)}:` +
+  `${"b".repeat(64)}:${"c".repeat(64)}`;
+
 describe("candidate review evidence-to-scope provenance", () => {
   it("accepts a repository target only when trusted contexts agree", () => {
     expect(
@@ -316,6 +320,92 @@ describe("candidate review evidence-to-scope provenance", () => {
     }
   );
 
+  it.each(["reject", "request_changes"] as const)(
+    "resolves a bodyless GitHub path-absence candidate with %s",
+    async (decision) => {
+      const database = new ReviewDatabase("repository-a", {
+        analysisJson: null,
+        candidateContent: null,
+        evidenceRows: [
+          evidenceRow("evidence-tombstone", "repository-a", "tombstone")
+        ]
+      });
+      const coordinator = Object.assign(Object.create(ProjectCoordinator.prototype), {
+        env: reviewEnvironment(database)
+      });
+      const response = await ProjectCoordinator.prototype.fetch.call(
+        coordinator,
+        candidateReviewRequest("repository-a", {}, {
+          candidateId: DELETION_CANDIDATE_ID,
+          decision,
+          reason: "The deleted path requires an explicit maintainer disposition.",
+          edits: null
+        })
+      );
+
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toMatchObject({
+        candidate_id: DELETION_CANDIDATE_ID,
+        status: decision === "reject" ? "rejected" : "request_changes"
+      });
+      expect(database.batches).toHaveLength(1);
+    }
+  );
+
+  it("does not approve a bodyless GitHub path-absence candidate", async () => {
+    const database = new ReviewDatabase("repository-a", {
+      candidateContent: null,
+      evidenceRows: [
+        evidenceRow("evidence-tombstone", "repository-a", "tombstone")
+      ]
+    });
+    const coordinator = Object.assign(Object.create(ProjectCoordinator.prototype), {
+      env: reviewEnvironment(database)
+    });
+    const response = await ProjectCoordinator.prototype.fetch.call(
+      coordinator,
+      candidateReviewRequest("repository-a", {}, {
+        candidateId: DELETION_CANDIDATE_ID,
+        decision: "approve"
+      })
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({ code: "VALIDATION_FAILED" });
+    expect(database.batches).toHaveLength(0);
+  });
+
+  it("does not promote a GitHub path-absence candidate from tombstone-only evidence", async () => {
+    const database = new ReviewDatabase("repository-a", {
+      analysisJson: null,
+      candidateContent: null,
+      evidenceRows: [
+        evidenceRow("evidence-tombstone", "repository-a", "tombstone")
+      ]
+    });
+    const coordinator = Object.assign(Object.create(ProjectCoordinator.prototype), {
+      env: reviewEnvironment(database)
+    });
+    const response = await ProjectCoordinator.prototype.fetch.call(
+      coordinator,
+      candidateReviewRequest("repository-a", {}, {
+        candidateId: DELETION_CANDIDATE_ID,
+        decision: "approve",
+        edits: {
+          content: "The deleted path should remain absent.",
+          kind: "fact",
+          memory_class: "semantic",
+          scope: "repository",
+          scope_id: "repository-a"
+        }
+      })
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({ code: "VALIDATION_FAILED" });
+    expect(database.batches).toHaveLength(0);
+  });
+
   it.each([
     ["an empty citation list", []],
     ["a forged citation", ["evidence-forged"]]
@@ -577,6 +667,7 @@ function candidateReviewRequest(
   repositoryId: string,
   edits: Record<string, unknown> = {},
   overrides: {
+    candidateId?: string;
     decision?: "approve" | "reject" | "request_changes";
     reason?: string;
     edits?: Record<string, unknown> | null;
@@ -595,7 +686,8 @@ function candidateReviewRequest(
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
-      candidate_id: "00000000-0000-4000-8000-000000000001",
+      candidate_id:
+        overrides.candidateId ?? "00000000-0000-4000-8000-000000000001",
       expected_candidate_version: 1,
       decision: overrides.decision ?? "approve",
       reason: overrides.reason ?? "The repository provenance is verified.",
@@ -632,6 +724,7 @@ class ReviewDatabase {
   readonly reads: CapturedStatement[] = [];
   private readonly citedEvidenceIds: unknown;
   private readonly analysisJson: string | null;
+  private readonly candidateContent: string | null;
   private readonly evidenceRows: Array<Record<string, unknown>>;
   private readonly snapshotAuthority: {
     memory_count: number;
@@ -646,6 +739,7 @@ class ReviewDatabase {
     options: {
       citedEvidenceIds?: unknown;
       analysisJson?: string | null;
+      candidateContent?: string | null;
       evidenceRows?: Array<Record<string, unknown>>;
       snapshotAuthority?: {
         memory_count: number;
@@ -663,6 +757,9 @@ class ReviewDatabase {
           persistent_value: true,
           evidence_source_ids: this.citedEvidenceIds
         });
+    this.candidateContent = Object.hasOwn(options, "candidateContent")
+      ? (options.candidateContent ?? null)
+      : "Repository A uses pnpm.";
     this.evidenceRows = options.evidenceRows ?? [evidenceRow("evidence-a", "repository-a")];
     this.snapshotAuthority = options.snapshotAuthority ?? {
       memory_count: 1,
@@ -706,7 +803,7 @@ class ReviewDatabase {
             audit_head_hash: null,
             candidate_version: 1,
             status: "pending_review",
-            content: "Repository A uses pnpm.",
+            content: database.candidateContent,
             reviewed_content: null,
             kind: deferred ? null : "fact",
             memory_class: deferred ? null : "semantic",

@@ -1,6 +1,11 @@
 import type { MemoryEvent } from "../gateway/service";
 import { sha256 } from "../security/crypto";
 import { GitHubSyncError } from "./client";
+import {
+  pendingGitHubSyncActivationGuardBindings,
+  pendingGitHubSyncActivationGuardSql,
+  type PendingGitHubSyncActivationFence
+} from "./sync-activation-fence";
 
 const MAX_BATCH_BYTES = 256 * 1024;
 const MAX_BATCH_ROWS = 100;
@@ -93,22 +98,6 @@ export async function buildGitHubTombstoneEvidenceLocator(input: {
   );
 }
 
-export async function persistGitHubCandidates(input: {
-  database: D1Database;
-  projectId: string;
-  repositoryId: string;
-  repositoryRef: string;
-  externalRepositoryId: number;
-  manifestId: string;
-  observedSha: string;
-  candidates: readonly PersistableGitHubCandidate[];
-}): Promise<void> {
-  const statements = await prepareGitHubCandidateStatements(input);
-  if (statements.length > 0) {
-    await input.database.batch(statements);
-  }
-}
-
 export async function prepareGitHubCandidateStatements(input: {
   database: D1Database;
   projectId: string;
@@ -117,6 +106,7 @@ export async function prepareGitHubCandidateStatements(input: {
   externalRepositoryId: number;
   manifestId: string;
   observedSha: string;
+  activationFence: PendingGitHubSyncActivationFence;
   candidates: readonly PersistableGitHubCandidate[];
 }): Promise<D1PreparedStatement[]> {
   const target = await input.database
@@ -146,6 +136,7 @@ export async function prepareGitHubCandidateStatements(input: {
   ) {
     throw new GitHubSyncError("GITHUB_RECONCILIATION_REQUIRED");
   }
+  validateCandidateActivationFence(input, target);
   const prepared = await Promise.all(
     input.candidates.map(async (candidate): Promise<PreparedCandidate> => {
       if (
@@ -205,9 +196,37 @@ export async function prepareGitHubCandidateStatements(input: {
 
   const statements: D1PreparedStatement[] = [];
   for (const chunk of chunkPreparedCandidates(prepared)) {
-    statements.push(...buildChunkStatements(input, chunk));
+    statements.push(
+      ...buildChunkStatements(input, chunk)
+    );
   }
   return statements;
+}
+
+function validateCandidateActivationFence(
+  input: {
+    projectId: string;
+    repositoryId: string;
+    repositoryRef: string;
+    externalRepositoryId: number;
+    manifestId: string;
+    activationFence: PendingGitHubSyncActivationFence;
+  },
+  target: CandidateTargetRow
+): void {
+  const fence = input.activationFence;
+  if (
+    fence.projectId !== input.projectId ||
+    fence.repositoryId !== input.repositoryId ||
+    fence.ref !== input.repositoryRef ||
+    fence.manifestId !== input.manifestId ||
+    fence.repositoryAuthority !== target.repository_authority ||
+    fence.expectedExternalId !== input.externalRepositoryId ||
+    !/^[0-9a-f]{64}$/u.test(fence.receiptId) ||
+    !/^[0-9a-f]{64}$/u.test(fence.activationToken)
+  ) {
+    throw new GitHubSyncError("GITHUB_RECONCILIATION_REQUIRED");
+  }
 }
 
 function hasDigestOnlyLocator(
@@ -217,7 +236,10 @@ function hasDigestOnlyLocator(
 ): boolean {
   const prefix =
     `github://${externalRepositoryId}/${observedSha}/path-sha256/`;
-  return locator.startsWith(prefix) && /^[0-9a-f]{64}$/u.test(locator.slice(prefix.length));
+  return (
+    locator.startsWith(prefix) &&
+    /^[0-9a-f]{64}$/u.test(locator.slice(prefix.length))
+  );
 }
 
 function buildChunkStatements(
@@ -229,10 +251,15 @@ function buildChunkStatements(
     externalRepositoryId: number;
     manifestId: string;
     observedSha: string;
+    activationFence: PendingGitHubSyncActivationFence;
   },
   chunk: readonly PreparedCandidate[]
 ): D1PreparedStatement[] {
   const now = new Date().toISOString();
+  const activationGuardSql = pendingGitHubSyncActivationGuardSql();
+  const activationGuardBindings = pendingGitHubSyncActivationGuardBindings(
+    input.activationFence
+  );
   const evidenceRows = chunk.map(({ candidate }) => [
     candidate.evidenceId,
     candidate.locator,
@@ -266,16 +293,14 @@ function buildChunkStatements(
                 json_extract(value, '$[3]'), json_extract(value, '$[4]'), ?,
                 json_extract(value, '$[5]'), NULL, json_extract(value, '$[6]'), ?
          FROM json_each(?) AS candidate
-         JOIN github_tree_ref_heads AS head
-           ON head.project_id = ? AND head.repository_id = ?
-          AND head.ref = ? AND head.manifest_id = ?
          JOIN github_tree_manifests AS manifest
-           ON manifest.project_id = head.project_id
-          AND manifest.manifest_id = head.manifest_id
+           ON manifest.project_id = ? AND manifest.repository_id = ?
+          AND manifest.ref = ? AND manifest.manifest_id = ?
           AND manifest.observed_sha = ?
+          AND manifest.status = 'complete'
          JOIN repositories AS repository
-           ON repository.project_id = head.project_id
-          AND repository.repository_id = head.repository_id
+           ON repository.project_id = manifest.project_id
+          AND repository.repository_id = manifest.repository_id
           AND repository.external_id = ?
          WHERE json_extract(value, '$[4]') = manifest.repository_authority
            AND (
@@ -285,18 +310,17 @@ function buildChunkStatements(
                manifest.observed_sha || '/path-sha256/' ||
                substr(json_extract(value, '$[1]'), -64)
            )
+           AND (${activationGuardSql})
          ON CONFLICT(project_id, source_type, locator, excerpt_hash) DO UPDATE SET
-           evidence_id = CASE
-             WHEN evidence.evidence_id IS excluded.evidence_id
-              AND evidence.repository_id IS excluded.repository_id
-              AND evidence.repository_ref IS excluded.repository_ref
-              AND evidence.repository_path IS excluded.repository_path
-              AND evidence.repository_authority IS excluded.repository_authority
-              AND evidence.commit_sha IS excluded.commit_sha
-              AND evidence.sensitivity_status IS excluded.sensitivity_status
-             THEN evidence.evidence_id
-             ELSE evidence.evidence_id || ':conflict'
-           END`
+           sensitivity_status = 'github_activation_conflict'
+         WHERE NOT (
+           evidence.evidence_id IS excluded.evidence_id
+           AND evidence.repository_id IS excluded.repository_id
+           AND evidence.repository_ref IS excluded.repository_ref
+           AND evidence.repository_path IS excluded.repository_path
+           AND evidence.repository_authority IS excluded.repository_authority
+           AND evidence.commit_sha IS excluded.commit_sha
+         )`
       )
       .bind(
         input.projectId,
@@ -309,7 +333,8 @@ function buildChunkStatements(
         input.repositoryRef,
         input.manifestId,
         input.observedSha,
-        input.externalRepositoryId
+        input.externalRepositoryId,
+        ...activationGuardBindings
       )
   ];
 
@@ -341,21 +366,25 @@ function buildChunkStatements(
                   json_extract(value, '$[1]'), json_extract(value, '$[2]'),
                   json_extract(value, '$[3]'), ?, ?
            FROM json_each(?) AS candidate
-           JOIN github_tree_ref_heads AS head
-             ON head.project_id = ? AND head.repository_id = ?
-            AND head.ref = ? AND head.manifest_id = ?
-           WHERE 1
-           ON CONFLICT(project_id, observation_id) DO NOTHING`
+           WHERE ${activationGuardSql}
+           ON CONFLICT(project_id, observation_id) DO UPDATE SET
+             candidate_version = 0
+           WHERE NOT (
+             observations.session_id IS excluded.session_id
+             AND observations.principal_id IS excluded.principal_id
+             AND observations.content IS excluded.content
+             AND observations.content_sha256 IS excluded.content_sha256
+             AND observations.evidence_json IS excluded.evidence_json
+             AND observations.source_consolidation_id IS
+               excluded.source_consolidation_id
+           )`
         )
         .bind(
           input.projectId,
           now,
           now,
           JSON.stringify(observationRows),
-          input.projectId,
-          input.repositoryId,
-          input.repositoryRef,
-          input.manifestId
+          ...activationGuardBindings
         ),
       input.database
         .prepare(
@@ -371,11 +400,7 @@ function buildChunkStatements(
              SELECT 1 FROM evidence AS evidence
              WHERE evidence.project_id = ?
                AND evidence.evidence_id = json_extract(value, '$[1]')
-           ) AND EXISTS (
-             SELECT 1 FROM github_tree_ref_heads AS head
-             WHERE head.project_id = ? AND head.repository_id = ?
-               AND head.ref = ? AND head.manifest_id = ?
-           )
+           ) AND (${activationGuardSql})
            ON CONFLICT(project_id, observation_id, evidence_id) DO NOTHING`
         )
         .bind(
@@ -384,10 +409,7 @@ function buildChunkStatements(
           JSON.stringify(linkRows),
           input.projectId,
           input.projectId,
-          input.projectId,
-          input.repositoryId,
-          input.repositoryRef,
-          input.manifestId
+          ...activationGuardBindings
         ),
       input.database
         .prepare(
@@ -399,20 +421,21 @@ function buildChunkStatements(
                   json_extract(value, '$[1]'), json_extract(value, '$[2]'), ?
            FROM json_each(?)
            JOIN projects AS project ON project.project_id = ?
-           JOIN github_tree_ref_heads AS head
-             ON head.project_id = project.project_id
-            AND head.repository_id = ? AND head.ref = ?
-            AND head.manifest_id = ?
-           WHERE 1
-           ON CONFLICT(event_id) DO NOTHING`
+           WHERE ${activationGuardSql}
+           ON CONFLICT(event_id) DO UPDATE SET
+             attempt = -1
+           WHERE NOT (
+             outbox_events.project_id IS excluded.project_id
+             AND outbox_events.event_type IS excluded.event_type
+             AND outbox_events.payload_digest IS excluded.payload_digest
+             AND outbox_events.payload_json IS excluded.payload_json
+           )`
         )
         .bind(
           now,
           JSON.stringify(outboxRows),
           input.projectId,
-          input.repositoryId,
-          input.repositoryRef,
-          input.manifestId
+          ...activationGuardBindings
         )
     );
   }
@@ -426,7 +449,8 @@ function chunkPreparedCandidates(
   let current: PreparedCandidate[] = [];
   let currentBytes = 2;
   for (const candidate of candidates) {
-    const nextBytes = currentBytes + candidate.encodedBytes + (current.length === 0 ? 0 : 1);
+    const nextBytes =
+      currentBytes + candidate.encodedBytes + (current.length === 0 ? 0 : 1);
     if (
       current.length > 0 &&
       (current.length >= MAX_BATCH_ROWS || nextBytes > MAX_BATCH_BYTES)

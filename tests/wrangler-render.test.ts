@@ -24,6 +24,27 @@ const baseEnvironment = {
   ENABLE_GITHUB_SYNC: "true"
 };
 
+const githubSyncWorkflows = [
+  {
+    binding: "GITHUB_DISPATCH_WORKFLOW",
+    name: "edgemneme-github-dispatch-workflow",
+    class_name: "GitHubDispatchWorkflow",
+    limits: { steps: 10_000 }
+  },
+  {
+    binding: "GITHUB_REF_SYNC_WORKFLOW",
+    name: "edgemneme-github-ref-sync-workflow",
+    class_name: "GitHubRefSyncWorkflow",
+    limits: { steps: 10_000 }
+  },
+  {
+    binding: "GITHUB_RETENTION_WORKFLOW",
+    name: "edgemneme-github-retention-workflow",
+    class_name: "GitHubRetentionWorkflow",
+    limits: { steps: 10_000 }
+  }
+] as const;
+
 function sourceConfig(name: string): Record<string, unknown> {
   return JSON.parse(readFileSync(join(root, "wrangler", `${name}.jsonc`), "utf8")) as Record<
     string,
@@ -130,6 +151,7 @@ describe("Wrangler deployment config renderer", () => {
       },
       secrets: { required: ["GITHUB_CLASSIC_TOKEN"] },
       triggers: { crons: ["0 */6 * * *"] },
+      workflows: githubSyncWorkflows,
       d1_databases: [
         { binding: "MEMORY_DB", database_id: baseEnvironment.CF_D1_MEMORY_DATABASE_ID }
       ]
@@ -148,11 +170,50 @@ describe("Wrangler deployment config renderer", () => {
         GITHUB_CREDENTIAL_VERSION: "unconfigured"
       },
       triggers: { crons: [] },
+      workflows: githubSyncWorkflows,
       d1_databases: [
         { binding: "MEMORY_DB", database_id: baseEnvironment.CF_D1_MEMORY_DATABASE_ID }
       ]
     });
     expect(rendered).not.toHaveProperty("secrets");
+    expect(rendered).not.toHaveProperty("queues");
+  });
+
+  it.each([
+    ["a missing binding", (config: Record<string, unknown>) => {
+      config.workflows = githubSyncWorkflows.slice(0, 2);
+    }],
+    ["an extra binding", (config: Record<string, unknown>) => {
+      config.workflows = [...githubSyncWorkflows, githubSyncWorkflows[0]];
+    }],
+    ["a mismatched class", (config: Record<string, unknown>) => {
+      config.workflows = githubSyncWorkflows.map((workflow, index) =>
+        index === 0 ? { ...workflow, class_name: "LegacyDirectCronWorkflow" } : workflow
+      );
+    }],
+    ["a cross-script binding", (config: Record<string, unknown>) => {
+      config.workflows = githubSyncWorkflows.map((workflow, index) =>
+        index === 0 ? { ...workflow, script_name: "another-worker" } : workflow
+      );
+    }],
+    ["a direct Workflow schedule", (config: Record<string, unknown>) => {
+      config.workflows = githubSyncWorkflows.map((workflow, index) =>
+        index === 0 ? { ...workflow, schedules: [{ cron: "0 */6 * * *" }] } : workflow
+      );
+    }],
+    ["a mismatched Workflow step limit", (config: Record<string, unknown>) => {
+      config.workflows = githubSyncWorkflows.map((workflow, index) =>
+        index === 0 ? { ...workflow, limits: { steps: 9_999 } } : workflow
+      );
+    }],
+    ["a Queue surface", (config: Record<string, unknown>) => {
+      config.queues = { producers: [] };
+    }]
+  ])("rejects github-sync config with %s", (_label, mutate) => {
+    const config = sourceConfig("github-sync");
+    mutate(config);
+
+    expect(() => renderConfig("github-sync", config, baseEnvironment)).toThrow();
   });
 
   it("does not mutate the public source config or remove required secrets", () => {
@@ -251,14 +312,20 @@ describe("Wrangler deployment config renderer", () => {
     );
   });
 
-  it("pins the orchestrator Workflow CPU and snapshot subrequest limits", () => {
+  it("pins the orchestrator Workflow step, CPU, and snapshot subrequest limits", () => {
     const rendered = renderConfig("memory-orchestrator", sourceConfig("memory-orchestrator"), {
       ...baseEnvironment,
       CF_D1_MEMORY_DATABASE_ID: "22222222-2222-4222-8222-222222222222",
       CF_D1_SEARCH_DATABASE_ID: "33333333-3333-4333-8333-333333333333"
     });
 
-    expect(rendered.limits).toEqual({ cpu_ms: 300_000, subrequests: 50_000 });
+    expect(rendered.limits).toEqual({
+      cpu_ms: 300_000,
+      subrequests: 50_000
+    });
+    expect(rendered.workflows).toEqual([
+      expect.objectContaining({ limits: { steps: 10_000 } })
+    ]);
   });
 });
 
@@ -292,7 +359,9 @@ describe("production workflow secret isolation", () => {
       "Rollback failed Worker deployment"
     ].map((name) => workflowStep(deploy, name)).join("\n");
     const allowedMigrationSteps = [
+      "Require quiescent GitHub sync before migration",
       "Capture and verify private pre-migration backups",
+      "Revalidate quiescent GitHub sync before migration apply",
       "Apply memory database migrations",
       "Apply search database migrations",
       "Validate migrated D1 databases"
@@ -424,6 +493,7 @@ describe("production workflow secret isolation", () => {
     expect(capture).toContain("EDGEMNEME_GITHUB_SYNC_PREVIOUS_VERSION");
     expect(capture).toContain("EDGEMNEME_GITHUB_SYNC_PREVIOUS_STATE");
     expect(capture).toContain("EDGEMNEME_GITHUB_SYNC_PREVIOUS_SCHEDULE_STATE");
+    expect(capture).toContain("EDGEMNEME_GITHUB_SYNC_PREVIOUS_SECRET_STATE");
     expect(capture).toContain("edgemneme-github-sync");
     expect(capture).toContain("read_github_sync_schedule_state");
     expect(capture).toContain("Enabled bootstrap expected the GitHub sync Worker to be absent");
@@ -434,25 +504,29 @@ describe("production workflow secret isolation", () => {
     );
     expect(gatewayDeploy).toContain('--tag "github-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-gateway"');
     expect(githubSyncDeploy).toContain(
-      '--tag "github-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-github-sync-enabled"'
+      'expected_tag="edgemneme-github-workflows-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-enabled"'
     );
+    expect(githubSyncDeploy).toContain('--tag "$expected_tag"');
     expect(githubSyncDeploy).toContain("wrangler secret list");
-    expect(githubSyncDeploy).toContain(
-      'secrets.length !== 1 || secrets[0]?.name !== "GITHUB_CLASSIC_TOKEN"'
-    );
+    expect(githubSyncDeploy).toContain("secrets.length !== 1");
+    expect(githubSyncDeploy).toContain('secrets[0]?.name !== "GITHUB_CLASSIC_TOKEN"');
+    expect(githubSyncDeploy).toContain('secrets[0]?.type !== "secret_text"');
     expect(githubSyncDeploy).toContain("/workers/scripts/edgemneme-github-sync/schedules");
     expect(githubSyncDeploy).toContain('schedules.length !== 1');
     expect(disabledSync).toContain(
       "if: vars.ENABLE_GITHUB_SYNC == 'false' && steps.capture_core_versions.outputs.github_sync_state == 'present'"
     );
     expect(disabledSync).toContain(
-      '--tag "github-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-github-sync-disabled"'
+      'quiesce_tag="edgemneme-github-workflows-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-disabled"'
     );
-    expect(disabledSync).toContain('{"GITHUB_CLASSIC_TOKEN":null}');
-    expect(disabledSync).toContain("wrangler secret bulk");
+    expect(disabledSync).toContain('--tag "$quiesce_tag"');
+    expect(disabledSync).toContain("secrets: { GITHUB_CLASSIC_TOKEN: null }");
+    expect(disabledSync).toContain("/secrets-bulk");
+    expect(disabledSync).toContain('version_tags: { "workers/tag": tag }');
     expect(disabledSync).toContain("wrangler secret list");
     expect(disabledSync).toContain("secrets.length !== 0");
-    expect(disabledSync).toContain("schedules.length !== 0");
+    expect(disabledSync).toContain('process.env.SCHEDULES_STATE !== "clear"');
+    expect(disabledSync).toContain("wait_for_github_sync_drain");
     expect(disabledSync).not.toContain("secrets.GITHUB_CLASSIC_TOKEN");
     expect(deploy).toContain("  rollback_workers:\n");
     expect(deploy).toContain("    needs: deploy\n");
@@ -473,11 +547,14 @@ describe("production workflow secret isolation", () => {
       "github_sync_previous_state: ${{ steps.capture_core_versions.outputs.github_sync_state }}"
     );
     expect(deploy).toContain(
+      "github_sync_previous_secret_state: ${{ steps.capture_core_versions.outputs.github_sync_secret_state }}"
+    );
+    expect(deploy).toContain(
       "bootstrap_mode: ${{ steps.capture_core_versions.outputs.bootstrap_mode }}"
     );
     expect(rollback).not.toContain("wrangler versions list");
     expect(rollback).toContain('wrangler versions view "$version_id"');
-    expect(rollback.match(/wrangler versions view/gu)).toHaveLength(2);
+    expect(rollback.match(/wrangler versions view/gu)).toHaveLength(3);
     expect(rollback).toContain("wrangler deployments list");
     expect(rollback).toContain('local expected_absent="$6"');
     expect(rollback).toContain("absent outside its captured expected-absent state");
@@ -508,10 +585,10 @@ describe("production workflow secret isolation", () => {
     expect(rollback).toContain("body: JSON.stringify(desired)");
     expect(rollback).not.toContain("body: JSON.stringify({ schedules: desired })");
     expect(rollback).toContain("EDGEMNEME_GITHUB_SYNC_ENABLED");
-    expect(rollback).toContain("rollback_if_advanced github-sync");
+    expect(rollback).toContain("rollback_github_sync");
     expect(rollback).toContain("rollback_if_advanced gateway");
     expect(rollback).toContain("rollback_if_advanced orchestrator");
-    expect(rollback.indexOf("rollback_if_advanced github-sync"))
+    expect(rollback.indexOf("rollback_github_sync"))
       .toBeLessThan(rollback.indexOf("rollback_if_advanced gateway"));
     expect(rollback.indexOf("rollback_if_advanced gateway"))
       .toBeLessThan(rollback.indexOf("rollback_if_advanced orchestrator"));
@@ -563,6 +640,37 @@ describe("production workflow secret isolation", () => {
     ).run("rebuild-base-repair-1");
     expect(database.prepare(query!).get()).toEqual({ count: 0 });
     database.close();
+  });
+
+  it("renders all enabled rollback configs in one cleanup-safe renderer invocation", () => {
+    const render = workflowStep(deploy, "Render rollback deployment configs");
+
+    expect(render).not.toContain('targets=(memory-orchestrator memory-gateway)');
+    expect(render).toContain('if [[ "$ENABLE_GITHUB_SYNC" == "true" ]]');
+    expect(render).toContain(
+      "ENABLE_GITHUB_SYNC=false node scripts/render-wrangler-config.mjs \\\n"
+    );
+    expect(render).toContain("memory-orchestrator memory-gateway github-sync");
+    expect(render).toContain(
+      "node scripts/render-wrangler-config.mjs memory-orchestrator memory-gateway"
+    );
+  });
+
+  it("fails rollback when a required generated core config is missing", () => {
+    const script = workflowRunScript(deploy, "Rollback failed Worker deployment");
+    const functionStart = script.indexOf("rollback_if_advanced() {");
+    const functionEnd = script.indexOf("\n}\nrollback_github_sync()", functionStart);
+    expect(functionStart).toBeGreaterThanOrEqual(0);
+    expect(functionEnd).toBeGreaterThan(functionStart);
+    const rollbackFunction = script.slice(functionStart, functionEnd + 2);
+    const result = spawnSync(
+      "bash",
+      ["-c", `${rollbackFunction}\nrollback_if_advanced gateway /definitely/missing previous tag worker false`],
+      { env: process.env, encoding: "utf8" }
+    );
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("required rollback config is missing");
   });
 
   it("fails closed when a previously deployed Worker is unexpectedly absent", () => {

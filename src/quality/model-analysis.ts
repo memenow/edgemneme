@@ -2,7 +2,10 @@ import { z } from "zod";
 import { MEMORY_CLASSES, MEMORY_KINDS, MEMORY_SCOPES } from "../contracts/taxonomy";
 import { isValidValidityInterval } from "../contracts/validity";
 
-const MODEL_JSON_MAX_BYTES = 256 * 1024;
+export const MODEL_RESPONSE_TRANSPORT_MAX_BYTES = 1024 * 1024;
+export const CANDIDATE_ANALYSIS_MAX_UTF8_BYTES = 256 * 1024;
+export const CONSOLIDATION_SUGGESTIONS_MAX_UTF8_BYTES =
+  MODEL_RESPONSE_TRANSPORT_MAX_BYTES;
 const MAX_VERBATIM_TEMPORAL_VALUES = 32;
 const ISO_OFFSET_TIMESTAMP_PATTERN =
   /(?:^|[^0-9A-Za-z])(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2}))(?=$|[^0-9A-Za-z])/gu;
@@ -212,11 +215,23 @@ function containsVerbatimTimestamp(text: string, timestamp: string): boolean {
 }
 
 export function parseCandidateAnalysis(value: unknown): CandidateAnalysis {
-  return candidateAnalysisSchema.parse(value);
+  const parsed = candidateAnalysisSchema.parse(value);
+  assertStructuredJsonByteLength(
+    parsed,
+    CANDIDATE_ANALYSIS_MAX_UTF8_BYTES,
+    "Candidate analysis"
+  );
+  return parsed;
 }
 
 export function parseModelCandidateAnalysis(value: unknown): ModelCandidateAnalysis {
-  return modelCandidateAnalysisSchema.parse(value);
+  const parsed = modelCandidateAnalysisSchema.parse(value);
+  assertStructuredJsonByteLength(
+    parsed,
+    CANDIDATE_ANALYSIS_MAX_UTF8_BYTES,
+    "Candidate analysis"
+  );
+  return parsed;
 }
 
 export function parseConsolidationSuggestions(
@@ -224,6 +239,11 @@ export function parseConsolidationSuggestions(
   frozenSourceIds: ReadonlySet<string>
 ): ConsolidationSuggestion[] {
   const parsed = consolidationSchema.parse(value).suggestions;
+  assertStructuredJsonByteLength(
+    { suggestions: parsed },
+    CONSOLIDATION_SUGGESTIONS_MAX_UTF8_BYTES,
+    "Consolidation suggestions"
+  );
   assertFrozenEvidenceSubset(parsed, frozenSourceIds);
   return parsed;
 }
@@ -244,8 +264,29 @@ export function parseModelConsolidationSuggestions(
   frozenSourceIds: ReadonlySet<string>
 ): ModelConsolidationSuggestion[] {
   const parsed = modelConsolidationSchema.parse(value).suggestions;
+  assertStructuredJsonByteLength(
+    { suggestions: parsed },
+    CONSOLIDATION_SUGGESTIONS_MAX_UTF8_BYTES,
+    "Consolidation suggestions"
+  );
   assertFrozenEvidenceSubset(parsed, frozenSourceIds);
   return parsed;
+}
+
+function assertStructuredJsonByteLength(
+  value: unknown,
+  maxBytes: number,
+  label: string
+): void {
+  let serialized: string;
+  try {
+    serialized = JSON.stringify(value);
+  } catch {
+    throw new Error(`${label} is not serializable JSON.`);
+  }
+  if (new TextEncoder().encode(serialized).byteLength > maxBytes) {
+    throw new Error(`${label} exceeds the ${maxBytes}-byte UTF-8 JSON limit.`);
+  }
 }
 
 export function readModelJson(response: unknown): unknown {
@@ -268,7 +309,10 @@ export function readModelJson(response: unknown): unknown {
       }
     }
   }
-  if (text === undefined || new TextEncoder().encode(text).byteLength > MODEL_JSON_MAX_BYTES) {
+  if (
+    text === undefined ||
+    new TextEncoder().encode(text).byteLength > MODEL_RESPONSE_TRANSPORT_MAX_BYTES
+  ) {
     throw new Error("Unsupported model response.");
   }
   try {
@@ -311,7 +355,10 @@ export function readModelFunctionArguments(
     throw new Error("Unsupported model function response.");
   }
   const argumentsText = toolCall.function.arguments;
-  if (new TextEncoder().encode(argumentsText).byteLength > MODEL_JSON_MAX_BYTES) {
+  if (
+    new TextEncoder().encode(argumentsText).byteLength >
+    MODEL_RESPONSE_TRANSPORT_MAX_BYTES
+  ) {
     throw new Error("Unsupported model function response.");
   }
   try {
@@ -324,7 +371,10 @@ export function readModelFunctionArguments(
 function cloneBoundedJson(value: Record<string, unknown> | unknown[]): unknown {
   try {
     const serialized = JSON.stringify(value);
-    if (new TextEncoder().encode(serialized).byteLength > MODEL_JSON_MAX_BYTES) {
+    if (
+      new TextEncoder().encode(serialized).byteLength >
+      MODEL_RESPONSE_TRANSPORT_MAX_BYTES
+    ) {
       throw new Error("Unsupported model response.");
     }
     return JSON.parse(serialized) as unknown;

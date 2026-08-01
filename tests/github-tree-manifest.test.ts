@@ -6,23 +6,30 @@ import {
 } from "node:sqlite";
 import { describe, expect, it } from "vitest";
 import {
-  persistGitHubCandidates,
   prepareGitHubCandidateStatements
 } from "../src/github/candidate-persistence";
+import type { PersistableGitHubCandidate } from "../src/github/candidate-persistence";
+import type { PendingGitHubSyncActivationFence } from "../src/github/sync-activation-fence";
 import {
   activateGitHubTreeManifest,
   beginGitHubTreeManifest,
   buildGitHubTreeManifestDescriptor,
   completeGitHubTreeManifest,
+  createGitHubTreeManifestActivationAttempt,
   persistGitHubTreeManifestEntries,
   readActiveGitHubTreeHead,
+  type GitHubTreeManifestActivationClaim,
   type GitHubTreeManifestDescriptor,
   type GitHubTreeManifestEntry
 } from "../src/github/tree-manifest";
 import { sha256 } from "../src/security/crypto";
-import { buildGitHubBlobCandidate } from "../workers/github-sync/index";
+import {
+  buildGitHubBlobCandidate,
+  buildStableSyncEvent
+} from "../workers/github-sync/index";
 
-const MIGRATIONS = Array.from({ length: 11 }, (_, index) => {
+const MIGRATIONS = [
+  ...Array.from({ length: 11 }, (_, index) => {
   const number = String(index + 1).padStart(4, "0");
   const names = [
     "initial",
@@ -37,8 +44,10 @@ const MIGRATIONS = Array.from({ length: 11 }, (_, index) => {
     "github_credential_expiry_and_repository_identity",
     "github_tree_manifests"
   ];
-  return `migrations/${number}_${names[index]}.sql`;
-});
+    return `migrations/${number}_${names[index]}.sql`;
+  }),
+  "migrations/0017_github_sync_activation_receipts.sql"
+];
 
 const NOW = "2026-07-28T00:00:00.000Z";
 const PROJECT_ID = "project-a";
@@ -59,7 +68,6 @@ describe("GitHub tree manifest reconciliation", () => {
   it("persists candidate artifacts in idempotent project-scoped bulk statements", async () => {
     const fixture = createFixture();
     const activeManifest = await descriptor("2026-07-28T00:00:00.000Z");
-    await storeAndActivate(fixture.d1, activeManifest, [], null);
     const clear = await buildGitHubBlobCandidate({
       projectId: PROJECT_ID,
       repositoryId: REPOSITORY_ID,
@@ -82,20 +90,21 @@ describe("GitHub tree manifest reconciliation", () => {
       blobSha: SHA.sensitive,
       content: "api_key = 'synthetic-sensitive-value'"
     });
-    const persist = () =>
-      persistGitHubCandidates({
-        database: fixture.d1,
-        projectId: PROJECT_ID,
-        repositoryId: REPOSITORY_ID,
-        repositoryRef: REF,
-        externalRepositoryId: 42,
-        manifestId: activeManifest.manifestId,
-        observedSha: SHA.commit,
-        candidates: [clear, tombstone]
-      });
-
-    await persist();
-    await persist();
+    const committed = await storeAndActivate(
+      fixture.d1,
+      activeManifest,
+      [],
+      null,
+      [clear, tombstone]
+    );
+    await activate(
+      fixture.d1,
+      activeManifest,
+      null,
+      committed.candidateStatements,
+      null,
+      committed.activationClaim
+    );
     expect(
       fixture.database
         .prepare(
@@ -133,7 +142,7 @@ describe("GitHub tree manifest reconciliation", () => {
     });
 
     await expect(
-      persistGitHubCandidates({
+      prepareGitHubCandidateStatements({
         database: fixture.d1,
         projectId: PROJECT_ID,
         repositoryId: REPOSITORY_ID,
@@ -141,6 +150,7 @@ describe("GitHub tree manifest reconciliation", () => {
         externalRepositoryId: 42,
         manifestId: activeManifest.manifestId,
         observedSha: SHA.commit,
+        activationFence: committed.activationFence,
         candidates: [
           {
             ...tombstone,
@@ -172,7 +182,7 @@ describe("GitHub tree manifest reconciliation", () => {
     ).toThrow(/evidence repository context is invalid/iu);
 
     await expect(
-      persistGitHubCandidates({
+      prepareGitHubCandidateStatements({
         database: fixture.d1,
         projectId: PROJECT_ID,
         repositoryId: "repository-b",
@@ -180,19 +190,582 @@ describe("GitHub tree manifest reconciliation", () => {
         externalRepositoryId: 42,
         manifestId: activeManifest.manifestId,
         observedSha: SHA.commit,
+        activationFence: committed.activationFence,
         candidates: [clear]
       })
     ).rejects.toMatchObject({ code: "GITHUB_RECONCILIATION_REQUIRED" });
   });
 
+  it("replays the same ref and SHA across manifests without resetting durable artifacts", async () => {
+    const fixture = createFixture();
+    const firstManifest = await descriptor("2026-07-28T00:00:00.000Z");
+    const candidate = await buildGitHubBlobCandidate({
+      projectId: PROJECT_ID,
+      repositoryId: REPOSITORY_ID,
+      externalRepositoryId: 42,
+      defaultBranch: "main",
+      ref: REF,
+      observedSha: SHA.commit,
+      path: "docs/context.md",
+      blobSha: SHA.keep,
+      content: "Durable project context."
+    });
+    const observationId = candidate.observation?.observationId;
+    if (observationId === undefined) {
+      throw new Error("The replay fixture requires a clear candidate.");
+    }
+    await storeAndActivate(fixture.d1, firstManifest, [], null, [candidate]);
+
+    fixture.database
+      .prepare(
+        `UPDATE observations
+         SET status = 'pending_review', updated_at = ?
+         WHERE project_id = ? AND observation_id = ?`
+      )
+      .run("2026-07-28T01:00:00.000Z", PROJECT_ID, observationId);
+    fixture.database
+      .prepare(
+        `UPDATE observations
+         SET candidate_version = 2, status = 'request_changes',
+             review_reason = 'Synthetic lifecycle advancement', updated_at = ?
+         WHERE project_id = ? AND observation_id = ?`
+      )
+      .run("2026-07-28T02:00:00.000Z", PROJECT_ID, observationId);
+    fixture.database
+      .prepare(
+        `UPDATE evidence
+         SET sensitivity_status = 'quarantined', object_uri = ?
+         WHERE project_id = ? AND evidence_id = ?`
+      )
+      .run("r2://synthetic-quarantine/object", PROJECT_ID, candidate.evidenceId);
+    fixture.database
+      .prepare(
+        `UPDATE outbox_events
+         SET dispatched_at = ?, next_attempt_at = ?,
+             last_error_code = 'SYNTHETIC_RETRY', attempt = 3
+         WHERE project_id = ?
+           AND event_type IN ('candidate.submitted', 'github.sync.requested')`
+      )
+      .run(
+        "2026-07-28T03:00:00.000Z",
+        "2026-07-28T04:00:00.000Z",
+        PROJECT_ID
+      );
+    fixture.database
+      .prepare(
+        `UPDATE projects SET project_version = 7, updated_at = ?
+         WHERE project_id = ?`
+      )
+      .run("2026-07-28T05:00:00.000Z", PROJECT_ID);
+
+    const durableBefore = readCandidateReplayState(
+      fixture.database,
+      observationId,
+      candidate.evidenceId
+    );
+    const expectedHead = await readActiveGitHubTreeHead(
+      fixture.d1,
+      PROJECT_ID,
+      REPOSITORY_ID,
+      REF
+    );
+    const secondManifest = await descriptor("2026-07-29T00:00:00.000Z");
+    await storeAndActivate(
+      fixture.d1,
+      secondManifest,
+      [],
+      expectedHead,
+      [candidate]
+    );
+
+    expect(
+      readCandidateReplayState(
+        fixture.database,
+        observationId,
+        candidate.evidenceId
+      )
+    ).toEqual(durableBefore);
+    expect(durableBefore.observation).toMatchObject({
+      candidate_version: 2,
+      status: "request_changes",
+      review_reason: "Synthetic lifecycle advancement"
+    });
+    expect(durableBefore.evidence).toMatchObject({
+      sensitivity_status: "quarantined",
+      object_uri: "r2://synthetic-quarantine/object"
+    });
+    expect(durableBefore.outbox).toHaveLength(2);
+    expect(durableBefore.outbox).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          project_version: 0,
+          dispatched_at: "2026-07-28T03:00:00.000Z",
+          next_attempt_at: "2026-07-28T04:00:00.000Z",
+          last_error_code: "SYNTHETIC_RETRY",
+          attempt: 3
+        })
+      ])
+    );
+    expect(
+      await readActiveGitHubTreeHead(
+        fixture.d1,
+        PROJECT_ID,
+        REPOSITORY_ID,
+        REF
+      )
+    ).toEqual({
+      manifestId: secondManifest.manifestId,
+      observedSha: SHA.commit,
+      headVersion: 2
+    });
+    expect(
+      fixture.database
+        .prepare(
+          `SELECT cursor.observed_sha, cursor.status, cursor.cursor_version,
+                  (SELECT COUNT(*) FROM github_tree_activation_receipts
+                   WHERE project_id = ?) AS receipts
+           FROM sync_cursors AS cursor
+           WHERE cursor.project_id = ? AND cursor.repository_id = ?
+             AND cursor.ref = ?`
+        )
+        .get(PROJECT_ID, PROJECT_ID, REPOSITORY_ID, REF)
+    ).toEqual({
+      observed_sha: SHA.commit,
+      status: "observed",
+      cursor_version: 3,
+      receipts: 2
+    });
+  });
+
+  it("keeps pending candidate statements inert until the activation witness exists", async () => {
+    const fixture = createFixture();
+    const manifest = await descriptor("2026-07-28T00:00:00.000Z");
+    await beginGitHubTreeManifest(fixture.d1, manifest);
+    await persistGitHubTreeManifestEntries(fixture.d1, manifest, []);
+    await completeGitHubTreeManifest(fixture.d1, manifest, [], NOW);
+    const candidate = await buildGitHubBlobCandidate({
+      projectId: PROJECT_ID,
+      repositoryId: REPOSITORY_ID,
+      externalRepositoryId: 42,
+      defaultBranch: "main",
+      ref: REF,
+      observedSha: SHA.commit,
+      path: "docs/context.md",
+      blobSha: SHA.keep,
+      content: "Durable project context."
+    });
+    const pending = await prepareCandidateActivation(
+      fixture.d1,
+      manifest,
+      null,
+      [candidate]
+    );
+
+    await fixture.d1.batch([...pending.candidateStatements]);
+    expect(
+      fixture.database
+        .prepare(
+          `SELECT
+             (SELECT COUNT(*) FROM evidence WHERE project_id = ?) AS evidence,
+             (SELECT COUNT(*) FROM observations WHERE project_id = ?) AS observations,
+             (SELECT COUNT(*) FROM outbox_events WHERE project_id = ?) AS outbox`
+        )
+        .get(PROJECT_ID, PROJECT_ID, PROJECT_ID)
+    ).toEqual({ evidence: 0, observations: 0, outbox: 0 });
+
+    await activate(
+      fixture.d1,
+      manifest,
+      null,
+      pending.candidateStatements,
+      null,
+      pending.activationClaim
+    );
+    expect(
+      fixture.database
+        .prepare(
+          `SELECT
+             (SELECT COUNT(*) FROM evidence WHERE project_id = ?) AS evidence,
+             (SELECT COUNT(*) FROM observations WHERE project_id = ?) AS observations,
+             (SELECT COUNT(*) FROM github_tree_activation_receipts
+              WHERE project_id = ?) AS receipts`
+        )
+        .get(PROJECT_ID, PROJECT_ID, PROJECT_ID)
+    ).toEqual({ evidence: 1, observations: 1, receipts: 1 });
+  });
+
+  it("recovers an exact response-loss retry from the committed receipt", async () => {
+    const fixture = createFixture();
+    const manifest = await descriptor("2026-07-28T00:00:00.000Z");
+    await beginGitHubTreeManifest(fixture.d1, manifest);
+    await persistGitHubTreeManifestEntries(fixture.d1, manifest, []);
+    await completeGitHubTreeManifest(fixture.d1, manifest, [], NOW);
+    const pending = await prepareCandidateActivation(
+      fixture.d1,
+      manifest,
+      null,
+      []
+    );
+    fixture.control.failAfterNextCommittedBatch();
+
+    await activate(
+      fixture.d1,
+      manifest,
+      null,
+      pending.candidateStatements,
+      null,
+      pending.activationClaim
+    );
+    await activate(
+      fixture.d1,
+      manifest,
+      null,
+      pending.candidateStatements,
+      null,
+      pending.activationClaim
+    );
+    expect(
+      fixture.database
+        .prepare(
+          `SELECT
+             (SELECT COUNT(*) FROM github_tree_activation_witnesses) AS witnesses,
+             (SELECT COUNT(*) FROM github_tree_activation_receipts) AS receipts,
+             (SELECT COUNT(*) FROM github_tree_ref_heads) AS heads,
+             (SELECT COUNT(*) FROM outbox_events
+              WHERE event_type = 'github.sync.requested') AS outbox`
+        )
+        .get()
+    ).toEqual({ witnesses: 1, receipts: 1, heads: 1, outbox: 1 });
+
+    await expect(
+      activate(
+        fixture.d1,
+        manifest,
+        null,
+        pending.candidateStatements,
+        null,
+        {
+          ...pending.activationClaim,
+          activationToken: "9".repeat(64)
+        }
+      )
+    ).rejects.toMatchObject({ code: "GITHUB_RECONCILIATION_REQUIRED" });
+  });
+
+  it("rejects a manifest collected for a different scheduled run", async () => {
+    const fixture = createFixture();
+    const manifest = await descriptor("2026-07-28T00:00:00.000Z");
+    await beginGitHubTreeManifest(fixture.d1, manifest);
+    await persistGitHubTreeManifestEntries(fixture.d1, manifest, []);
+    await completeGitHubTreeManifest(fixture.d1, manifest, [], NOW);
+    const pending = await prepareCandidateActivation(
+      fixture.d1,
+      manifest,
+      null,
+      []
+    );
+    const payloadJson = JSON.stringify({ manifest_id: manifest.manifestId });
+
+    await expect(
+      activateGitHubTreeManifest({
+        database: fixture.d1,
+        descriptor: manifest,
+        expectedHead: null,
+        activationClaim: pending.activationClaim,
+        scheduledTime: Date.parse("2026-07-28T06:00:00.000Z"),
+        nextSyncAt: "2026-07-28T12:00:00.000Z",
+        historyGapPossible: false,
+        credentialStatus: "active",
+        etag: null,
+        syncEvent: {
+          eventId: `sync-${manifest.manifestId}`,
+          payloadDigest: await sha256(payloadJson),
+          payloadJson
+        },
+        candidateStatements: pending.candidateStatements
+      })
+    ).rejects.toMatchObject({ code: "GITHUB_RECONCILIATION_REQUIRED" });
+    expect(
+      fixture.database
+        .prepare(`SELECT COUNT(*) AS count FROM github_tree_activation_receipts`)
+        .get()
+    ).toEqual({ count: 0 });
+  });
+
+  it("does not heal a target head that has no activation receipt", async () => {
+    const fixture = createFixture();
+    const oldManifest = await descriptor("2026-07-28T00:00:00.000Z");
+    await storeAndActivate(fixture.d1, oldManifest, [], null);
+    const expectedHead = await readActiveGitHubTreeHead(
+      fixture.d1,
+      PROJECT_ID,
+      REPOSITORY_ID,
+      REF
+    );
+    const newManifest = await descriptor("2026-07-29T00:00:00.000Z");
+    await beginGitHubTreeManifest(fixture.d1, newManifest);
+    await persistGitHubTreeManifestEntries(fixture.d1, newManifest, []);
+    await completeGitHubTreeManifest(fixture.d1, newManifest, [], NOW);
+    const pending = await prepareCandidateActivation(
+      fixture.d1,
+      newManifest,
+      expectedHead,
+      []
+    );
+    fixture.database
+      .prepare(
+        `UPDATE github_tree_ref_heads
+         SET manifest_id = ?, head_version = head_version + 1,
+             activated_at = ?, updated_at = ?
+         WHERE project_id = ? AND repository_id = ? AND ref = ?`
+      )
+      .run(
+        newManifest.manifestId,
+        NOW,
+        NOW,
+        PROJECT_ID,
+        REPOSITORY_ID,
+        REF
+      );
+
+    await expect(
+      activate(
+        fixture.d1,
+        newManifest,
+        expectedHead,
+        pending.candidateStatements,
+        expectedHead?.observedSha ?? null,
+        pending.activationClaim
+      )
+    ).rejects.toMatchObject({ code: "GITHUB_RECONCILIATION_REQUIRED" });
+    expect(
+      fixture.database
+        .prepare(
+          `SELECT COUNT(*) AS count FROM github_tree_activation_receipts
+           WHERE manifest_id = ?`
+        )
+        .get(newManifest.manifestId)
+    ).toEqual({ count: 0 });
+  });
+
+  it.each(["observation", "candidate outbox", "sync outbox"] as const)(
+    "aborts the whole activation on a conflicting %s artifact",
+    async (artifact) => {
+      const fixture = createFixture();
+      const manifest = await descriptor("2026-07-28T00:00:00.000Z");
+      await beginGitHubTreeManifest(fixture.d1, manifest);
+      await persistGitHubTreeManifestEntries(fixture.d1, manifest, []);
+      await completeGitHubTreeManifest(fixture.d1, manifest, [], NOW);
+      const candidate = await buildGitHubBlobCandidate({
+        projectId: PROJECT_ID,
+        repositoryId: REPOSITORY_ID,
+        externalRepositoryId: 42,
+        defaultBranch: "main",
+        ref: REF,
+        observedSha: SHA.commit,
+        path: "docs/context.md",
+        blobSha: SHA.keep,
+        content: "Durable project context."
+      });
+      const observation = candidate.observation;
+      if (observation === undefined) {
+        throw new Error("The candidate collision fixture requires an observation.");
+      }
+      const pending = await prepareCandidateActivation(
+        fixture.d1,
+        manifest,
+        null,
+        [candidate]
+      );
+      if (artifact === "observation") {
+        fixture.database
+          .prepare(
+            `INSERT INTO observations
+             (observation_id, project_id, candidate_version, status, content,
+              content_sha256, evidence_json, created_at, updated_at)
+             VALUES (?, ?, 1, 'queued', 'conflicting content', ?, '[]', ?, ?)`
+          )
+          .run(
+            observation.observationId,
+            PROJECT_ID,
+            observation.contentSha256,
+            NOW,
+            NOW
+          );
+      } else if (artifact === "candidate outbox") {
+        fixture.database
+          .prepare(
+            `INSERT INTO outbox_events
+             (event_id, project_id, project_version, event_type, payload_digest,
+              payload_json, created_at)
+             VALUES (?, ?, 0, 'candidate.submitted', ?, ?, ?)`
+          )
+          .run(
+            observation.event.eventId,
+            PROJECT_ID,
+            "0".repeat(64),
+            JSON.stringify({ conflicting: true }),
+            NOW
+          );
+      } else {
+        const syncEvent = await buildStableSyncEvent({
+          projectId: PROJECT_ID,
+          repositoryId: REPOSITORY_ID,
+          externalRepositoryId: 42,
+          ref: REF,
+          observedSha: SHA.commit
+        });
+        fixture.database
+          .prepare(
+            `INSERT INTO outbox_events
+             (event_id, project_id, project_version, event_type, payload_digest,
+              payload_json, created_at)
+             VALUES (?, ?, 0, 'github.sync.requested', ?, ?, ?)`
+          )
+          .run(
+            syncEvent.eventId,
+            PROJECT_ID,
+            "0".repeat(64),
+            JSON.stringify({ conflicting: true }),
+            NOW
+          );
+      }
+
+      await expect(
+        activate(
+          fixture.d1,
+          manifest,
+          null,
+          pending.candidateStatements,
+          null,
+          pending.activationClaim
+        )
+      ).rejects.toThrow(/stale candidate head|constraint|immutable/iu);
+      expect(
+        fixture.database
+          .prepare(
+            `SELECT
+               (SELECT COUNT(*) FROM evidence WHERE project_id = ?) AS evidence,
+               (SELECT COUNT(*) FROM github_tree_activation_witnesses) AS witnesses,
+               (SELECT COUNT(*) FROM github_tree_activation_receipts) AS receipts,
+               (SELECT COUNT(*) FROM github_tree_ref_heads) AS heads`
+          )
+          .get(PROJECT_ID)
+      ).toEqual({ evidence: 0, witnesses: 0, receipts: 0, heads: 0 });
+    }
+  );
+
+  it("aborts activation when a deterministic delta ID has different content", async () => {
+    const fixture = createFixture();
+    const oldManifest = await descriptor("2026-07-28T00:00:00.000Z");
+    await storeAndActivate(fixture.d1, oldManifest, [], null);
+    const expectedHead = await readActiveGitHubTreeHead(
+      fixture.d1,
+      PROJECT_ID,
+      REPOSITORY_ID,
+      REF
+    );
+    const newManifest = await descriptor("2026-07-29T00:00:00.000Z");
+    const newEntries = await entries([["docs/new.md", SHA.added, "text"]]);
+    const newEntry = newEntries[0];
+    if (newEntry === undefined) {
+      throw new Error("The delta collision fixture requires one entry.");
+    }
+    await beginGitHubTreeManifest(fixture.d1, newManifest);
+    await persistGitHubTreeManifestEntries(fixture.d1, newManifest, newEntries);
+    await completeGitHubTreeManifest(fixture.d1, newManifest, newEntries, NOW);
+    const pending = await prepareCandidateActivation(
+      fixture.d1,
+      newManifest,
+      expectedHead,
+      []
+    );
+    const deltaId =
+      `github-tree-delta:added:${newManifest.manifestId}:` +
+      newEntry.pathDigest;
+    fixture.database
+      .prepare(
+        `INSERT INTO github_tree_manifest_deltas
+         (delta_id, project_id, repository_id, ref, old_manifest_id,
+          new_manifest_id, path_digest, safe_path, change_kind, old_blob_sha,
+          new_blob_sha, affected_memory_ids_json, idempotency_key, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'docs/conflicting.md', 'added', NULL,
+                 ?, '[]', 'conflicting-idempotency-key', ?)`
+      )
+      .run(
+        deltaId,
+        PROJECT_ID,
+        REPOSITORY_ID,
+        REF,
+        oldManifest.manifestId,
+        newManifest.manifestId,
+        newEntry.pathDigest,
+        newEntry.blobSha,
+        NOW
+      );
+
+    await expect(
+      activate(
+        fixture.d1,
+        newManifest,
+        expectedHead,
+        pending.candidateStatements,
+        expectedHead?.observedSha ?? null,
+        pending.activationClaim
+      )
+    ).rejects.toThrow(/manifest deltas are immutable/iu);
+    expect(
+      fixture.database
+        .prepare(
+          `SELECT
+             (SELECT COUNT(*) FROM github_tree_activation_receipts
+              WHERE manifest_id = ?) AS receipts,
+             (SELECT manifest_id FROM github_tree_ref_heads
+              WHERE project_id = ? AND repository_id = ? AND ref = ?) AS head`
+        )
+        .get(
+          newManifest.manifestId,
+          PROJECT_ID,
+          REPOSITORY_ID,
+          REF
+        )
+    ).toEqual({ receipts: 0, head: oldManifest.manifestId });
+  });
+
   it("keeps evidence provenance isolated when refs share the same Git object", async () => {
     const fixture = createFixture();
     const trackedRef = "refs/heads/feature";
+    fixture.database
+      .prepare(
+        `UPDATE repositories SET tracked_refs_json = ?, updated_at = ?
+         WHERE project_id = ? AND repository_id = ?`
+      )
+      .run(JSON.stringify([trackedRef]), NOW, PROJECT_ID, REPOSITORY_ID);
     const manifestEntries = await entries([
       ["docs/context.md", SHA.keep, "text"]
     ]);
     const defaultManifest = await descriptor("2026-07-28T00:00:00.000Z");
-    await storeAndActivate(fixture.d1, defaultManifest, manifestEntries, null);
+    const sharedInput = {
+      projectId: PROJECT_ID,
+      repositoryId: REPOSITORY_ID,
+      externalRepositoryId: 42,
+      defaultBranch: "main",
+      observedSha: SHA.commit,
+      path: "docs/context.md",
+      blobSha: SHA.keep,
+      content: "Durable project context."
+    } as const;
+    const defaultCandidate = await buildGitHubBlobCandidate({
+      ...sharedInput,
+      ref: REF
+    });
+    await storeAndActivate(
+      fixture.d1,
+      defaultManifest,
+      manifestEntries,
+      null,
+      [defaultCandidate]
+    );
 
     fixture.database
       .prepare(
@@ -223,48 +796,28 @@ describe("GitHub tree manifest reconciliation", () => {
       manifestEntries,
       NOW
     );
-    await activate(fixture.d1, trackedManifest, null, [], SHA.commit);
-
-    const sharedInput = {
-      projectId: PROJECT_ID,
-      repositoryId: REPOSITORY_ID,
-      externalRepositoryId: 42,
-      defaultBranch: "main",
-      observedSha: SHA.commit,
-      path: "docs/context.md",
-      blobSha: SHA.keep,
-      content: "Durable project context."
-    } as const;
-    const defaultCandidate = await buildGitHubBlobCandidate({
-      ...sharedInput,
-      ref: REF
-    });
     const trackedCandidate = await buildGitHubBlobCandidate({
       ...sharedInput,
       ref: trackedRef
     });
+    const trackedActivation = await prepareCandidateActivation(
+      fixture.d1,
+      trackedManifest,
+      null,
+      [trackedCandidate],
+      SHA.commit
+    );
+    await activate(
+      fixture.d1,
+      trackedManifest,
+      null,
+      trackedActivation.candidateStatements,
+      SHA.commit,
+      trackedActivation.activationClaim
+    );
 
     expect(trackedCandidate.evidenceId).not.toBe(defaultCandidate.evidenceId);
     expect(trackedCandidate.locator).not.toBe(defaultCandidate.locator);
-    for (const [manifest, candidate] of [
-      [trackedManifest, trackedCandidate],
-      [defaultManifest, defaultCandidate]
-    ] as const) {
-      const persist = async (): Promise<void> => {
-        await persistGitHubCandidates({
-          database: fixture.d1,
-          projectId: PROJECT_ID,
-          repositoryId: REPOSITORY_ID,
-          repositoryRef: manifest.ref,
-          externalRepositoryId: 42,
-          manifestId: manifest.manifestId,
-          observedSha: SHA.commit,
-          candidates: [candidate]
-        });
-      };
-      await persist();
-      await persist();
-    }
 
     const linkedProvenance = fixture.database
       .prepare(
@@ -313,8 +866,13 @@ describe("GitHub tree manifest reconciliation", () => {
   it("keeps bodyless tombstones isolated across default and tracked refs", async () => {
     const fixture = createFixture();
     const trackedRef = "refs/heads/release";
+    fixture.database
+      .prepare(
+        `UPDATE repositories SET tracked_refs_json = ?, updated_at = ?
+         WHERE project_id = ? AND repository_id = ?`
+      )
+      .run(JSON.stringify([trackedRef]), NOW, PROJECT_ID, REPOSITORY_ID);
     const defaultManifest = await descriptor("2026-07-28T00:00:00.000Z");
-    await storeAndActivate(fixture.d1, defaultManifest, [], null);
     fixture.database
       .prepare(
         `INSERT INTO sync_cursors
@@ -335,8 +893,6 @@ describe("GitHub tree manifest reconciliation", () => {
     await beginGitHubTreeManifest(fixture.d1, trackedManifest);
     await persistGitHubTreeManifestEntries(fixture.d1, trackedManifest, []);
     await completeGitHubTreeManifest(fixture.d1, trackedManifest, [], NOW);
-    await activate(fixture.d1, trackedManifest, null, [], SHA.commit);
-
     const sharedInput = {
       projectId: PROJECT_ID,
       repositoryId: REPOSITORY_ID,
@@ -351,20 +907,33 @@ describe("GitHub tree manifest reconciliation", () => {
       [defaultManifest, await buildGitHubBlobCandidate({ ...sharedInput, ref: REF })],
       [trackedManifest, await buildGitHubBlobCandidate({ ...sharedInput, ref: trackedRef })]
     ] as const;
+    await storeAndActivate(
+      fixture.d1,
+      defaultManifest,
+      [],
+      null,
+      [candidates[0][1]]
+    );
+    const trackedActivation = await prepareCandidateActivation(
+      fixture.d1,
+      trackedManifest,
+      null,
+      [candidates[1][1]],
+      SHA.commit
+    );
+    await activate(
+      fixture.d1,
+      trackedManifest,
+      null,
+      trackedActivation.candidateStatements,
+      SHA.commit,
+      trackedActivation.activationClaim
+    );
     for (const [manifest, candidate] of candidates) {
       expect(candidate.sensitivityStatus).toBe("tombstone");
       expect(candidate.repositoryPath).toBeNull();
       expect(candidate.observation).toBeUndefined();
-      await persistGitHubCandidates({
-        database: fixture.d1,
-        projectId: PROJECT_ID,
-        repositoryId: REPOSITORY_ID,
-        repositoryRef: manifest.ref,
-        externalRepositoryId: 42,
-        manifestId: manifest.manifestId,
-        observedSha: SHA.commit,
-        candidates: [candidate]
-      });
+      expect(manifest.manifestId).toHaveLength(64);
     }
 
     expect(candidates[0][1].evidenceId).not.toBe(candidates[1][1].evidenceId);
@@ -390,7 +959,9 @@ describe("GitHub tree manifest reconciliation", () => {
   ])("fails closed when immutable evidence drifts only in %s", async (_label, drift) => {
     const fixture = createFixture();
     const activeManifest = await descriptor("2026-07-28T00:00:00.000Z");
-    await storeAndActivate(fixture.d1, activeManifest, [], null);
+    await beginGitHubTreeManifest(fixture.d1, activeManifest);
+    await persistGitHubTreeManifestEntries(fixture.d1, activeManifest, []);
+    await completeGitHubTreeManifest(fixture.d1, activeManifest, [], NOW);
     const candidate = await buildGitHubBlobCandidate({
       projectId: PROJECT_ID,
       repositoryId: REPOSITORY_ID,
@@ -402,6 +973,12 @@ describe("GitHub tree manifest reconciliation", () => {
       blobSha: SHA.keep,
       content: "Durable project context."
     });
+    const pending = await prepareCandidateActivation(
+      fixture.d1,
+      activeManifest,
+      null,
+      [candidate]
+    );
     fixture.database
       .prepare(
         `INSERT INTO evidence
@@ -427,17 +1004,15 @@ describe("GitHub tree manifest reconciliation", () => {
       );
 
     await expect(
-      persistGitHubCandidates({
-        database: fixture.d1,
-        projectId: PROJECT_ID,
-        repositoryId: REPOSITORY_ID,
-        repositoryRef: REF,
-        externalRepositoryId: 42,
-        manifestId: activeManifest.manifestId,
-        observedSha: SHA.commit,
-        candidates: [candidate]
-      })
-    ).rejects.toThrow(/evidence identity is immutable/iu);
+      activate(
+        fixture.d1,
+        activeManifest,
+        null,
+        pending.candidateStatements,
+        null,
+        pending.activationClaim
+      )
+    ).rejects.toThrow(/constraint|activation conflict/iu);
     expect(
       fixture.database
         .prepare("SELECT COUNT(*) AS count FROM observations WHERE project_id = ?")
@@ -448,7 +1023,9 @@ describe("GitHub tree manifest reconciliation", () => {
   it("fails closed when a stored evidence tuple has a different immutable identity", async () => {
     const fixture = createFixture();
     const activeManifest = await descriptor("2026-07-28T00:00:00.000Z");
-    await storeAndActivate(fixture.d1, activeManifest, [], null);
+    await beginGitHubTreeManifest(fixture.d1, activeManifest);
+    await persistGitHubTreeManifestEntries(fixture.d1, activeManifest, []);
+    await completeGitHubTreeManifest(fixture.d1, activeManifest, [], NOW);
     const candidate = await buildGitHubBlobCandidate({
       projectId: PROJECT_ID,
       repositoryId: REPOSITORY_ID,
@@ -460,6 +1037,12 @@ describe("GitHub tree manifest reconciliation", () => {
       blobSha: SHA.keep,
       content: "Durable project context."
     });
+    const pending = await prepareCandidateActivation(
+      fixture.d1,
+      activeManifest,
+      null,
+      [candidate]
+    );
     fixture.database
       .prepare(
         `INSERT INTO evidence
@@ -482,17 +1065,15 @@ describe("GitHub tree manifest reconciliation", () => {
       );
 
     await expect(
-      persistGitHubCandidates({
-        database: fixture.d1,
-        projectId: PROJECT_ID,
-        repositoryId: REPOSITORY_ID,
-        repositoryRef: REF,
-        externalRepositoryId: 42,
-        manifestId: activeManifest.manifestId,
-        observedSha: SHA.commit,
-        candidates: [candidate]
-      })
-    ).rejects.toThrow(/evidence identity is immutable/iu);
+      activate(
+        fixture.d1,
+        activeManifest,
+        null,
+        pending.candidateStatements,
+        null,
+        pending.activationClaim
+      )
+    ).rejects.toThrow(/constraint|activation conflict/iu);
     expect(
       fixture.database
         .prepare(
@@ -530,7 +1111,12 @@ describe("GitHub tree manifest reconciliation", () => {
       REPOSITORY_ID,
       REF
     );
-    await storeAndActivate(fixture.d1, newManifest, newEntries, expectedHead);
+    const committed = await storeAndActivate(
+      fixture.d1,
+      newManifest,
+      newEntries,
+      expectedHead
+    );
 
     expect(
       fixture.database
@@ -595,9 +1181,20 @@ describe("GitHub tree manifest reconciliation", () => {
     ).toEqual({ count: 2 });
     expect(
       await readActiveGitHubTreeHead(fixture.d1, PROJECT_ID, REPOSITORY_ID, REF)
-    ).toEqual({ manifestId: newManifest.manifestId, observedSha: SHA.commit });
+    ).toEqual({
+      manifestId: newManifest.manifestId,
+      observedSha: SHA.commit,
+      headVersion: 2
+    });
 
-    await activate(fixture.d1, newManifest, expectedHead);
+    await activate(
+      fixture.d1,
+      newManifest,
+      expectedHead,
+      committed.candidateStatements,
+      expectedHead?.observedSha ?? null,
+      committed.activationClaim
+    );
     expect(
       fixture.database
         .prepare(
@@ -621,6 +1218,12 @@ describe("GitHub tree manifest reconciliation", () => {
   it("isolates deletion evidence when tracked refs converge on the same commit", async () => {
     const fixture = createFixture();
     const trackedRefs = ["refs/heads/feature-a", "refs/heads/feature-b"] as const;
+    fixture.database
+      .prepare(
+        `UPDATE repositories SET tracked_refs_json = ?, updated_at = ?
+         WHERE project_id = ? AND repository_id = ?`
+      )
+      .run(JSON.stringify(trackedRefs), NOW, PROJECT_ID, REPOSITORY_ID);
     const deletedPath = "private/shared-secret.env";
     const oldObservedSha = "6".repeat(40);
     const oldTreeSha = "7".repeat(40);
@@ -824,7 +1427,11 @@ describe("GitHub tree manifest reconciliation", () => {
     ).rejects.toMatchObject({ code: "GITHUB_PARTIAL_SYNC" });
     expect(
       await readActiveGitHubTreeHead(fixture.d1, PROJECT_ID, REPOSITORY_ID, REF)
-    ).toEqual({ manifestId: oldManifest.manifestId, observedSha: SHA.commit });
+    ).toEqual({
+      manifestId: oldManifest.manifestId,
+      observedSha: SHA.commit,
+      headVersion: 1
+    });
     expect(
       fixture.database
         .prepare(
@@ -873,6 +1480,11 @@ describe("GitHub tree manifest reconciliation", () => {
       blobSha: SHA.added,
       content: "New durable context."
     });
+    const activationClaim = await prepareActivationClaim(
+      fixture.d1,
+      newManifest,
+      expectedHead?.observedSha ?? null
+    );
     const candidateStatements = await prepareGitHubCandidateStatements({
       database: fixture.d1,
       projectId: PROJECT_ID,
@@ -881,6 +1493,11 @@ describe("GitHub tree manifest reconciliation", () => {
       externalRepositoryId: 42,
       manifestId: newManifest.manifestId,
       observedSha: SHA.commit,
+      activationFence: buildActivationFence(
+        newManifest,
+        expectedHead,
+        activationClaim
+      ),
       candidates: [candidate]
     });
     fixture.database.exec(`
@@ -893,11 +1510,22 @@ describe("GitHub tree manifest reconciliation", () => {
     `);
 
     await expect(
-      activate(fixture.d1, newManifest, expectedHead, candidateStatements)
+      activate(
+        fixture.d1,
+        newManifest,
+        expectedHead,
+        candidateStatements,
+        expectedHead?.observedSha ?? null,
+        activationClaim
+      )
     ).rejects.toThrow("synthetic activation failure");
     expect(
       await readActiveGitHubTreeHead(fixture.d1, PROJECT_ID, REPOSITORY_ID, REF)
-    ).toEqual({ manifestId: oldManifest.manifestId, observedSha: SHA.commit });
+    ).toEqual({
+      manifestId: oldManifest.manifestId,
+      observedSha: SHA.commit,
+      headVersion: 1
+    });
     expect(
       fixture.database
         .prepare(
@@ -946,6 +1574,16 @@ describe("GitHub tree manifest reconciliation", () => {
       blobSha: SHA.added,
       content: "New durable context."
     });
+    const staleExpectedHead = {
+      manifestId: "4".repeat(64),
+      observedSha: SHA.commit,
+      headVersion: 1
+    };
+    const activationClaim = await prepareActivationClaim(
+      fixture.d1,
+      newManifest,
+      SHA.commit
+    );
     const candidateStatements = await prepareGitHubCandidateStatements({
       database: fixture.d1,
       projectId: PROJECT_ID,
@@ -954,6 +1592,11 @@ describe("GitHub tree manifest reconciliation", () => {
       externalRepositoryId: 42,
       manifestId: newManifest.manifestId,
       observedSha: SHA.commit,
+      activationFence: buildActivationFence(
+        newManifest,
+        staleExpectedHead,
+        activationClaim
+      ),
       candidates: [candidate]
     });
 
@@ -961,13 +1604,19 @@ describe("GitHub tree manifest reconciliation", () => {
       activate(
         fixture.d1,
         newManifest,
-        { manifestId: "4".repeat(64), observedSha: SHA.commit },
-        candidateStatements
+        staleExpectedHead,
+        candidateStatements,
+        SHA.commit,
+        activationClaim
       )
     ).rejects.toMatchObject({ code: "GITHUB_RECONCILIATION_REQUIRED" });
     expect(
       await readActiveGitHubTreeHead(fixture.d1, PROJECT_ID, REPOSITORY_ID, REF)
-    ).toEqual({ manifestId: oldManifest.manifestId, observedSha: SHA.commit });
+    ).toEqual({
+      manifestId: oldManifest.manifestId,
+      observedSha: SHA.commit,
+      headVersion: 1
+    });
     expect(
       fixture.database
         .prepare(
@@ -1009,7 +1658,11 @@ describe("GitHub tree manifest reconciliation", () => {
     ).rejects.toMatchObject({ code: "GITHUB_RECONCILIATION_REQUIRED" });
     expect(
       await readActiveGitHubTreeHead(fixture.d1, PROJECT_ID, REPOSITORY_ID, REF)
-    ).toEqual({ manifestId: oldManifest.manifestId, observedSha: SHA.commit });
+    ).toEqual({
+      manifestId: oldManifest.manifestId,
+      observedSha: SHA.commit,
+      headVersion: 1
+    });
     expect(
       fixture.database
         .prepare(
@@ -1033,11 +1686,11 @@ describe("GitHub tree manifest reconciliation", () => {
     const legacySha = "8".repeat(40);
     fixture.database
       .prepare(
-        `INSERT INTO sync_cursors
-         (project_id, repository_id, ref, observed_sha, status, updated_at)
-         VALUES (?, ?, ?, ?, 'complete', ?)`
+        `UPDATE sync_cursors
+         SET observed_sha = ?, status = 'complete', updated_at = ?
+         WHERE project_id = ? AND repository_id = ? AND ref = ?`
       )
-      .run(PROJECT_ID, REPOSITORY_ID, REF, legacySha, NOW);
+      .run(legacySha, NOW, PROJECT_ID, REPOSITORY_ID, REF);
     const manifest = await descriptor("2026-07-29T00:00:00.000Z");
     const manifestEntries = await entries([["docs/current.md", SHA.keep, "text"]]);
     await beginGitHubTreeManifest(fixture.d1, manifest);
@@ -1048,7 +1701,11 @@ describe("GitHub tree manifest reconciliation", () => {
 
     expect(
       await readActiveGitHubTreeHead(fixture.d1, PROJECT_ID, REPOSITORY_ID, REF)
-    ).toEqual({ manifestId: manifest.manifestId, observedSha: SHA.commit });
+    ).toEqual({
+      manifestId: manifest.manifestId,
+      observedSha: SHA.commit,
+      headVersion: 1
+    });
     expect(
       fixture.database
         .prepare(
@@ -1167,12 +1824,99 @@ async function storeAndActivate(
   database: D1Database,
   manifest: GitHubTreeManifestDescriptor,
   manifestEntries: readonly GitHubTreeManifestEntry[],
-  expectedHead: Awaited<ReturnType<typeof readActiveGitHubTreeHead>>
-): Promise<void> {
+  expectedHead: Awaited<ReturnType<typeof readActiveGitHubTreeHead>>,
+  candidates: readonly PersistableGitHubCandidate[] = []
+): Promise<PreparedCandidateActivation> {
   await beginGitHubTreeManifest(database, manifest);
   await persistGitHubTreeManifestEntries(database, manifest, manifestEntries);
   await completeGitHubTreeManifest(database, manifest, manifestEntries, NOW);
-  await activate(database, manifest, expectedHead);
+  const pending = await prepareCandidateActivation(
+    database,
+    manifest,
+    expectedHead,
+    candidates
+  );
+  await activate(
+    database,
+    manifest,
+    expectedHead,
+    pending.candidateStatements,
+    expectedHead?.observedSha ?? null,
+    pending.activationClaim
+  );
+  return pending;
+}
+
+interface PreparedCandidateActivation {
+  activationClaim: GitHubTreeManifestActivationClaim;
+  activationFence: PendingGitHubSyncActivationFence;
+  candidateStatements: readonly D1PreparedStatement[];
+}
+
+async function prepareCandidateActivation(
+  database: D1Database,
+  manifest: GitHubTreeManifestDescriptor,
+  expectedHead: Awaited<ReturnType<typeof readActiveGitHubTreeHead>>,
+  candidates: readonly PersistableGitHubCandidate[],
+  expectedCursorObservedSha: string | null = expectedHead?.observedSha ?? null
+): Promise<PreparedCandidateActivation> {
+  const activationClaim = await prepareActivationClaim(
+    database,
+    manifest,
+    expectedCursorObservedSha
+  );
+  const activationFence = buildActivationFence(
+    manifest,
+    expectedHead,
+    activationClaim
+  );
+  const candidateStatements = await prepareGitHubCandidateStatements({
+    database,
+    projectId: manifest.projectId,
+    repositoryId: manifest.repositoryId,
+    repositoryRef: manifest.ref,
+    externalRepositoryId: activationClaim.expectedExternalId,
+    manifestId: manifest.manifestId,
+    observedSha: manifest.observedSha,
+    activationFence,
+    candidates
+  });
+  return { activationClaim, activationFence, candidateStatements };
+}
+
+function buildActivationFence(
+  manifest: GitHubTreeManifestDescriptor,
+  expectedHead: Awaited<ReturnType<typeof readActiveGitHubTreeHead>>,
+  activationClaim: GitHubTreeManifestActivationClaim
+): PendingGitHubSyncActivationFence {
+  return {
+    projectId: manifest.projectId,
+    repositoryId: manifest.repositoryId,
+    ref: manifest.ref,
+    manifestId: manifest.manifestId,
+    repositoryAuthority: manifest.repositoryAuthority,
+    runId: activationClaim.runId,
+    receiptId: activationClaim.receiptId,
+    activationToken: activationClaim.activationToken,
+    scheduledFor: new Date(Date.parse(manifest.collectionKey)).toISOString(),
+    fullReconciliation: activationClaim.fullReconciliation,
+    expectedHeadManifestId: expectedHead?.manifestId ?? null,
+    expectedHeadVersion: expectedHead?.headVersion ?? 0,
+    expectedExternalId: activationClaim.expectedExternalId,
+    expectedOwnerExternalId: activationClaim.expectedOwnerExternalId,
+    expectedOwner: activationClaim.expectedOwner,
+    expectedName: activationClaim.expectedName,
+    expectedDefaultBranch: activationClaim.expectedDefaultBranch,
+    expectedTrackedRefsJson: activationClaim.expectedTrackedRefsJson,
+    expectedRepositoryConfigurationVersion:
+      activationClaim.expectedRepositoryConfigurationVersion,
+    expectedRepositoryUpdatedAt:
+      activationClaim.expectedRepositoryUpdatedAt,
+    expectedCursorObservedSha: activationClaim.expectedCursorObservedSha,
+    expectedCursorStatus: activationClaim.expectedCursorStatus,
+    expectedCursorUpdatedAt: activationClaim.expectedCursorUpdatedAt,
+    expectedCursorVersion: activationClaim.expectedCursorVersion
+  };
 }
 
 async function activate(
@@ -1180,21 +1924,36 @@ async function activate(
   manifest: GitHubTreeManifestDescriptor,
   expectedHead: Awaited<ReturnType<typeof readActiveGitHubTreeHead>>,
   candidateStatements: readonly D1PreparedStatement[] = [],
-  expectedCursorObservedSha: string | null = expectedHead?.observedSha ?? null
+  expectedCursorObservedSha: string | null = expectedHead?.observedSha ?? null,
+  preparedClaim?: GitHubTreeManifestActivationClaim
 ): Promise<void> {
-  const payloadJson = JSON.stringify({ manifest_id: manifest.manifestId });
+  const activationClaim =
+    preparedClaim ??
+    (await prepareActivationClaim(
+      database,
+      manifest,
+      expectedCursorObservedSha
+    ));
+  const syncEvent = await buildStableSyncEvent({
+    projectId: manifest.projectId,
+    repositoryId: manifest.repositoryId,
+    externalRepositoryId: activationClaim.expectedExternalId,
+    ref: manifest.ref,
+    observedSha: manifest.observedSha
+  });
+  const payloadJson = JSON.stringify(syncEvent);
   await activateGitHubTreeManifest({
     database,
     descriptor: manifest,
     expectedHead,
-    expectedCursorObservedSha,
+    activationClaim,
     scheduledTime: Date.parse(manifest.collectionKey),
     nextSyncAt: "2026-07-28T06:00:00.000Z",
     historyGapPossible: false,
     credentialStatus: "active",
     etag: '"synthetic-etag"',
     syncEvent: {
-      eventId: `sync-${manifest.manifestId}`,
+      eventId: syncEvent.eventId,
       payloadDigest: await sha256(payloadJson),
       payloadJson
     },
@@ -1202,13 +1961,131 @@ async function activate(
   });
 }
 
-function createFixture(): { database: DatabaseSync; d1: D1Database } {
+async function prepareActivationClaim(
+  database: D1Database,
+  manifest: GitHubTreeManifestDescriptor,
+  expectedCursorObservedSha: string | null
+): Promise<GitHubTreeManifestActivationClaim> {
+  const repository = await database
+    .withSession("first-primary")
+    .prepare(
+      `SELECT external_id, expected_owner_external_id, owner, name,
+              default_branch, tracked_refs_json,
+              github_sync_configuration_version, updated_at
+       FROM repositories
+       WHERE project_id = ? AND repository_id = ?`
+    )
+    .bind(manifest.projectId, manifest.repositoryId)
+    .first<{
+      external_id: number;
+      expected_owner_external_id: number;
+      owner: string;
+      name: string;
+      default_branch: string;
+      tracked_refs_json: string;
+      github_sync_configuration_version: number;
+      updated_at: string;
+    }>();
+  const cursor = await database
+    .withSession("first-primary")
+    .prepare(
+      `SELECT status, updated_at, cursor_version
+       FROM sync_cursors
+       WHERE project_id = ? AND repository_id = ? AND ref = ?`
+    )
+    .bind(manifest.projectId, manifest.repositoryId, manifest.ref)
+    .first<{
+      status: string;
+      updated_at: string;
+      cursor_version: number;
+    }>();
+  const head = await database
+    .withSession("first-primary")
+    .prepare(
+      `SELECT manifest_id, head_version
+       FROM github_tree_ref_heads
+       WHERE project_id = ? AND repository_id = ? AND ref = ?`
+    )
+    .bind(manifest.projectId, manifest.repositoryId, manifest.ref)
+    .first<{ manifest_id: string; head_version: number }>();
+  if (repository === null || cursor === null) {
+    throw new Error("Synthetic activation requires repository and cursor rows.");
+  }
+  const scheduledFor = new Date(
+    Date.parse(manifest.collectionKey)
+  ).toISOString();
+  const runId = await sha256(
+    [
+      "synthetic.github.sync.run",
+      manifest.projectId,
+      manifest.repositoryId,
+      manifest.ref,
+      manifest.manifestId
+    ].join("\n")
+  );
+  await database
+    .prepare(
+      `INSERT INTO github_repository_sync_runs
+       (run_id, project_id, repository_id, scheduled_for,
+        full_reconciliation, status, started_at, lease_expires_at,
+        claimed_ref, claimed_head_manifest_id, claimed_head_version,
+        repository_configuration_version, cursor_version, claim_contract_version)
+       VALUES (?, ?, ?, ?, 1, 'running', ?,
+               '2099-01-01T00:00:00.000Z', ?, ?, ?, ?, ?, 1)
+       ON CONFLICT(run_id) DO NOTHING`
+    )
+    .bind(
+      runId,
+      manifest.projectId,
+      manifest.repositoryId,
+      scheduledFor,
+      NOW,
+      manifest.ref,
+      head?.manifest_id ?? null,
+      head?.head_version ?? 0,
+      repository.github_sync_configuration_version,
+      cursor.cursor_version
+    )
+    .run();
+  const attempt = await createGitHubTreeManifestActivationAttempt({
+    runId,
+    projectId: manifest.projectId,
+    repositoryId: manifest.repositoryId,
+    ref: manifest.ref,
+    manifestId: manifest.manifestId
+  });
+  return {
+    runId,
+    ...attempt,
+    expectedExternalId: repository.external_id,
+    expectedOwnerExternalId: repository.expected_owner_external_id,
+    expectedOwner: repository.owner,
+    expectedName: repository.name,
+    expectedDefaultBranch: repository.default_branch,
+    expectedTrackedRefsJson: repository.tracked_refs_json,
+    expectedRepositoryConfigurationVersion:
+      repository.github_sync_configuration_version,
+    expectedRepositoryUpdatedAt: repository.updated_at,
+    expectedCursorStatus: cursor.status,
+    expectedCursorUpdatedAt: cursor.updated_at,
+    expectedCursorVersion: cursor.cursor_version,
+    expectedCursorObservedSha,
+    fullReconciliation: true
+  };
+}
+
+function createFixture(): {
+  database: DatabaseSync;
+  d1: D1Database;
+  control: SqliteD1;
+} {
   const database = new DatabaseSync(":memory:");
   for (const migration of MIGRATIONS) {
     database.exec(readFileSync(migration, "utf8"));
   }
   seedProjectRepository(database, PROJECT_ID, REPOSITORY_ID, 42);
-  return { database, d1: new SqliteD1(database) as unknown as D1Database };
+  const control = new SqliteD1(database);
+  return { database, d1: control as unknown as D1Database, control };
 }
 
 function seedProjectRepository(
@@ -1234,6 +2111,57 @@ function seedProjectRepository(
        VALUES (?, ?, 'github', ?, 'memenow', ?, 'main', '[]', 1, ?, ?, 7)`
     )
     .run(repositoryId, projectId, externalId, repositoryId, NOW, NOW);
+  database
+    .prepare(
+      `INSERT INTO sync_cursors
+       (project_id, repository_id, ref, status, history_gap_possible,
+        credential_status, updated_at)
+       VALUES (?, ?, ?, 'idle', 0, 'active', ?)
+       ON CONFLICT(project_id, repository_id, ref) DO NOTHING`
+    )
+    .run(projectId, repositoryId, REF, NOW);
+}
+
+function readCandidateReplayState(
+  database: DatabaseSync,
+  observationId: string,
+  evidenceId: string
+): {
+  observation: Record<string, unknown> | undefined;
+  evidence: Record<string, unknown> | undefined;
+  link: Record<string, unknown> | undefined;
+  outbox: Record<string, unknown>[];
+} {
+  return {
+    observation: database
+      .prepare(
+        `SELECT * FROM observations
+         WHERE project_id = ? AND observation_id = ?`
+      )
+      .get(PROJECT_ID, observationId) as Record<string, unknown> | undefined,
+    evidence: database
+      .prepare(
+        `SELECT * FROM evidence
+         WHERE project_id = ? AND evidence_id = ?`
+      )
+      .get(PROJECT_ID, evidenceId) as Record<string, unknown> | undefined,
+    link: database
+      .prepare(
+        `SELECT * FROM observation_evidence
+         WHERE project_id = ? AND observation_id = ? AND evidence_id = ?`
+      )
+      .get(PROJECT_ID, observationId, evidenceId) as
+      | Record<string, unknown>
+      | undefined,
+    outbox: database
+      .prepare(
+        `SELECT * FROM outbox_events
+         WHERE project_id = ?
+           AND event_type IN ('candidate.submitted', 'github.sync.requested')
+         ORDER BY event_type, event_id`
+      )
+      .all(PROJECT_ID) as Record<string, unknown>[]
+  };
 }
 
 function seedAffectedMemory(
@@ -1370,7 +2298,13 @@ function d1Result(changes: number): D1Result {
 }
 
 class SqliteD1 {
+  private failAfterCommit = false;
+
   constructor(private readonly database: DatabaseSync) {}
+
+  failAfterNextCommittedBatch(): void {
+    this.failAfterCommit = true;
+  }
 
   prepare(sql: string): SqliteD1Statement {
     return new SqliteD1Statement(this.database, sql);
@@ -1385,9 +2319,15 @@ class SqliteD1 {
     try {
       const results = statements.map((statement) => statement.runSync());
       this.database.exec("COMMIT");
+      if (this.failAfterCommit) {
+        this.failAfterCommit = false;
+        throw new Error("synthetic response loss after commit");
+      }
       return results;
     } catch (error) {
-      this.database.exec("ROLLBACK");
+      if (this.database.isTransaction) {
+        this.database.exec("ROLLBACK");
+      }
       throw error;
     }
   }

@@ -33,7 +33,7 @@ jobs:
     needs: confirm
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 55
     environment: production
     steps:
       - name: Check out repository
@@ -75,6 +75,7 @@ jobs:
         env:
           CF_D1_MEMORY_DATABASE_ID: ${{ vars.CF_D1_MEMORY_DATABASE_ID }}
           CF_D1_SEARCH_DATABASE_ID: ${{ vars.CF_D1_SEARCH_DATABASE_ID }}
+          ENABLE_GITHUB_SYNC: ${{ vars.ENABLE_GITHUB_SYNC }}
         shell: bash
         run: |
           set -euo pipefail
@@ -92,6 +93,10 @@ jobs:
             echo "Missing required production settings: ${missing[*]}" >&2
             exit 1
           fi
+          if [[ "${ENABLE_GITHUB_SYNC:-}" != "false" ]]; then
+            echo "D1 migrations require ENABLE_GITHUB_SYNC to be explicitly false." >&2
+            exit 1
+          fi
           echo "::add-mask::$CF_D1_MEMORY_DATABASE_ID"
           echo "::add-mask::$CF_D1_SEARCH_DATABASE_ID"
 
@@ -100,6 +105,591 @@ jobs:
           CF_D1_MEMORY_DATABASE_ID: ${{ vars.CF_D1_MEMORY_DATABASE_ID }}
           CF_D1_SEARCH_DATABASE_ID: ${{ vars.CF_D1_SEARCH_DATABASE_ID }}
         run: node scripts/render-wrangler-config.mjs memory-orchestrator
+
+      - name: Require quiescent GitHub sync before migration
+        timeout-minutes: 7
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          ENABLE_GITHUB_SYNC: ${{ vars.ENABLE_GITHUB_SYNC }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${ENABLE_GITHUB_SYNC:-}" != "false" ]]; then
+            echo "D1 migrations require ENABLE_GITHUB_SYNC to remain explicitly false." >&2
+            exit 1
+          fi
+          config="wrangler/.wrangler/memory-orchestrator.generated.jsonc"
+
+          github_sync_runtime_state() {
+            node --input-type=module <<'NODE'
+          const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
+          const token = process.env.CLOUDFLARE_API_TOKEN;
+          if (!accountId || !token) {
+            throw new Error("Cloudflare GitHub sync lifecycle inputs are incomplete.");
+          }
+          const base = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}`;
+          const headers = { Authorization: `Bearer ${token}` };
+          const deploymentsResponse = await fetch(
+            `${base}/workers/scripts/edgemneme-github-sync/deployments`,
+            { headers, redirect: "manual" }
+          );
+          let activeVersion = "absent";
+          if (deploymentsResponse.status !== 404 && !deploymentsResponse.ok) {
+            throw new Error(
+              `Cloudflare GitHub sync deployment query failed with HTTP ${deploymentsResponse.status}.`
+            );
+          }
+          if (deploymentsResponse.status !== 404) {
+            const deploymentsEnvelope = await deploymentsResponse.json();
+            if (
+              deploymentsEnvelope?.success !== true ||
+              !Array.isArray(deploymentsEnvelope?.result?.deployments) ||
+              deploymentsEnvelope.result.deployments.length === 0
+            ) {
+              throw new Error("The Cloudflare GitHub sync deployment response is invalid.");
+            }
+            const candidates = deploymentsEnvelope.result.deployments.map((deployment) => {
+              const createdAt = Date.parse(deployment?.created_on);
+              if (!Number.isFinite(createdAt)) {
+                throw new Error("A Cloudflare GitHub sync deployment has an invalid timestamp.");
+              }
+              return { deployment, createdAt };
+            });
+            const latest = candidates.reduce((selected, candidate) =>
+              candidate.createdAt > selected.createdAt ? candidate : selected
+            ).deployment;
+            if (
+              !Array.isArray(latest.versions) ||
+              latest.versions.length !== 1 ||
+              typeof latest.versions[0]?.version_id !== "string" ||
+              !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+                latest.versions[0].version_id
+              ) ||
+              latest.versions[0]?.percentage !== 100
+            ) {
+              throw new Error("The active GitHub sync deployment is not a single 100% version.");
+            }
+            activeVersion = latest.versions[0].version_id;
+            const settingsResponse = await fetch(
+              `${base}/workers/scripts/edgemneme-github-sync/settings`,
+              { headers, redirect: "manual" }
+            );
+            if (!settingsResponse.ok) {
+              throw new Error(
+                `Cloudflare GitHub sync settings query failed with HTTP ${settingsResponse.status}.`
+              );
+            }
+            const settingsEnvelope = await settingsResponse.json();
+            const bindings = settingsEnvelope?.result?.bindings;
+            if (settingsEnvelope?.success !== true || !Array.isArray(bindings)) {
+              throw new Error("The Cloudflare GitHub sync settings response is invalid.");
+            }
+            const runtimeBindings = bindings.filter(
+              (binding) => binding?.name === "GITHUB_SYNC_ENABLED"
+            );
+            if (
+              bindings.some((binding) => binding?.type === "queue") ||
+              runtimeBindings.length !== 1 ||
+              runtimeBindings[0]?.type !== "plain_text" ||
+              runtimeBindings[0]?.text !== "false"
+            ) {
+              throw new Error("The deployed GitHub sync runtime is not explicitly disabled.");
+            }
+            const schedulesResponse = await fetch(
+              `${base}/workers/scripts/edgemneme-github-sync/schedules`,
+              { headers, redirect: "manual" }
+            );
+            if (!schedulesResponse.ok) {
+              throw new Error(
+                `Cloudflare GitHub sync schedule query failed with HTTP ${schedulesResponse.status}.`
+              );
+            }
+            const schedulesEnvelope = await schedulesResponse.json();
+            const schedules = schedulesEnvelope?.result?.schedules;
+            if (
+              schedulesEnvelope?.success !== true ||
+              !Array.isArray(schedules) ||
+              schedules.length !== 0
+            ) {
+              throw new Error("The deployed GitHub sync Worker still has a Cron Trigger.");
+            }
+          }
+
+          const queueRequest = async (url) => {
+            const response = await fetch(url, { headers, redirect: "manual" });
+            if (!response.ok) {
+              throw new Error(`Cloudflare Queue query failed with HTTP ${response.status}.`);
+            }
+            const envelope = await response.json();
+            if (envelope?.success !== true) {
+              throw new Error("The Cloudflare Queue response is invalid.");
+            }
+            return envelope;
+          };
+          const queueIds = new Set();
+          let queueTotalCount;
+          let queueTotalPages;
+          for (let page = 1; page <= 10_000; page += 1) {
+            const url = new URL(`${base}/queues`);
+            url.searchParams.set("page", String(page));
+            url.searchParams.set("per_page", "100");
+            const envelope = await queueRequest(url);
+            const info = envelope?.result_info;
+            if (
+              !Array.isArray(envelope.result) ||
+              !Number.isSafeInteger(info?.count) || info.count !== envelope.result.length ||
+              !Number.isSafeInteger(info?.page) || info.page !== page ||
+              !Number.isSafeInteger(info?.per_page) || info.per_page < 1 ||
+              info.count > info.per_page ||
+              !Number.isSafeInteger(info?.total_count) || info.total_count < 0 ||
+              !Number.isSafeInteger(info?.total_pages) || info.total_pages < 0 ||
+              (info.total_count > 0 &&
+                info.total_pages !== Math.ceil(info.total_count / info.per_page)) ||
+              (info.total_count === 0 && ![0, 1].includes(info.total_pages))
+            ) {
+              throw new Error("The Cloudflare Queue inventory pagination is invalid.");
+            }
+            queueTotalCount ??= info.total_count;
+            queueTotalPages ??= info.total_pages;
+            if (info.total_count !== queueTotalCount || info.total_pages !== queueTotalPages) {
+              throw new Error("The Cloudflare Queue inventory changed during pagination.");
+            }
+            for (const queue of envelope.result) {
+              if (
+                typeof queue?.queue_id !== "string" || queue.queue_id.length === 0 ||
+                typeof queue?.queue_name !== "string" || queue.queue_name.length === 0 ||
+                queueIds.has(queue.queue_id) ||
+                !Number.isSafeInteger(queue?.consumers_total_count) ||
+                queue.consumers_total_count < 0 ||
+                !Number.isSafeInteger(queue?.producers_total_count) ||
+                queue.producers_total_count < 0 ||
+                (queue.consumers !== undefined && !Array.isArray(queue.consumers)) ||
+                (queue.producers !== undefined && !Array.isArray(queue.producers))
+              ) {
+                throw new Error("The Cloudflare Queue inventory contains an invalid entry.");
+              }
+              queueIds.add(queue.queue_id);
+              let consumers = queue.consumers ?? [];
+              if (consumers.length > queue.consumers_total_count) {
+                throw new Error("A Cloudflare Queue consumer count is invalid.");
+              }
+              if (consumers.length !== queue.consumers_total_count) {
+                const consumerEnvelope = await queueRequest(
+                  `${base}/queues/${encodeURIComponent(queue.queue_id)}/consumers`
+                );
+                if (
+                  !Array.isArray(consumerEnvelope.result) ||
+                  consumerEnvelope.result.length !== queue.consumers_total_count
+                ) {
+                  throw new Error("A Cloudflare Queue consumer inventory is incomplete.");
+                }
+                consumers = consumerEnvelope.result;
+              }
+              const producers = queue.producers ?? [];
+              if (producers.length !== queue.producers_total_count) {
+                throw new Error("A Cloudflare Queue producer inventory is incomplete.");
+              }
+              const consumerIds = new Set();
+              for (const consumer of consumers) {
+                if (
+                  typeof consumer?.consumer_id !== "string" ||
+                  consumer.consumer_id.length === 0 ||
+                  consumerIds.has(consumer.consumer_id) ||
+                  !["worker", "http_pull"].includes(consumer?.type) ||
+                  (consumer.type === "worker" &&
+                    (typeof consumer.script_name !== "string" ||
+                      consumer.script_name.length === 0))
+                ) {
+                  throw new Error("A Cloudflare Queue consumer entry is invalid.");
+                }
+                consumerIds.add(consumer.consumer_id);
+                if (consumer?.script_name === "edgemneme-github-sync") {
+                  throw new Error("The GitHub sync Worker still has a Queue consumer.");
+                }
+              }
+              for (const producer of producers) {
+                if (
+                  (producer?.type !== "worker" && producer?.type !== "r2_bucket") ||
+                  (producer.type === "worker" &&
+                    (typeof producer.script !== "string" || producer.script.length === 0)) ||
+                  (producer.type === "r2_bucket" &&
+                    (typeof producer.bucket_name !== "string" || producer.bucket_name.length === 0))
+                ) {
+                  throw new Error("A Cloudflare Queue producer entry is invalid.");
+                }
+                if (producer?.script === "edgemneme-github-sync") {
+                  throw new Error("The GitHub sync Worker still has a Queue producer.");
+                }
+              }
+            }
+            if (page >= Math.max(1, queueTotalPages)) break;
+            if (page === 10_000) {
+              throw new Error("Cloudflare Queue inventory pagination exceeded its safety bound.");
+            }
+          }
+          if (queueIds.size !== queueTotalCount) {
+            throw new Error("The Cloudflare Queue inventory count is inconsistent.");
+          }
+          process.stdout.write(activeVersion);
+          NODE
+          }
+
+          github_sync_schedule_state() {
+            local expected_version="$1"
+            EXPECTED_GITHUB_SYNC_VERSION="$expected_version" node --input-type=module <<'NODE'
+          const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
+          const token = process.env.CLOUDFLARE_API_TOKEN;
+          const expectedVersion = process.env.EXPECTED_GITHUB_SYNC_VERSION;
+          if (
+            !accountId || !token ||
+            !/^(?:absent|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i
+              .test(expectedVersion ?? "")
+          ) {
+            throw new Error("Cloudflare GitHub sync schedule inputs are incomplete.");
+          }
+          const base = "https://api.cloudflare.com/client/v4/accounts/" +
+            encodeURIComponent(accountId);
+          const response = await fetch(
+            base + "/workers/scripts/edgemneme-github-sync/schedules",
+            { headers: { Authorization: "Bearer " + token }, redirect: "manual" }
+          );
+          if (response.status === 404) {
+            if (expectedVersion !== "absent") {
+              throw new Error("The expected GitHub sync Worker schedule endpoint is unavailable.");
+            }
+            process.stdout.write("clear");
+          } else {
+            if (expectedVersion === "absent") {
+              throw new Error("The absent GitHub sync Worker appeared during schedule verification.");
+            }
+            if (!response.ok) {
+              throw new Error(
+                "Cloudflare GitHub sync schedule query failed with HTTP " + response.status + "."
+              );
+            }
+            const envelope = await response.json();
+            const schedules = envelope?.result?.schedules;
+            if (envelope?.success !== true || !Array.isArray(schedules)) {
+              throw new Error("The Cloudflare GitHub sync schedule response is invalid.");
+            }
+            process.stdout.write(schedules.length === 0 ? "clear" : "pending");
+          }
+          NODE
+          }
+
+          cloudflare_github_workflow_state() {
+            EXPECTED_WORKFLOW_INVENTORY="$expected_workflow_inventory" \
+              ALLOW_MISSING_WORKFLOWS="true" node --input-type=module <<'NODE'
+          const workflowContracts = [
+            ["edgemneme-github-dispatch-workflow", "GitHubDispatchWorkflow"],
+            ["edgemneme-github-ref-sync-workflow", "GitHubRefSyncWorkflow"],
+            ["edgemneme-github-retention-workflow", "GitHubRetentionWorkflow"]
+          ];
+          const nonterminalStatuses = [
+            "queued", "running", "paused", "waitingForPause", "waiting", "rollingBack"
+          ];
+          const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
+          const token = process.env.CLOUDFLARE_API_TOKEN;
+          const expectedInventoryState = process.env.EXPECTED_WORKFLOW_INVENTORY;
+          if (
+            !accountId || !token || process.env.ALLOW_MISSING_WORKFLOWS !== "true" ||
+            !["legacy-or-exact", "absent"].includes(expectedInventoryState ?? "")
+          ) {
+            throw new Error("Cloudflare Workflow lifecycle inputs are invalid.");
+          }
+          const base = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}`;
+          const headers = { Authorization: `Bearer ${token}` };
+          const request = async (url, allowNotFound = false) => {
+            const response = await fetch(url, { headers, redirect: "manual" });
+            if (allowNotFound && response.status === 404) return null;
+            if (!response.ok) {
+              throw new Error(`Cloudflare Workflow query failed with HTTP ${response.status}.`);
+            }
+            const envelope = await response.json();
+            if (envelope?.success !== true) {
+              throw new Error("The Cloudflare Workflow response is invalid.");
+            }
+            return envelope;
+          };
+          const expectedInventory = new Map(workflowContracts);
+          const workflowInventoryNames = new Set();
+          const accountWorkflowIds = new Set();
+          const accountWorkflowNames = new Set();
+          let inventoryTotalCount;
+          let inventoryTotalPages;
+          for (let page = 1; page <= 10_000; page += 1) {
+            const url = new URL(`${base}/workflows`);
+            url.searchParams.set("page", String(page));
+            url.searchParams.set("per_page", "100");
+            const envelope = await request(url);
+            const info = envelope?.result_info;
+            if (
+              !Array.isArray(envelope.result) ||
+              !Number.isSafeInteger(info?.count) || info.count !== envelope.result.length ||
+              !Number.isSafeInteger(info?.page) || info.page !== page ||
+              !Number.isSafeInteger(info?.per_page) || info.per_page !== 100 ||
+              !Number.isSafeInteger(info?.total_count) || info.total_count < 0 ||
+              !Number.isSafeInteger(info?.total_pages) || info.total_pages < 0 ||
+              (info.total_count > 0 &&
+                info.total_pages !== Math.ceil(info.total_count / info.per_page)) ||
+              (info.total_count === 0 && ![0, 1].includes(info.total_pages))
+            ) {
+              throw new Error("The Cloudflare Workflow inventory pagination is invalid.");
+            }
+            inventoryTotalCount ??= info.total_count;
+            inventoryTotalPages ??= info.total_pages;
+            if (
+              info.total_count !== inventoryTotalCount ||
+              info.total_pages !== inventoryTotalPages
+            ) {
+              throw new Error("The Cloudflare Workflow inventory changed during pagination.");
+            }
+            for (const workflow of envelope.result) {
+              if (
+                typeof workflow?.id !== "string" || workflow.id.length === 0 ||
+                typeof workflow?.name !== "string" || workflow.name.length === 0 ||
+                typeof workflow?.script_name !== "string" || workflow.script_name.length === 0 ||
+                accountWorkflowIds.has(workflow.id) || accountWorkflowNames.has(workflow.name)
+              ) {
+                throw new Error("The Cloudflare Workflow inventory contains an invalid entry.");
+              }
+              accountWorkflowIds.add(workflow.id);
+              accountWorkflowNames.add(workflow.name);
+              if (workflow.script_name !== "edgemneme-github-sync") continue;
+              const expectedClass = expectedInventory.get(workflow.name);
+              if (
+                expectedClass === undefined || workflow.class_name !== expectedClass ||
+                (workflow.schedules !== undefined &&
+                  (!Array.isArray(workflow.schedules) || workflow.schedules.length !== 0))
+              ) {
+                throw new Error("The GitHub sync Workflow inventory is not the exact approved set.");
+              }
+              workflowInventoryNames.add(workflow.name);
+            }
+            if (page >= Math.max(1, inventoryTotalPages)) break;
+            if (page === 10_000) {
+              throw new Error("Cloudflare Workflow inventory pagination exceeded its safety bound.");
+            }
+          }
+          if (accountWorkflowIds.size !== inventoryTotalCount) {
+            throw new Error("The Cloudflare Workflow inventory count is inconsistent.");
+          }
+          const exactInventory =
+            workflowInventoryNames.size === expectedInventory.size &&
+            [...expectedInventory.keys()].every((name) => workflowInventoryNames.has(name));
+          if (
+            (expectedInventoryState === "legacy-or-exact" &&
+              workflowInventoryNames.size !== 0 && !exactInventory) ||
+            (expectedInventoryState === "absent" && workflowInventoryNames.size !== 0)
+          ) {
+            throw new Error("The GitHub sync Workflow inventory is not the expected lifecycle set.");
+          }
+          if (workflowInventoryNames.size === 0) {
+            process.stdout.write("clear");
+            process.exit(0);
+          }
+          let pendingInstances = 0;
+          const observedInstanceKeys = new Set();
+          const statusInstanceKeys = new Set();
+          for (const [name, className] of workflowContracts) {
+            const definitionEnvelope = await request(
+              `${base}/workflows/${encodeURIComponent(name)}`,
+              false
+            );
+            const workflow = definitionEnvelope.result;
+            if (
+              workflow?.name !== name ||
+              workflow?.class_name !== className ||
+              workflow?.script_name !== "edgemneme-github-sync" ||
+              (workflow?.schedules !== undefined &&
+                (!Array.isArray(workflow.schedules) || workflow.schedules.length !== 0))
+            ) {
+              throw new Error("A GitHub sync Workflow definition does not match the approved contract.");
+            }
+            for (const status of nonterminalStatuses) {
+              let cursor;
+              const cursors = new Set();
+              for (let page = 0; page < 10_000; page += 1) {
+                const url = new URL(`${base}/workflows/${encodeURIComponent(name)}/instances`);
+                url.searchParams.set("status", status);
+                url.searchParams.set("direction", "asc");
+                url.searchParams.set("per_page", "100");
+                if (cursor !== undefined) url.searchParams.set("cursor", cursor);
+                const envelope = await request(url);
+                if (!Array.isArray(envelope.result)) {
+                  throw new Error("The Cloudflare Workflow instance page is invalid.");
+                }
+                for (const instance of envelope.result) {
+                  const observedInstanceKey = JSON.stringify([name, instance?.id]);
+                  const statusInstanceKey = JSON.stringify([name, status, instance?.id]);
+                  if (
+                    typeof instance?.id !== "string" || instance.id.length === 0 ||
+                    instance.status !== status || statusInstanceKeys.has(statusInstanceKey)
+                  ) {
+                    throw new Error("A Cloudflare Workflow instance is invalid or duplicated.");
+                  }
+                  statusInstanceKeys.add(statusInstanceKey);
+                  if (!observedInstanceKeys.has(observedInstanceKey)) {
+                    observedInstanceKeys.add(observedInstanceKey);
+                    pendingInstances += 1;
+                  }
+                }
+                const nextCursor = envelope?.result_info?.cursor;
+                if (nextCursor === undefined || nextCursor === null || nextCursor === "") break;
+                if (typeof nextCursor !== "string" || cursors.has(nextCursor)) {
+                  throw new Error("A Cloudflare Workflow instance cursor is invalid or repeated.");
+                }
+                cursors.add(nextCursor);
+                cursor = nextCursor;
+                if (page === 9_999) {
+                  throw new Error("Cloudflare Workflow instance pagination exceeded its safety bound.");
+                }
+              }
+            }
+          }
+          process.stdout.write(pendingInstances === 0 ? "clear" : "pending");
+          NODE
+          }
+
+          github_sync_d1_state() {
+            local schema
+            local table_names
+            local count_expression="0"
+            local output
+            schema="$(
+              pnpm exec wrangler d1 execute MEMORY_DB --remote --json \
+                --config "$config" \
+                --command "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('github_sync_dispatches', 'github_sync_dispatch_items', 'github_repository_sync_runs', 'github_credential_sync_lane') ORDER BY name;"
+            )" || return 1
+            table_names="$(D1_RESULT_JSON="$schema" node --input-type=module <<'NODE'
+          const statements = JSON.parse(process.env.D1_RESULT_JSON ?? "");
+          const rows = statements?.[0]?.results;
+          const allowed = new Set([
+            "github_sync_dispatches", "github_sync_dispatch_items",
+            "github_repository_sync_runs", "github_credential_sync_lane"
+          ]);
+          if (statements?.length !== 1 || statements[0]?.success !== true || !Array.isArray(rows)) {
+            throw new Error("The GitHub sync D1 schema probe response is invalid.");
+          }
+          const names = rows.map((row) => row?.name);
+          if (names.some((name) => typeof name !== "string" || !allowed.has(name)) ||
+              new Set(names).size !== names.length) {
+            throw new Error("The GitHub sync D1 schema probe contains an unexpected table.");
+          }
+          process.stdout.write(`|${names.join("|")}|`);
+          NODE
+            )" || return 1
+            if [[ "$table_names" == *"|github_sync_dispatches|"* ]]; then
+              count_expression+=" + (SELECT COUNT(*) FROM github_sync_dispatches WHERE status IN ('materialized', 'dispatching'))"
+            fi
+            if [[ "$table_names" == *"|github_sync_dispatch_items|"* ]]; then
+              count_expression+=" + (SELECT COUNT(*) FROM github_sync_dispatch_items WHERE status IN ('pending', 'running'))"
+            fi
+            if [[ "$table_names" == *"|github_repository_sync_runs|"* ]]; then
+              count_expression+=" + (SELECT COUNT(*) FROM github_repository_sync_runs WHERE status = 'running')"
+            fi
+            if [[ "$table_names" == *"|github_credential_sync_lane|"* ]]; then
+              count_expression+=" + (SELECT COUNT(*) FROM github_credential_sync_lane WHERE holder_id IS NOT NULL OR lease_claim_id IS NOT NULL OR lease_until IS NOT NULL)"
+            fi
+            output="$(
+              pnpm exec wrangler d1 execute MEMORY_DB --remote --json \
+                --config "$config" --command "SELECT $count_expression AS count;"
+            )" || return 1
+            D1_RESULT_JSON="$output" node --input-type=module <<'NODE'
+          const statements = JSON.parse(process.env.D1_RESULT_JSON ?? "");
+          const count = statements?.[0]?.results?.[0]?.count;
+          if (statements?.length !== 1 || statements[0]?.success !== true ||
+              !Number.isSafeInteger(count) || count < 0) {
+            throw new Error("The GitHub sync D1 drain response is invalid.");
+          }
+          process.stdout.write(count === 0 ? "clear" : "pending");
+          NODE
+          }
+
+          captured_runtime_version="$(github_sync_runtime_state)"
+          if [[ -z "$captured_runtime_version" ]]; then
+            echo "The deployed GitHub sync runtime version is invalid." >&2
+            exit 1
+          fi
+          if [[ "$captured_runtime_version" == "absent" ]]; then
+            expected_workflow_inventory="absent"
+          else
+            expected_workflow_inventory="legacy-or-exact"
+          fi
+          printf 'EDGEMNEME_MIGRATION_GITHUB_SYNC_VERSION=%s\n' \
+            "$captured_runtime_version" >> "$GITHUB_ENV"
+          zero_observations=0
+          for ((attempt = 1; attempt <= 5; attempt++)); do
+            observed_runtime_version="$(github_sync_runtime_state)"
+            if [[ "$observed_runtime_version" != "$captured_runtime_version" ]]; then
+              echo "The GitHub sync Worker changed during the migration drain gate." >&2
+              exit 1
+            fi
+            workflow_state="$(cloudflare_github_workflow_state)"
+            schedule_state="$(github_sync_schedule_state "$captured_runtime_version")"
+            if [[ "$schedule_state" != "clear" || "$workflow_state" != "clear" ]]; then
+              zero_observations=0
+              if (( attempt < 5 )); then
+                sleep 60
+              fi
+              continue
+            fi
+            reconciliation_state="$(
+              node scripts/github-sync-quiescence.mjs reconcile \
+                --config "$config" \
+                --disabled-version "$captured_runtime_version" \
+                --schedule-state clear \
+                --workflow-state clear
+            )" || exit 1
+            case "$reconciliation_state" in
+              clear|pending) ;;
+              *)
+                echo "GitHub sync D1 reconciliation returned an invalid state." >&2
+                exit 1
+                ;;
+            esac
+            verified_schedule_state="$(
+              github_sync_schedule_state "$captured_runtime_version"
+            )"
+            verified_runtime_version="$(github_sync_runtime_state)"
+            if [[ "$verified_runtime_version" != "$captured_runtime_version" ]]; then
+              echo "The GitHub sync Worker changed during a migration zero observation." >&2
+              exit 1
+            fi
+            verified_workflow_state="$(cloudflare_github_workflow_state)"
+            if [[ "$verified_schedule_state" != "clear" || \
+                  "$verified_workflow_state" != "clear" ]]; then
+              echo "GitHub sync control-plane state changed during D1 reconciliation." >&2
+              exit 1
+            fi
+            if [[ "$reconciliation_state" == "pending" ]]; then
+              zero_observations=0
+              if (( attempt < 5 )); then
+                sleep 60
+              fi
+              continue
+            fi
+            d1_state="$(github_sync_d1_state)"
+            if [[ "$schedule_state" == "clear" && \
+                  "$verified_schedule_state" == "clear" && \
+                  "$workflow_state" == "clear" && \
+                  "$verified_workflow_state" == "clear" && \
+                  "$reconciliation_state" == "clear" && \
+                  "$d1_state" == "clear" ]]; then
+              zero_observations=$((zero_observations + 1))
+              if (( zero_observations == 2 )); then
+                exit 0
+              fi
+            else
+              zero_observations=0
+            fi
+            if (( attempt < 5 )); then
+              sleep 60
+            fi
+          done
+          echo "GitHub sync is not quiescent; migration is blocked." >&2
+          exit 1
 
       - name: Capture and verify private pre-migration backups
         timeout-minutes: 25
@@ -411,6 +1001,423 @@ jobs:
           node scripts/d1-migration-safety.mjs verify-backup \
             "$backup_dir/manifest.json" "$backup_dir"
           upload_and_verify "manifest.json" "application/json"
+
+      - name: Revalidate quiescent GitHub sync before migration apply
+        timeout-minutes: 7
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          config="wrangler/.wrangler/memory-orchestrator.generated.jsonc"
+          : "${EDGEMNEME_MIGRATION_GITHUB_SYNC_VERSION:?Captured GitHub sync version is unavailable}"
+
+          cloudflare_github_sync_state() {
+            node --input-type=module <<'NODE'
+          const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
+          const token = process.env.CLOUDFLARE_API_TOKEN;
+          const expectedVersion = process.env.EDGEMNEME_MIGRATION_GITHUB_SYNC_VERSION;
+          if (!accountId || !token || !expectedVersion) {
+            throw new Error("The final GitHub sync migration gate inputs are incomplete.");
+          }
+          const base = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}`;
+          const headers = { Authorization: `Bearer ${token}` };
+          const request = async (url, allowNotFound = false) => {
+            const response = await fetch(url, { headers, redirect: "manual" });
+            if (allowNotFound && response.status === 404) return null;
+            if (!response.ok) {
+              throw new Error(`Cloudflare final migration gate failed with HTTP ${response.status}.`);
+            }
+            const envelope = await response.json();
+            if (envelope?.success !== true) {
+              throw new Error("The Cloudflare final migration gate response is invalid.");
+            }
+            return envelope;
+          };
+
+          const deploymentsEnvelope = await request(
+            `${base}/workers/scripts/edgemneme-github-sync/deployments`,
+            true
+          );
+          let activeVersion = "absent";
+          if (deploymentsEnvelope !== null) {
+            const deployments = deploymentsEnvelope?.result?.deployments;
+            if (!Array.isArray(deployments) || deployments.length === 0) {
+              throw new Error("The final GitHub sync deployment response is invalid.");
+            }
+            const candidates = deployments.map((deployment) => {
+              const createdAt = Date.parse(deployment?.created_on);
+              if (!Number.isFinite(createdAt)) {
+                throw new Error("A final GitHub sync deployment has an invalid timestamp.");
+              }
+              return { deployment, createdAt };
+            });
+            const latest = candidates.reduce((selected, candidate) =>
+              candidate.createdAt > selected.createdAt ? candidate : selected
+            ).deployment;
+            if (
+              !Array.isArray(latest.versions) || latest.versions.length !== 1 ||
+              typeof latest.versions[0]?.version_id !== "string" ||
+              !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+                latest.versions[0].version_id
+              ) ||
+              latest.versions[0]?.percentage !== 100
+            ) {
+              throw new Error("The final GitHub sync deployment is not a single 100% version.");
+            }
+            activeVersion = latest.versions[0].version_id;
+          }
+          if (activeVersion !== expectedVersion) {
+            throw new Error("The GitHub sync Worker changed after the migration backup.");
+          }
+
+          const queueIds = new Set();
+          let queueTotalCount;
+          let queueTotalPages;
+          for (let page = 1; page <= 10_000; page += 1) {
+            const url = new URL(`${base}/queues`);
+            url.searchParams.set("page", String(page));
+            url.searchParams.set("per_page", "100");
+            const envelope = await request(url);
+            const info = envelope?.result_info;
+            if (
+              !Array.isArray(envelope.result) ||
+              !Number.isSafeInteger(info?.count) || info.count !== envelope.result.length ||
+              !Number.isSafeInteger(info?.page) || info.page !== page ||
+              !Number.isSafeInteger(info?.per_page) || info.per_page < 1 ||
+              info.count > info.per_page ||
+              !Number.isSafeInteger(info?.total_count) || info.total_count < 0 ||
+              !Number.isSafeInteger(info?.total_pages) || info.total_pages < 0 ||
+              (info.total_count > 0 &&
+                info.total_pages !== Math.ceil(info.total_count / info.per_page)) ||
+              (info.total_count === 0 && ![0, 1].includes(info.total_pages))
+            ) {
+              throw new Error("The final Cloudflare Queue inventory pagination is invalid.");
+            }
+            queueTotalCount ??= info.total_count;
+            queueTotalPages ??= info.total_pages;
+            if (info.total_count !== queueTotalCount || info.total_pages !== queueTotalPages) {
+              throw new Error("The final Cloudflare Queue inventory changed during pagination.");
+            }
+            for (const queue of envelope.result) {
+              if (
+                typeof queue?.queue_id !== "string" || queue.queue_id.length === 0 ||
+                typeof queue?.queue_name !== "string" || queue.queue_name.length === 0 ||
+                queueIds.has(queue.queue_id) ||
+                !Number.isSafeInteger(queue?.consumers_total_count) ||
+                queue.consumers_total_count < 0 ||
+                !Number.isSafeInteger(queue?.producers_total_count) ||
+                queue.producers_total_count < 0 ||
+                (queue.consumers !== undefined && !Array.isArray(queue.consumers)) ||
+                (queue.producers !== undefined && !Array.isArray(queue.producers))
+              ) {
+                throw new Error("The final Cloudflare Queue inventory contains an invalid entry.");
+              }
+              queueIds.add(queue.queue_id);
+              let consumers = queue.consumers ?? [];
+              if (consumers.length > queue.consumers_total_count) {
+                throw new Error("A final Cloudflare Queue consumer count is invalid.");
+              }
+              if (consumers.length !== queue.consumers_total_count) {
+                const consumerEnvelope = await request(
+                  `${base}/queues/${encodeURIComponent(queue.queue_id)}/consumers`
+                );
+                if (
+                  !Array.isArray(consumerEnvelope.result) ||
+                  consumerEnvelope.result.length !== queue.consumers_total_count
+                ) {
+                  throw new Error("A final Cloudflare Queue consumer inventory is incomplete.");
+                }
+                consumers = consumerEnvelope.result;
+              }
+              const producers = queue.producers ?? [];
+              if (producers.length !== queue.producers_total_count) {
+                throw new Error("A final Cloudflare Queue producer inventory is incomplete.");
+              }
+              const consumerIds = new Set();
+              for (const consumer of consumers) {
+                if (
+                  typeof consumer?.consumer_id !== "string" ||
+                  consumer.consumer_id.length === 0 ||
+                  consumerIds.has(consumer.consumer_id) ||
+                  !["worker", "http_pull"].includes(consumer?.type) ||
+                  (consumer.type === "worker" &&
+                    (typeof consumer.script_name !== "string" ||
+                      consumer.script_name.length === 0))
+                ) {
+                  throw new Error("A final Cloudflare Queue consumer entry is invalid.");
+                }
+                consumerIds.add(consumer.consumer_id);
+                if (consumer?.script_name === "edgemneme-github-sync") {
+                  throw new Error("The GitHub sync Worker still has a Queue consumer.");
+                }
+              }
+              for (const producer of producers) {
+                if (
+                  (producer?.type !== "worker" && producer?.type !== "r2_bucket") ||
+                  (producer.type === "worker" &&
+                    (typeof producer.script !== "string" || producer.script.length === 0)) ||
+                  (producer.type === "r2_bucket" &&
+                    (typeof producer.bucket_name !== "string" || producer.bucket_name.length === 0))
+                ) {
+                  throw new Error("A final Cloudflare Queue producer entry is invalid.");
+                }
+                if (producer?.script === "edgemneme-github-sync") {
+                  throw new Error("The GitHub sync Worker still has a Queue producer.");
+                }
+              }
+            }
+            if (page >= Math.max(1, queueTotalPages)) break;
+            if (page === 10_000) {
+              throw new Error("Final Cloudflare Queue pagination exceeded its safety bound.");
+            }
+          }
+          if (queueIds.size !== queueTotalCount) {
+            throw new Error("The final Cloudflare Queue inventory count is inconsistent.");
+          }
+
+          if (activeVersion !== "absent") {
+            const settingsEnvelope = await request(
+              `${base}/workers/scripts/edgemneme-github-sync/settings`
+            );
+            const bindings = settingsEnvelope?.result?.bindings;
+            const runtime = Array.isArray(bindings)
+              ? bindings.filter((binding) => binding?.name === "GITHUB_SYNC_ENABLED")
+              : [];
+            if (
+              !Array.isArray(bindings) ||
+              bindings.some((binding) => binding?.type === "queue") ||
+              runtime.length !== 1 ||
+              runtime[0]?.type !== "plain_text" || runtime[0]?.text !== "false"
+            ) {
+              throw new Error("The GitHub sync runtime is not disabled after backup.");
+            }
+            const schedulesEnvelope = await request(
+              `${base}/workers/scripts/edgemneme-github-sync/schedules`
+            );
+            const schedules = schedulesEnvelope?.result?.schedules;
+            if (!Array.isArray(schedules) || schedules.length !== 0) {
+              throw new Error("The GitHub sync Worker regained a Cron Trigger after backup.");
+            }
+          }
+
+          const workflowContracts = new Map([
+            ["edgemneme-github-dispatch-workflow", "GitHubDispatchWorkflow"],
+            ["edgemneme-github-ref-sync-workflow", "GitHubRefSyncWorkflow"],
+            ["edgemneme-github-retention-workflow", "GitHubRetentionWorkflow"]
+          ]);
+          const nonterminalStatuses = [
+            "queued", "running", "paused", "waitingForPause", "waiting", "rollingBack"
+          ];
+          const workflowInventoryNames = new Set();
+          const accountWorkflowIds = new Set();
+          const accountWorkflowNames = new Set();
+          let inventoryTotalCount;
+          let inventoryTotalPages;
+          for (let page = 1; page <= 10_000; page += 1) {
+            const url = new URL(`${base}/workflows`);
+            url.searchParams.set("page", String(page));
+            url.searchParams.set("per_page", "100");
+            const envelope = await request(url);
+            const info = envelope?.result_info;
+            if (
+              !Array.isArray(envelope.result) ||
+              !Number.isSafeInteger(info?.count) || info.count !== envelope.result.length ||
+              !Number.isSafeInteger(info?.page) || info.page !== page ||
+              !Number.isSafeInteger(info?.per_page) || info.per_page !== 100 ||
+              !Number.isSafeInteger(info?.total_count) || info.total_count < 0 ||
+              !Number.isSafeInteger(info?.total_pages) || info.total_pages < 0 ||
+              (info.total_count > 0 &&
+                info.total_pages !== Math.ceil(info.total_count / info.per_page)) ||
+              (info.total_count === 0 && ![0, 1].includes(info.total_pages))
+            ) {
+              throw new Error("The final Workflow inventory pagination is invalid.");
+            }
+            inventoryTotalCount ??= info.total_count;
+            inventoryTotalPages ??= info.total_pages;
+            if (
+              info.total_count !== inventoryTotalCount ||
+              info.total_pages !== inventoryTotalPages
+            ) {
+              throw new Error("The final Workflow inventory changed during pagination.");
+            }
+            for (const workflow of envelope.result) {
+              if (
+                typeof workflow?.id !== "string" || workflow.id.length === 0 ||
+                typeof workflow?.name !== "string" || workflow.name.length === 0 ||
+                typeof workflow?.script_name !== "string" || workflow.script_name.length === 0 ||
+                accountWorkflowIds.has(workflow.id) || accountWorkflowNames.has(workflow.name)
+              ) {
+                throw new Error("The final Workflow inventory contains an invalid entry.");
+              }
+              accountWorkflowIds.add(workflow.id);
+              accountWorkflowNames.add(workflow.name);
+              if (workflow.script_name !== "edgemneme-github-sync") continue;
+              const expectedClass = workflowContracts.get(workflow.name);
+              if (
+                expectedClass === undefined || workflow.class_name !== expectedClass ||
+                (workflow.schedules !== undefined &&
+                  (!Array.isArray(workflow.schedules) || workflow.schedules.length !== 0))
+              ) {
+                throw new Error("The final GitHub sync Workflow inventory is not approved.");
+              }
+              workflowInventoryNames.add(workflow.name);
+            }
+            if (page >= Math.max(1, inventoryTotalPages)) break;
+            if (page === 10_000) {
+              throw new Error("Final Workflow inventory pagination exceeded its safety bound.");
+            }
+          }
+          if (accountWorkflowIds.size !== inventoryTotalCount) {
+            throw new Error("The final Workflow inventory count is inconsistent.");
+          }
+          const exactInventory =
+            workflowInventoryNames.size === workflowContracts.size &&
+            [...workflowContracts.keys()].every((name) => workflowInventoryNames.has(name));
+          if (
+            (activeVersion === "absent" && workflowInventoryNames.size !== 0) ||
+            (activeVersion !== "absent" && workflowInventoryNames.size !== 0 && !exactInventory)
+          ) {
+            throw new Error("The final GitHub sync Workflow inventory is not an allowed set.");
+          }
+
+          let pendingInstances = 0;
+          const observedInstanceKeys = new Set();
+          const statusInstanceKeys = new Set();
+          for (const [name, className] of exactInventory ? workflowContracts : []) {
+            const definitionEnvelope = await request(
+              `${base}/workflows/${encodeURIComponent(name)}`
+            );
+            const workflow = definitionEnvelope.result;
+            if (
+              workflow?.name !== name || workflow?.class_name !== className ||
+              workflow?.script_name !== "edgemneme-github-sync" ||
+              (workflow?.schedules !== undefined &&
+                (!Array.isArray(workflow.schedules) || workflow.schedules.length !== 0))
+            ) {
+              throw new Error("A final GitHub sync Workflow definition is invalid.");
+            }
+            for (const status of nonterminalStatuses) {
+              let cursor;
+              const cursors = new Set();
+              for (let page = 0; page < 10_000; page += 1) {
+                const url = new URL(`${base}/workflows/${encodeURIComponent(name)}/instances`);
+                url.searchParams.set("status", status);
+                url.searchParams.set("direction", "asc");
+                url.searchParams.set("per_page", "100");
+                if (cursor !== undefined) url.searchParams.set("cursor", cursor);
+                const envelope = await request(url);
+                if (!Array.isArray(envelope.result)) {
+                  throw new Error("A final Workflow instance page is invalid.");
+                }
+                for (const instance of envelope.result) {
+                  const observedKey = JSON.stringify([name, instance?.id]);
+                  const statusKey = JSON.stringify([name, status, instance?.id]);
+                  if (
+                    typeof instance?.id !== "string" || instance.id.length === 0 ||
+                    instance.status !== status || statusInstanceKeys.has(statusKey)
+                  ) {
+                    throw new Error("A final Workflow instance is invalid or duplicated.");
+                  }
+                  statusInstanceKeys.add(statusKey);
+                  if (!observedInstanceKeys.has(observedKey)) {
+                    observedInstanceKeys.add(observedKey);
+                    pendingInstances += 1;
+                  }
+                }
+                const nextCursor = envelope?.result_info?.cursor;
+                if (nextCursor === undefined || nextCursor === null || nextCursor === "") break;
+                if (typeof nextCursor !== "string" || cursors.has(nextCursor)) {
+                  throw new Error("A final Workflow instance cursor is invalid or repeated.");
+                }
+                cursors.add(nextCursor);
+                cursor = nextCursor;
+                if (page === 9_999) {
+                  throw new Error("Final Workflow instance pagination exceeded its safety bound.");
+                }
+              }
+            }
+          }
+          process.stdout.write(pendingInstances === 0 ? "clear" : "pending");
+          NODE
+          }
+
+          github_sync_d1_state() {
+            local schema
+            local table_names
+            local count_expression="0"
+            local output
+            schema="$(
+              pnpm exec wrangler d1 execute MEMORY_DB --remote --json \
+                --config "$config" \
+                --command "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('github_sync_dispatches', 'github_sync_dispatch_items', 'github_repository_sync_runs', 'github_credential_sync_lane') ORDER BY name;"
+            )" || return 1
+            table_names="$(D1_RESULT_JSON="$schema" node --input-type=module <<'NODE'
+          const statements = JSON.parse(process.env.D1_RESULT_JSON ?? "");
+          const rows = statements?.[0]?.results;
+          const allowed = new Set([
+            "github_sync_dispatches", "github_sync_dispatch_items",
+            "github_repository_sync_runs", "github_credential_sync_lane"
+          ]);
+          if (statements?.length !== 1 || statements[0]?.success !== true || !Array.isArray(rows)) {
+            throw new Error("The final GitHub sync D1 schema probe response is invalid.");
+          }
+          const names = rows.map((row) => row?.name);
+          if (names.some((name) => typeof name !== "string" || !allowed.has(name)) ||
+              new Set(names).size !== names.length) {
+            throw new Error("The final GitHub sync D1 schema probe is invalid.");
+          }
+          process.stdout.write(`|${names.join("|")}|`);
+          NODE
+            )" || return 1
+            if [[ "$table_names" == *"|github_sync_dispatches|"* ]]; then
+              count_expression+=" + (SELECT COUNT(*) FROM github_sync_dispatches WHERE status IN ('materialized', 'dispatching'))"
+            fi
+            if [[ "$table_names" == *"|github_sync_dispatch_items|"* ]]; then
+              count_expression+=" + (SELECT COUNT(*) FROM github_sync_dispatch_items WHERE status IN ('pending', 'running'))"
+            fi
+            if [[ "$table_names" == *"|github_repository_sync_runs|"* ]]; then
+              count_expression+=" + (SELECT COUNT(*) FROM github_repository_sync_runs WHERE status = 'running')"
+            fi
+            if [[ "$table_names" == *"|github_credential_sync_lane|"* ]]; then
+              count_expression+=" + (SELECT COUNT(*) FROM github_credential_sync_lane WHERE holder_id IS NOT NULL OR lease_claim_id IS NOT NULL OR lease_until IS NOT NULL)"
+            fi
+            output="$(
+              pnpm exec wrangler d1 execute MEMORY_DB --remote --json \
+                --config "$config" --command "SELECT $count_expression AS count;"
+            )" || return 1
+            D1_RESULT_JSON="$output" node --input-type=module <<'NODE'
+          const statements = JSON.parse(process.env.D1_RESULT_JSON ?? "");
+          const count = statements?.[0]?.results?.[0]?.count;
+          if (statements?.length !== 1 || statements[0]?.success !== true ||
+              !Number.isSafeInteger(count) || count < 0) {
+            throw new Error("The final GitHub sync D1 drain response is invalid.");
+          }
+          process.stdout.write(count === 0 ? "clear" : "pending");
+          NODE
+          }
+
+          zero_observations=0
+          for ((attempt = 1; attempt <= 5; attempt++)); do
+            first_cloudflare_state="$(cloudflare_github_sync_state)"
+            d1_state="$(github_sync_d1_state)"
+            verified_cloudflare_state="$(cloudflare_github_sync_state)"
+            if [[ "$first_cloudflare_state" == "clear" && \
+                  "$d1_state" == "clear" && "$verified_cloudflare_state" == "clear" ]]; then
+              zero_observations=$((zero_observations + 1))
+              if (( zero_observations == 2 )); then
+                exit 0
+              fi
+            else
+              zero_observations=0
+            fi
+            if (( attempt < 5 )); then
+              sleep 60
+            fi
+          done
+          echo "GitHub sync changed after backup; migration apply is blocked." >&2
+          exit 1
 
       - name: Apply memory database migrations
         env:

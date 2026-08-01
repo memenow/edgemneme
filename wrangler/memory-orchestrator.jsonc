@@ -62,7 +62,10 @@
     {
       "name": "edgemneme-memory-workflow",
       "binding": "MEMORY_WORKFLOW",
-      "class_name": "MemoryWorkflow"
+      "class_name": "MemoryWorkflow",
+      "limits": {
+        "steps": 10000
+      }
     }
   ],
   "durable_objects": {

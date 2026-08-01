@@ -6,6 +6,7 @@ import {
 } from "cloudflare:workers";
 import { z } from "zod";
 import { EdgeMnemeError, errorBody } from "../../src/contracts/errors";
+import { candidateIdentifierSchema } from "../../src/contracts/candidate-id";
 import type { MemoryEvent } from "../../src/gateway/service";
 import { canonicalJson } from "../../src/security/canonical-json";
 import { sha256 } from "../../src/security/crypto";
@@ -24,9 +25,17 @@ import {
   MEMORY_MODEL_INPUT_MAX_BYTES
 } from "../../src/quality/sensitive-content";
 import {
-  consolidateSession,
+  CONSOLIDATION_STEP_TIMEOUT,
+  claimConsolidationLease,
+  consolidateSessionBatch,
+  createConsolidationClaimId,
+  failConsolidation,
+  finishConsolidation,
+  listConsolidationBatchIndexes,
   processCandidateSubmission,
-  type CandidateAnalysisDiagnosticCode
+  validateConsolidationWorkflowBatchIndexes,
+  type CandidateAnalysisDiagnosticCode,
+  type ConsolidationLeaseToken
 } from "../../src/workflows/quality";
 import {
   ensureWorkflowWithRepair,
@@ -160,7 +169,7 @@ const mutationSchema = z.object({
 });
 
 const candidateReviewSchema = z.object({
-  candidate_id: z.string().uuid(),
+  candidate_id: candidateIdentifierSchema,
   expected_candidate_version: z.number().int().positive(),
   decision: z.enum(["approve", "reject", "request_changes"]),
   reason: z.string().min(1).max(4096),
@@ -1214,10 +1223,23 @@ async function recordWorkflowRunFailure(
   throw new Error("The Workflow run identity conflicts with an existing record.");
 }
 
+async function requireWorkflowProjectAdmission(
+  database: D1Database,
+  projectId: string
+): Promise<void> {
+  if (!(await isProjectWorkAdmitted(database, projectId))) {
+    throw new EdgeMnemeError(
+      "PROJECT_UNAVAILABLE",
+      "The project stopped admitting Workflow work."
+    );
+  }
+}
+
 export class MemoryWorkflow extends WorkflowEntrypoint<Env, WorkflowPayload> {
   override async run(event: WorkflowEvent<WorkflowPayload>, step: WorkflowStep): Promise<void> {
     const identity = workflowRunIdentity(event);
     let qualityDiagnosticCode: CandidateAnalysisDiagnosticCode | null = null;
+    let consolidationLease: ConsolidationLeaseToken | null = null;
     try {
       const admitted = await step.do(
         "check workflow admission",
@@ -1253,6 +1275,87 @@ export class MemoryWorkflow extends WorkflowEntrypoint<Env, WorkflowPayload> {
         event.payload.projectionRebuild !== undefined
       ) {
         await runProjectionRebuild(this.env, event.payload, step);
+      } else if (event.payload.type === "session.consolidation.requested") {
+        const claimId = await step.do(
+          "create consolidation claim id",
+          async () => createConsolidationClaimId()
+        );
+        consolidationLease = await step.do(
+          "claim consolidation lease",
+          { retries: { limit: 2, delay: "2 seconds", backoff: "exponential" } },
+          async () => {
+            await requireWorkflowProjectAdmission(
+              this.env.MEMORY_DB,
+              event.payload.projectId
+            );
+            return claimConsolidationLease(
+              this.env.MEMORY_DB,
+              event.payload.projectId,
+              event.payload.eventId,
+              event.payload.subjectId,
+              event.instanceId,
+              claimId
+            );
+          }
+        );
+        if (consolidationLease !== null) {
+          const batchIndexes = await step.do(
+            "list consolidation batches",
+            { retries: { limit: 3, delay: "1 second", backoff: "exponential" } },
+            async () => {
+              await requireWorkflowProjectAdmission(
+                this.env.MEMORY_DB,
+                event.payload.projectId
+              );
+              return listConsolidationBatchIndexes(
+                this.env.MEMORY_DB,
+                event.payload.projectId,
+                event.payload.eventId
+              );
+            }
+          );
+          validateConsolidationWorkflowBatchIndexes(batchIndexes);
+          for (const batchIndex of batchIndexes) {
+            await step.do(
+              `consolidate batch ${batchIndex}`,
+              {
+                retries: { limit: 2, delay: "2 seconds", backoff: "exponential" },
+                timeout: CONSOLIDATION_STEP_TIMEOUT
+              },
+              async () => {
+                await requireWorkflowProjectAdmission(
+                  this.env.MEMORY_DB,
+                  event.payload.projectId
+                );
+                return consolidateSessionBatch(
+                  this.env,
+                  event.payload.projectId,
+                  event.payload.eventId,
+                  event.payload.subjectId,
+                  consolidationLease!,
+                  batchIndex
+                );
+              }
+            );
+          }
+          await step.do(
+            "finish consolidation",
+            { retries: { limit: 3, delay: "1 second", backoff: "exponential" } },
+            async () => {
+              await requireWorkflowProjectAdmission(
+                this.env.MEMORY_DB,
+                event.payload.projectId
+              );
+              return finishConsolidation(
+                this.env.MEMORY_DB,
+                event.payload.projectId,
+                event.payload.eventId,
+                consolidationLease!,
+                batchIndexes
+              );
+            }
+          );
+        }
       } else {
         qualityDiagnosticCode = await step.do(
           "apply quality policy",
@@ -1285,13 +1388,6 @@ export class MemoryWorkflow extends WorkflowEntrypoint<Env, WorkflowPayload> {
               .run();
           } else if (event.payload.type === "candidate.reviewed") {
             return null;
-          } else if (event.payload.type === "session.consolidation.requested") {
-            await consolidateSession(
-              this.env,
-              event.payload.projectId,
-              event.payload.eventId,
-              event.payload.subjectId
-            );
           } else if (
             event.payload.type === "memory.changed" &&
             event.payload.projectVersion !== undefined
@@ -1339,6 +1435,23 @@ export class MemoryWorkflow extends WorkflowEntrypoint<Env, WorkflowPayload> {
           .run();
       });
     } catch (error) {
+      if (consolidationLease !== null) {
+        try {
+          await step.do(
+            "fail consolidation",
+            { retries: { limit: 3, delay: "1 second", backoff: "exponential" } },
+            () =>
+              failConsolidation(
+                this.env.MEMORY_DB,
+                event.payload.projectId,
+                event.payload.eventId,
+                consolidationLease!
+              )
+          );
+        } catch {
+          // Preserve the original Workflow failure when lease cleanup cannot converge.
+        }
+      }
       await step.do(
         "record workflow failure",
         { retries: { limit: 3, delay: "1 second", backoff: "exponential" } },
@@ -1350,14 +1463,6 @@ export class MemoryWorkflow extends WorkflowEntrypoint<Env, WorkflowPayload> {
             error instanceof EdgeMnemeError ? error.code : "INTERNAL",
             updatedAt
           );
-          if (event.payload.type === "session.consolidation.requested") {
-            await this.env.MEMORY_DB.prepare(
-              `UPDATE session_consolidations SET status = 'failed', updated_at = ?
-               WHERE project_id = ? AND consolidation_id = ? AND status = 'running'`
-            )
-              .bind(updatedAt, event.payload.projectId, event.payload.eventId)
-              .run();
-          }
         }
       );
       throw error;

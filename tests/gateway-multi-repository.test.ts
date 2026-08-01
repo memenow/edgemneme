@@ -8,6 +8,9 @@ import { sha256 } from "../src/security/crypto";
 const NOW = "2026-07-27T12:00:00.000Z";
 const PROJECT_ID = "project-1";
 const PROJECT_REF = "project:one";
+const DELETION_CANDIDATE_ID =
+  `github-path-absent-observation:${"a".repeat(64)}:` +
+  `${"b".repeat(64)}:${"c".repeat(64)}`;
 
 describe("GatewayService multi-repository isolation", () => {
   it("allows a repository writer to open, submit, and close only in its repository", async () => {
@@ -599,6 +602,64 @@ describe("GatewayService multi-repository isolation", () => {
     expect(tableCount(fixture.database, "session_consolidations")).toBe(0);
     expect(tableCount(fixture.database, "idempotency_records")).toBe(0);
     expect(tableCount(fixture.database, "outbox_events")).toBe(0);
+  });
+
+  it.each(["reject", "request_changes"] as const)(
+    "forwards a valid GitHub path-absence candidate for %s",
+    async (decision) => {
+      const fixture = createFixture();
+      const service = fixture.service(projectMaintainerPrincipal());
+
+      await expect(
+        service.reviewCandidate({
+          candidateId: DELETION_CANDIDATE_ID,
+          expectedCandidateVersion: 1,
+          decision,
+          reason: "The deleted repository path requires a maintainer disposition.",
+          ...(decision === "request_changes"
+            ? { edits: { content: "Provide a replacement evidence-backed claim." } }
+            : {}),
+          idempotencyKey: `review-deletion-${decision}`
+        })
+      ).resolves.toEqual({ accepted: true });
+
+      expect(fixture.coordinatorInputs).toEqual([
+        expect.objectContaining({
+          candidate_id: DELETION_CANDIDATE_ID,
+          decision
+        })
+      ]);
+    }
+  );
+
+  it.each([
+    ["wrong prefix", DELETION_CANDIDATE_ID.replace("observation", "candidate")],
+    [
+      "uppercase digest",
+      `github-path-absent-observation:A${"a".repeat(63)}:${"b".repeat(64)}:${"c".repeat(64)}`
+    ],
+    [
+      "short digest",
+      `github-path-absent-observation:${"a".repeat(63)}:${"b".repeat(64)}:${"c".repeat(64)}`
+    ],
+    ["trailing whitespace", `${DELETION_CANDIDATE_ID} `],
+    ["NUL byte", `${DELETION_CANDIDATE_ID}\0`]
+  ])("rejects a candidate identifier with %s before coordinator mutation", async (_label, candidateId) => {
+    const fixture = createFixture();
+    const service = fixture.service(projectMaintainerPrincipal());
+
+    await expect(
+      service.reviewCandidate({
+        candidateId,
+        expectedCandidateVersion: 1,
+        decision: "reject",
+        reason: "The candidate identifier is invalid.",
+        idempotencyKey: `invalid-candidate-${_label}`
+      })
+    ).rejects.toMatchObject({ code: "VALIDATION_FAILED" });
+
+    expect(fixture.memoryDb.batchCount).toBe(0);
+    expect(fixture.coordinatorInputs).toEqual([]);
   });
 
   it("derives memory-change repository context and overwrites caller-supplied context", async () => {

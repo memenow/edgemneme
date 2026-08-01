@@ -13,6 +13,7 @@ export const AI_ANALYSIS_DIAGNOSTIC_CODES = [
 ];
 const AI_ANALYSIS_DIAGNOSTIC_CODE_SET = new Set(AI_ANALYSIS_DIAGNOSTIC_CODES);
 export const PROJECT_SCOPED_TABLES = [
+  "consolidation_batch_receipts",
   "consolidation_outputs",
   "consolidation_inputs",
   "session_consolidations",
@@ -29,6 +30,11 @@ export const PROJECT_SCOPED_TABLES = [
   "workflow_runs",
   "idempotency_records",
   "taxonomy_policies",
+  "github_repository_sync_finish_receipts",
+  "github_sync_dispatch_item_rejection_receipts",
+  "github_sync_dispatch_items",
+  "github_tree_activation_receipts",
+  "github_tree_activation_witnesses",
   "github_repository_sync_runs",
   "github_tree_ref_heads",
   "github_tree_manifest_deltas",
@@ -42,8 +48,7 @@ export const PROJECT_SCOPED_TABLES = [
   "repositories",
   "outbox_events",
   "projection_snapshots",
-  "audit_events",
-  "synthetic_cleanup_registry"
+  "audit_events"
 ];
 
 export function syntheticSeedSql(input) {
@@ -104,6 +109,11 @@ export function syntheticCleanupSql(projectId, principalId) {
     ...PROJECT_SCOPED_TABLES.map(
       (table) => `DELETE FROM ${table} WHERE project_id = ${project};`
     ),
+    `DELETE FROM github_sync_dispatch_materialization_receipts WHERE dispatch_id IN (SELECT dispatch_id FROM github_sync_dispatches WHERE credential_version = 'system.synthetic.' || ${project});`,
+    `DELETE FROM github_sync_dispatches WHERE credential_version = 'system.synthetic.' || ${project};`,
+    `DELETE FROM github_credential_sync_lane_release_receipts WHERE credential_version = 'system.synthetic.' || ${project};`,
+    `DELETE FROM github_credential_sync_lane WHERE credential_version = 'system.synthetic.' || ${project};`,
+    `DELETE FROM synthetic_cleanup_registry WHERE project_id = ${project} AND principal_id = ${principal};`,
     `DELETE FROM principals WHERE principal_id = ${principal};`,
     `DELETE FROM projects WHERE project_id = ${project};`
   ].join("\n");

@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
+  CANDIDATE_ANALYSIS_MAX_UTF8_BYTES,
+  CONSOLIDATION_SUGGESTIONS_MAX_UTF8_BYTES,
+  MODEL_RESPONSE_TRANSPORT_MAX_BYTES,
   extractVerbatimIsoOffsetTimestamps,
   hasVerbatimTemporalEvidence,
   parseModelCandidateAnalysis,
@@ -360,13 +363,17 @@ describe("model analysis validation", () => {
     ).toThrow("model function response");
   });
 
-  it("accepts exactly 256 KiB of function arguments and rejects one byte more", () => {
+  it("accepts exactly 1 MiB of function arguments and rejects one byte more", () => {
     const emptyObjectBytes = new TextEncoder().encode(JSON.stringify({ value: "" })).byteLength;
-    const boundaryValue = "x".repeat(256 * 1024 - emptyObjectBytes);
+    const boundaryValue = "x".repeat(
+      MODEL_RESPONSE_TRANSPORT_MAX_BYTES - emptyObjectBytes
+    );
     const boundaryArguments = JSON.stringify({ value: boundaryValue });
     const oversizedArguments = JSON.stringify({ value: `${boundaryValue}x` });
 
-    expect(new TextEncoder().encode(boundaryArguments)).toHaveLength(256 * 1024);
+    expect(new TextEncoder().encode(boundaryArguments)).toHaveLength(
+      MODEL_RESPONSE_TRANSPORT_MAX_BYTES
+    );
     expect(
       readModelFunctionArguments(
         functionResponse("candidate_analysis", boundaryArguments, true),
@@ -379,6 +386,78 @@ describe("model analysis validation", () => {
         "candidate_analysis"
       )
     ).toThrow("model function response");
+  });
+
+  it("measures the function-argument transport boundary in UTF-8 bytes", () => {
+    const emptyObjectBytes = new TextEncoder().encode(JSON.stringify({ value: "" })).byteLength;
+    const availableBytes = MODEL_RESPONSE_TRANSPORT_MAX_BYTES - emptyObjectBytes;
+    expect(availableBytes % 4).toBe(0);
+    const boundaryValue = "😀".repeat(availableBytes / 4);
+    const boundaryArguments = JSON.stringify({ value: boundaryValue });
+
+    expect(boundaryValue).toHaveLength((availableBytes / 4) * 2);
+    expect(new TextEncoder().encode(boundaryArguments)).toHaveLength(
+      MODEL_RESPONSE_TRANSPORT_MAX_BYTES
+    );
+    expect(
+      readModelFunctionArguments(
+        functionResponse("candidate_analysis", boundaryArguments, true),
+        "candidate_analysis"
+      )
+    ).toEqual({ value: boundaryValue });
+    expect(() =>
+      readModelFunctionArguments(
+        functionResponse(
+          "candidate_analysis",
+          `${boundaryArguments.slice(0, -2)}😀"}`,
+          true
+        ),
+        "candidate_analysis"
+      )
+    ).toThrow("model function response");
+  });
+
+  it("applies separate semantic UTF-8 JSON bounds after schema parsing", () => {
+    const evidenceIds = Array.from(
+      { length: 50 },
+      (_, index) => `${String(index).padStart(2, "0")}-${"界".repeat(509)}`
+    );
+    const candidate = parseModelCandidateAnalysis({
+      persistent_value: true,
+      kind: "decision",
+      memory_class: "semantic",
+      scope_option_id: "scope-option-1",
+      evidence_source_ids: evidenceIds,
+      confidence: 0.9
+    });
+    expect(new TextEncoder().encode(JSON.stringify(candidate)).byteLength).toBeLessThan(
+      CANDIDATE_ANALYSIS_MAX_UTF8_BYTES
+    );
+
+    const suggestion = {
+      // Each astral character occupies two JavaScript code units but four UTF-8 bytes.
+      content: "😀".repeat(32_768),
+      kind: "decision" as const,
+      memory_class: "semantic" as const,
+      scope_option_id: "scope-option-1",
+      evidence_source_ids: ["candidate-1"],
+      confidence: 0.9
+    };
+    const accepted = { suggestions: Array.from({ length: 7 }, () => suggestion) };
+    expect(new TextEncoder().encode(JSON.stringify(accepted)).byteLength).toBeLessThan(
+      CONSOLIDATION_SUGGESTIONS_MAX_UTF8_BYTES
+    );
+    expect(
+      parseModelConsolidationSuggestions(accepted, new Set(["candidate-1"]))
+    ).toHaveLength(7);
+
+    const oversized = { suggestions: Array.from({ length: 8 }, () => suggestion) };
+    expect(new TextEncoder().encode(JSON.stringify(oversized)).byteLength).toBeGreaterThan(
+      CONSOLIDATION_SUGGESTIONS_MAX_UTF8_BYTES
+    );
+    expect(() =>
+      parseModelConsolidationSuggestions(oversized, new Set(["candidate-1"]))
+    ).toThrow(/1048576-byte UTF-8 JSON limit/iu);
   });
 });
 

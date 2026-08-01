@@ -37,6 +37,9 @@ const CORS_EXPOSED_HEADERS = [
   "MCP-Session-Id",
   "Retry-After"
 ].join(", ");
+export const MCP_POST_BODY_MAX_BYTES = 2 * 1024 * 1024;
+const MCP_BODY_READ_CHUNK_BYTES = 64 * 1024;
+const JSON_RPC_INVALID_REQUEST = -32600;
 
 const projectRef = z.string().min(8).max(256);
 const identifier = z.string().uuid();
@@ -84,6 +87,13 @@ const evidence = z.array(
     excerpt_hash: z.string().regex(/^[A-Fa-f0-9]{64}$/u).optional()
   })
 ).min(1).max(50);
+const memorySearchFilters = z.object({
+  kind: z.enum(MEMORY_KINDS).optional(),
+  memory_class: z.enum(MEMORY_CLASSES).optional(),
+  scope: z.enum(MEMORY_SCOPES).optional(),
+  scope_id: z.string().min(1).max(2048).optional(),
+  status: z.enum(MEMORY_STATUSES).optional()
+});
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -123,16 +133,37 @@ export default {
           retryAfterMs: 60_000
         });
       }
+      const boundedRequest = await boundMcpPostRequest(request);
       const server = createServer(env, principal, requestId);
       return withCorsHeaders(
         await createMcpHandler(server, {
           route: "/mcp",
           enableJsonResponse: true
-        })(request, env, ctx),
+        })(boundedRequest, env, ctx),
         corsOrigin
       );
     } catch (error) {
       const body = errorBody(error, requestId);
+      if (error instanceof McpRequestBodyError) {
+        return withCorsHeaders(
+          Response.json(
+            {
+              jsonrpc: "2.0",
+              id: null,
+              error: {
+                code: JSON_RPC_INVALID_REQUEST,
+                message: body.message,
+                data: body
+              }
+            },
+            {
+              status: error.status,
+              headers: { "cache-control": "no-store" }
+            }
+          ),
+          corsOrigin
+        );
+      }
       const status =
         error instanceof EdgeMnemeError
           ? error.code === "UNAUTHENTICATED"
@@ -151,6 +182,152 @@ export default {
     }
   }
 } satisfies ExportedHandler<Env>;
+
+class McpRequestBodyError extends EdgeMnemeError {
+  constructor(
+    readonly status: 400 | 413 | 415,
+    message: string
+  ) {
+    super("VALIDATION_FAILED", message);
+  }
+}
+
+interface BoundedBody {
+  chunks: Uint8Array[];
+  byteLength: number;
+}
+
+export async function boundMcpPostRequest(request: Request): Promise<Request> {
+  if (request.method !== "POST") {
+    return request;
+  }
+
+  validateIdentityContentEncoding(request.headers.get("content-encoding"));
+  validateDeclaredContentLength(request.headers.get("content-length"));
+
+  const body = request.body;
+  if (body === null) {
+    return new Request(request, { body: new Uint8Array(0) });
+  }
+
+  const boundedBody =
+    (await readBodyWithByob(body)) ?? (await readBodyWithDefaultReader(body));
+  const bytes = new Uint8Array(boundedBody.byteLength);
+  let offset = 0;
+  for (const chunk of boundedBody.chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new Request(request, { body: bytes });
+}
+
+function validateIdentityContentEncoding(contentEncoding: string | null): void {
+  if (contentEncoding === null) {
+    return;
+  }
+  const codings = contentEncoding.split(",").map((coding) => coding.trim().toLowerCase());
+  if (codings.length === 0 || codings.some((coding) => coding !== "identity")) {
+    throw new McpRequestBodyError(415, "Encoded MCP request bodies are not supported.");
+  }
+}
+
+function validateDeclaredContentLength(contentLength: string | null): void {
+  if (contentLength === null) {
+    return;
+  }
+  if (!/^\d+$/u.test(contentLength)) {
+    throw new McpRequestBodyError(400, "The Content-Length header is invalid.");
+  }
+  const normalizedLength = contentLength.replace(/^0+/u, "") || "0";
+  const maximumLength = String(MCP_POST_BODY_MAX_BYTES);
+  if (
+    normalizedLength.length > maximumLength.length ||
+    (normalizedLength.length === maximumLength.length &&
+      normalizedLength > maximumLength) ||
+    BigInt(normalizedLength) > BigInt(MCP_POST_BODY_MAX_BYTES)
+  ) {
+    throw oversizedMcpBodyError();
+  }
+}
+
+async function readBodyWithByob(
+  body: ReadableStream<Uint8Array>
+): Promise<BoundedBody | null> {
+  let reader: ReadableStreamBYOBReader;
+  try {
+    reader = body.getReader({ mode: "byob" });
+  } catch {
+    return null;
+  }
+
+  const chunks: Uint8Array[] = [];
+  let byteLength = 0;
+  try {
+    while (true) {
+      const remainingProbeBytes = MCP_POST_BODY_MAX_BYTES + 1 - byteLength;
+      const buffer = new Uint8Array(
+        Math.min(MCP_BODY_READ_CHUNK_BYTES, remainingProbeBytes)
+      );
+      const { done, value } = await reader.read(buffer);
+      if (value !== undefined && value.byteLength > 0) {
+        byteLength += value.byteLength;
+        if (byteLength > MCP_POST_BODY_MAX_BYTES) {
+          await cancelReader(reader);
+          throw oversizedMcpBodyError();
+        }
+        chunks.push(value.slice());
+      }
+      if (done) {
+        return { chunks, byteLength };
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+async function readBodyWithDefaultReader(
+  body: ReadableStream<Uint8Array>
+): Promise<BoundedBody> {
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let byteLength = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        return { chunks, byteLength };
+      }
+      if (value.byteLength > MCP_POST_BODY_MAX_BYTES - byteLength) {
+        await cancelReader(reader);
+        throw oversizedMcpBodyError();
+      }
+      for (let offset = 0; offset < value.byteLength; offset += MCP_BODY_READ_CHUNK_BYTES) {
+        chunks.push(value.slice(offset, offset + MCP_BODY_READ_CHUNK_BYTES));
+      }
+      byteLength += value.byteLength;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+async function cancelReader(
+  reader: ReadableStreamDefaultReader<Uint8Array> | ReadableStreamBYOBReader
+): Promise<void> {
+  try {
+    await reader.cancel();
+  } catch {
+    // Cancellation is best effort after the request has already been rejected.
+  }
+}
+
+function oversizedMcpBodyError(): McpRequestBodyError {
+  return new McpRequestBodyError(
+    413,
+    `The MCP request body exceeds the ${MCP_POST_BODY_MAX_BYTES}-byte limit.`
+  );
+}
 
 function isCorsPreflight(request: Request, origin: string | null): origin is string {
   return (
@@ -256,15 +433,7 @@ function createServer(
         project_ref: projectRef,
         session_id: identifier.optional(),
         query: z.string().max(4096).optional(),
-        filters: z
-          .object({
-            kind: z.enum(MEMORY_KINDS).optional(),
-            memory_class: z.enum(MEMORY_CLASSES).optional(),
-            scope: z.enum(MEMORY_SCOPES).optional(),
-            scope_id: z.string().min(1).max(2048).optional(),
-            status: z.enum(MEMORY_STATUSES).optional()
-          })
-          .default({}),
+        filters: memorySearchFilters.default({}),
         limit: z.number().int().positive().max(50).optional(),
         page_token: z.string().max(4096).optional()
       }
@@ -338,7 +507,7 @@ function createServer(
     {
       description: "Review a candidate as a project maintainer using CAS.",
       inputSchema: {
-        candidate_id: identifier,
+        candidate_id: z.string(),
         expected_candidate_version: z.number().int().positive(),
         decision: z.enum(["approve", "reject", "request_changes"]),
         reason: z.string().min(1).max(4096),

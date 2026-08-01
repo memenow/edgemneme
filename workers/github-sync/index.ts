@@ -1,8 +1,11 @@
 import {
+  createGitHubRequestPacer,
   GitHubReadOnlyClient,
   GitHubSyncError,
   type GitComparison,
-  type GitHubRateLimit
+  type GitHubRateLimit,
+  type GitHubRequestPacer,
+  type GitHubSyncErrorCode
 } from "../../src/github/client";
 import type { MemoryEvent } from "../../src/gateway/service";
 import {
@@ -20,6 +23,7 @@ import {
   beginGitHubTreeManifest,
   buildGitHubTreeManifestDescriptor,
   completeGitHubTreeManifest,
+  createGitHubTreeManifestActivationAttempt,
   persistGitHubTreeManifestEntries,
   readActiveGitHubTreeHead,
   type GitHubTreeManifestDescriptor,
@@ -36,15 +40,43 @@ import {
   prepareGitHubCandidateStatements,
   type PersistableGitHubCandidate
 } from "../../src/github/candidate-persistence";
+import type { PendingGitHubSyncActivationFence } from "../../src/github/sync-activation-fence";
+import {
+  githubDispatchIdentity,
+  githubRetentionIdentity
+} from "../../src/github/sync-scheduling";
 
-interface Env {
+export interface GitHubDispatchWorkflowPayload {
+  dispatchId: string;
+  scheduledFor: string;
+  utcDate: string;
+  credentialVersion: string;
+}
+
+export interface GitHubRefSyncWorkflowPayload {
+  dispatchId: string;
+  itemId: string;
+  credentialVersion: string;
+  scheduledFor: string;
+  absoluteDeadlineMs: number;
+}
+
+export interface GitHubRetentionWorkflowPayload {
+  scheduledFor: string;
+  utcDate: string;
+}
+
+export interface Env {
   MEMORY_DB: D1Database;
   GITHUB_SYNC_ENABLED: string;
   GITHUB_CLASSIC_TOKEN?: string;
   GITHUB_CREDENTIAL_VERSION?: string;
+  GITHUB_DISPATCH_WORKFLOW?: Workflow<GitHubDispatchWorkflowPayload>;
+  GITHUB_REF_SYNC_WORKFLOW?: Workflow<GitHubRefSyncWorkflowPayload>;
+  GITHUB_RETENTION_WORKFLOW?: Workflow<GitHubRetentionWorkflowPayload>;
 }
 
-interface RepositoryRow {
+export interface RepositoryRow {
   repository_id: string;
   project_id: string;
   external_id: number;
@@ -53,11 +85,29 @@ interface RepositoryRow {
   name: string;
   default_branch: string | null;
   tracked_refs_json: string;
+  repository_configuration_version: number;
+  repository_updated_at: string;
 }
 
 interface CursorRow {
   observed_sha: string | null;
   etag: string | null;
+}
+
+export interface ConfiguredRefRow {
+  project_id: string;
+  repository_id: string;
+  ref: string;
+}
+
+export interface ScheduledRefRow extends RepositoryRow {
+  ref: string;
+  cursor_status: string;
+  cursor_updated_at: string;
+  cursor_version: number;
+  selected_head_manifest_id: string | null;
+  selected_head_version: number;
+  last_sync_at: string | null;
 }
 
 interface AccessBaselineRow {
@@ -75,10 +125,51 @@ export interface CredentialExpirationClassification {
 const MAX_CANDIDATE_BYTES = GITHUB_BLOB_TRANSPORT_LIMIT_BYTES;
 const MAX_RUN_BYTES = 16 * 1024 * 1024;
 const MAX_FILES = 2_000;
-const MAX_GITHUB_REQUESTS = 900;
+export const GITHUB_SYNC_REQUEST_BUDGET = {
+  accessBaseline: 900,
+  perRef: MAX_FILES + 5,
+  maxRefsPerSchedule: null,
+  maxTotalPerWorkflow: MAX_FILES + 5
+} as const;
+export const MAX_GITHUB_ACCESS_BASELINE_REQUESTS =
+  GITHUB_SYNC_REQUEST_BUDGET.accessBaseline;
+export const MAX_GITHUB_REQUESTS_PER_REF = GITHUB_SYNC_REQUEST_BUDGET.perRef;
+export const GITHUB_SYNC_REQUEST_INTERVAL_MS = 80;
 const SYNC_RUN_LEASE_MS = 60 * 60 * 1_000;
+const PRODUCTION_GITHUB_REQUEST_PACER = createGitHubRequestPacer({
+  minimumIntervalMs: GITHUB_SYNC_REQUEST_INTERVAL_MS,
+  sleep: (delayMs) => scheduler.wait(delayMs)
+});
 
 export type GitHubBlobCandidate = PersistableGitHubCandidate;
+
+export interface GitHubSyncRuntimeOptions {
+  beforeRequest?: GitHubRequestPacer;
+}
+
+export async function runScheduledGitHubSync(
+  controller: ScheduledController,
+  env: Env,
+  runtime: GitHubSyncRuntimeOptions = {}
+): Promise<void> {
+  const activeEnv = requireActiveGitHubSyncEnv(env);
+  if (activeEnv === null) {
+    return;
+  }
+  const beforeRequest = runtime.beforeRequest ?? PRODUCTION_GITHUB_REQUEST_PACER;
+  await synchronizeScheduledRepositories(controller, activeEnv, beforeRequest);
+  const retention = await maintainGitHubTreeManifestRetention(
+    activeEnv.MEMORY_DB,
+    controller.scheduledTime
+  );
+  if (retention.errors > 0) {
+    console.warn("GitHub manifest retention completed with isolated errors.", {
+      error_count: retention.errors,
+      claimed_count: retention.claimed,
+      purged_count: retention.purged
+    });
+  }
+}
 
 export default {
   async scheduled(
@@ -86,32 +177,93 @@ export default {
     env: Env,
     _ctx: ExecutionContext
   ): Promise<void> {
-    const activeEnv = requireActiveGitHubSyncEnv(env);
-    if (activeEnv === null) {
-      return;
-    }
-    await synchronizeScheduledRepositories(controller, activeEnv);
-    const retention = await maintainGitHubTreeManifestRetention(
-      activeEnv.MEMORY_DB,
-      controller.scheduledTime
-    );
-    if (retention.errors > 0) {
-      console.warn("GitHub manifest retention completed with isolated errors.", {
-        error_count: retention.errors,
-        claimed_count: retention.claimed,
-        purged_count: retention.purged
-      });
-    }
+    await scheduleGitHubSyncWorkflows(controller, env);
   }
 } satisfies ExportedHandler<Env>;
 
-interface ActiveGitHubSyncEnv extends Env {
+const REUSABLE_WORKFLOW_STATUSES = new Set([
+  "queued",
+  "running",
+  "waiting",
+  "waitingForPause",
+  "paused",
+  "complete"
+]);
+
+export async function ensureStableWorkflowInstance<Payload>(
+  workflow: Workflow<Payload>,
+  id: string,
+  params: Payload
+): Promise<void> {
+  try {
+    await workflow.create({ id, params });
+    return;
+  } catch (error) {
+    let instance: WorkflowInstance;
+    let status: Awaited<ReturnType<WorkflowInstance["status"]>>;
+    try {
+      instance = await workflow.get(id);
+      status = await instance.status();
+    } catch {
+      throw error;
+    }
+    if (REUSABLE_WORKFLOW_STATUSES.has(status.status)) {
+      return;
+    }
+    if (status.status === "errored" || status.status === "terminated") {
+      await instance.restart();
+      return;
+    }
+    throw error;
+  }
+}
+
+export async function scheduleGitHubSyncWorkflows(
+  controller: Pick<ScheduledController, "scheduledTime">,
+  env: Env
+): Promise<void> {
+  const activeEnv = requireActiveGitHubSyncEnv(env);
+  if (activeEnv === null) {
+    return;
+  }
+  if (
+    env.GITHUB_DISPATCH_WORKFLOW === undefined ||
+    env.GITHUB_RETENTION_WORKFLOW === undefined
+  ) {
+    throw new Error("Enabled GitHub sync requires its Workflow bindings.");
+  }
+  const [dispatch, retention] = await Promise.all([
+    githubDispatchIdentity(activeEnv.GITHUB_CREDENTIAL_VERSION, controller.scheduledTime),
+    githubRetentionIdentity(controller.scheduledTime)
+  ]);
+  const results = await Promise.allSettled([
+    ensureStableWorkflowInstance(env.GITHUB_DISPATCH_WORKFLOW, dispatch.instanceId, {
+      dispatchId: dispatch.dispatchId,
+      scheduledFor: dispatch.scheduledFor,
+      utcDate: dispatch.utcDate,
+      credentialVersion: activeEnv.GITHUB_CREDENTIAL_VERSION
+    }),
+    ensureStableWorkflowInstance(
+      env.GITHUB_RETENTION_WORKFLOW,
+      retention.instanceId,
+      { scheduledFor: retention.scheduledFor, utcDate: retention.utcDate }
+    )
+  ]);
+  if (results[1]?.status === "rejected") {
+    console.warn("GitHub retention Workflow scheduling failed in isolation.");
+  }
+  if (results[0]?.status === "rejected") {
+    throw results[0].reason;
+  }
+}
+
+export interface ActiveGitHubSyncEnv extends Env {
   GITHUB_SYNC_ENABLED: "true";
   GITHUB_CLASSIC_TOKEN: string;
   GITHUB_CREDENTIAL_VERSION: string;
 }
 
-function requireActiveGitHubSyncEnv(env: Env): ActiveGitHubSyncEnv | null {
+export function requireActiveGitHubSyncEnv(env: Env): ActiveGitHubSyncEnv | null {
   if (env.GITHUB_SYNC_ENABLED === "false") {
     return null;
   }
@@ -136,20 +288,26 @@ function requireActiveGitHubSyncEnv(env: Env): ActiveGitHubSyncEnv | null {
 
 async function synchronizeScheduledRepositories(
   controller: ScheduledController,
-  env: ActiveGitHubSyncEnv
+  env: ActiveGitHubSyncEnv,
+  beforeRequest: GitHubRequestPacer
 ): Promise<void> {
   const repositories = await env.MEMORY_DB.withSession("first-primary")
     .prepare(
       `SELECT repository_id, project_id, external_id, expected_owner_external_id,
-              owner, name, default_branch, tracked_refs_json
+              owner, name, default_branch, tracked_refs_json,
+              github_sync_configuration_version AS
+                repository_configuration_version,
+              updated_at AS repository_updated_at
        FROM repositories WHERE lower(provider) = 'github' AND sync_enabled = 1`
     )
     .all<RepositoryRow>();
   const eligibleRepositories: RepositoryRow[] = [];
+  const configuredRefs: ConfiguredRefRow[] = [];
   for (const repository of repositories.results) {
     if (
       !Number.isSafeInteger(repository.expected_owner_external_id) ||
-      (repository.expected_owner_external_id ?? 0) <= 0
+      (repository.expected_owner_external_id ?? 0) <= 0 ||
+      repository.default_branch === null
     ) {
       await recordSyncFailure(
         env.MEMORY_DB,
@@ -160,24 +318,53 @@ async function synchronizeScheduledRepositories(
       );
       continue;
     }
+    let refs: string[];
+    try {
+      refs = parseTrackedRefs(
+        repository.tracked_refs_json,
+        repository.default_branch
+      );
+    } catch (error) {
+      await recordSyncFailure(
+        env.MEMORY_DB,
+        repository,
+        "refs/heads/unknown",
+        toSyncError(error),
+        controller.scheduledTime
+      );
+      continue;
+    }
     eligibleRepositories.push(repository);
+    configuredRefs.push(
+      ...refs.map((ref) => ({
+        project_id: repository.project_id,
+        repository_id: repository.repository_id,
+        ref
+      }))
+    );
   }
-  const allowedIds = new Set(
-    eligibleRepositories.map((row) => row.external_id)
-  );
-  const client = new GitHubReadOnlyClient({
-    token: env.GITHUB_CLASSIC_TOKEN,
-    allowedRepositoryIds: allowedIds,
-    maxRequests: MAX_GITHUB_REQUESTS
-  });
   if (eligibleRepositories.length === 0) {
     return;
   }
+  const selectedRefs = await materializeAndSelectScheduledRefs(
+    env.MEMORY_DB,
+    configuredRefs,
+    controller.scheduledTime
+  );
+  const allowedIds = new Set(
+    eligibleRepositories.map((row) => row.external_id)
+  );
+  const baselineClient = new GitHubReadOnlyClient({
+    token: env.GITHUB_CLASSIC_TOKEN,
+    allowedRepositoryIds: allowedIds,
+    maxRequests: MAX_GITHUB_ACCESS_BASELINE_REQUESTS,
+    beforeRequest
+  });
   let credentialExpiration: CredentialExpirationClassification;
   try {
     credentialExpiration = await enforceApprovedAccessBaseline(
       env.MEMORY_DB,
-      client,
+      baselineClient,
       env.GITHUB_CREDENTIAL_VERSION,
       allowedIds,
       controller.scheduledTime
@@ -191,71 +378,294 @@ async function synchronizeScheduledRepositories(
         controller.scheduledTime
       );
     }
-    for (const repository of eligibleRepositories) {
+    for (const selected of selectedRefs) {
       await recordSyncFailure(
         env.MEMORY_DB,
-        repository,
-        "refs/heads/unknown",
+        selected,
+        selected.ref,
         baselineError,
-        controller.scheduledTime
+        controller.scheduledTime,
+        "active",
+        selected
       );
     }
     return;
   }
-  const fullReconciliation = isDailyFullReconciliation(controller.scheduledTime);
   const credentialStatus =
     credentialExpiration.status === "expiring" ? "expiring" : "active";
-  for (const repository of eligibleRepositories) {
-    const runId = await claimRepositorySync(
-      env.MEMORY_DB,
-      repository,
+  for (const selected of selectedRefs) {
+    const fullReconciliation = requiresFullReconciliation(
       controller.scheduledTime,
-      fullReconciliation
+      selected.last_sync_at
     );
+    let runId: string | null;
+    try {
+      runId = await claimRepositorySync(
+        env.MEMORY_DB,
+        selected,
+        controller.scheduledTime,
+        fullReconciliation
+      );
+    } catch (error) {
+      await recordSyncFailure(
+        env.MEMORY_DB,
+        selected,
+        selected.ref,
+        toSyncError(error),
+        controller.scheduledTime,
+        credentialStatus,
+        selected
+      );
+      continue;
+    }
     if (runId === null) {
       continue;
     }
+    let refError: GitHubSyncError | null = null;
     try {
-      const refError = await syncRepository(
-        repository,
-        client,
+      await syncScheduledRef(
+        selected,
         env,
         controller.scheduledTime,
         fullReconciliation,
-        credentialStatus
+        credentialStatus,
+        beforeRequest,
+        runId
       );
+    } catch (error) {
+      refError = toSyncError(error);
+      await recordSyncFailure(
+        env.MEMORY_DB,
+        selected,
+        selected.ref,
+        refError,
+        controller.scheduledTime,
+        credentialStatus,
+        selected,
+        runId
+      );
+    }
+    try {
       await finishRepositorySyncRun(
         env.MEMORY_DB,
         runId,
         refError?.code ?? null
       );
     } catch (error) {
-      const syncError = toSyncError(error);
-      await recordSyncFailure(
-        env.MEMORY_DB,
-        repository,
-        "refs/heads/unknown",
-        syncError,
-        controller.scheduledTime,
-        credentialStatus
-      );
-      await finishRepositorySyncRun(
-        env.MEMORY_DB,
-        runId,
-        syncError.code
-      );
+      if (refError === null) {
+        await recordSyncFailure(
+          env.MEMORY_DB,
+          selected,
+          selected.ref,
+          toSyncError(error),
+          controller.scheduledTime,
+          credentialStatus,
+          selected,
+          runId
+        );
+      }
     }
   }
 }
 
-async function syncRepository(
-  repository: RepositoryRow,
-  client: GitHubReadOnlyClient,
+export async function materializeAndSelectScheduledRefs(
+  database: D1Database,
+  configuredRefs: ConfiguredRefRow[],
+  scheduledTime: number
+): Promise<ScheduledRefRow[]> {
+  if (configuredRefs.length === 0) {
+    return [];
+  }
+  const scheduledAt = scheduledIso(scheduledTime);
+  const configuredJson = JSON.stringify(configuredRefs);
+  const session = database.withSession("first-primary");
+  await session.prepare(
+    `WITH configured AS (
+       SELECT CAST(json_extract(value, '$.project_id') AS TEXT) AS project_id,
+              CAST(json_extract(value, '$.repository_id') AS TEXT) AS repository_id,
+              CAST(json_extract(value, '$.ref') AS TEXT) AS ref
+       FROM json_each(?)
+     )
+     INSERT INTO sync_cursors
+     (project_id, repository_id, ref, status, next_sync_at,
+      history_gap_possible, credential_status, updated_at)
+     SELECT project_id, repository_id, ref, 'idle', ?, 0, 'unknown', ?
+     FROM configured WHERE 1
+     ON CONFLICT(project_id, repository_id, ref) DO NOTHING`
+  )
+    .bind(configuredJson, scheduledAt, scheduledAt)
+    .run();
+  const selected = await session.prepare(
+    `WITH configured AS (
+       SELECT CAST(json_extract(value, '$.project_id') AS TEXT) AS project_id,
+              CAST(json_extract(value, '$.repository_id') AS TEXT) AS repository_id,
+              CAST(json_extract(value, '$.ref') AS TEXT) AS ref
+       FROM json_each(?)
+     ), due AS (
+       SELECT repository.repository_id, repository.project_id,
+              repository.external_id, repository.expected_owner_external_id,
+              repository.owner, repository.name, repository.default_branch,
+              repository.tracked_refs_json, cursor.ref,
+              cursor.status AS cursor_status,
+              cursor.updated_at AS cursor_updated_at, cursor.cursor_version,
+              repository.github_sync_configuration_version AS
+                repository_configuration_version,
+              repository.updated_at AS repository_updated_at,
+              head.manifest_id AS selected_head_manifest_id,
+              COALESCE(head.head_version, 0) AS selected_head_version,
+              cursor.last_sync_at,
+              ROW_NUMBER() OVER (
+                ORDER BY cursor.updated_at, cursor.project_id,
+                         cursor.repository_id, cursor.ref
+              ) AS global_rank
+       FROM configured
+       JOIN sync_cursors AS cursor
+         ON cursor.project_id = configured.project_id
+        AND cursor.repository_id = configured.repository_id
+        AND cursor.ref = configured.ref
+       JOIN repositories AS repository
+         ON repository.project_id = cursor.project_id
+        AND repository.repository_id = cursor.repository_id
+       LEFT JOIN github_tree_ref_heads AS head
+         ON head.project_id = cursor.project_id
+        AND head.repository_id = cursor.repository_id
+        AND head.ref = cursor.ref
+       WHERE lower(repository.provider) = 'github'
+         AND repository.sync_enabled = 1
+         AND cursor.status <> 'paused'
+         AND (cursor.next_sync_at IS NULL OR cursor.next_sync_at <= ?)
+         AND NOT EXISTS (
+           SELECT 1 FROM github_sync_dispatch_items AS active_item
+           WHERE active_item.project_id = cursor.project_id
+             AND active_item.repository_id = cursor.repository_id
+             AND active_item.ref = cursor.ref
+             AND active_item.status IN ('pending', 'running')
+         )
+     )
+     SELECT repository_id, project_id, external_id,
+            expected_owner_external_id, owner, name, default_branch,
+            tracked_refs_json, repository_configuration_version,
+            repository_updated_at, ref, cursor_status, cursor_updated_at,
+            cursor_version, selected_head_manifest_id, selected_head_version,
+            last_sync_at
+     FROM due
+     ORDER BY cursor_updated_at, project_id, repository_id, ref
+     LIMIT ?`
+  )
+    .bind(configuredJson, scheduledAt, Number.MAX_SAFE_INTEGER)
+    .all<ScheduledRefRow>();
+  return selected.results;
+}
+
+export async function syncScheduledRef(
+  selected: ScheduledRefRow,
   env: ActiveGitHubSyncEnv,
   scheduledTime: number,
   fullReconciliation: boolean,
-  credentialStatus: "active" | "expiring"
-): Promise<GitHubSyncError | null> {
+  credentialStatus: "active" | "expiring",
+  beforeRequest: GitHubRequestPacer,
+  runId: string,
+  absoluteDeadlineMs?: number
+): Promise<void> {
+  const client = createRefClient(
+    selected,
+    env.GITHUB_CLASSIC_TOKEN,
+    beforeRequest,
+    absoluteDeadlineMs
+  );
+  const verifiedDefaultBranch = await verifyRepositoryForRef(
+    selected,
+    client
+  );
+  const configuredRefs = parseTrackedRefs(
+    selected.tracked_refs_json,
+    verifiedDefaultBranch
+  );
+  if (!configuredRefs.includes(selected.ref)) {
+    throw new GitHubSyncError("GITHUB_RECONCILIATION_REQUIRED");
+  }
+  await syncRef(
+    selected,
+    client,
+    env,
+    scheduledTime,
+    selected.ref,
+    verifiedDefaultBranch,
+    fullReconciliation,
+    credentialStatus,
+    runId
+  );
+}
+
+export async function failStagedManifestsForScheduledRef(
+  database: D1Database,
+  repository: Pick<ScheduledRefRow, "project_id" | "repository_id" | "ref">,
+  scheduledTime: number,
+  errorCode: GitHubSyncErrorCode
+): Promise<void> {
+  const staged = await database.withSession("first-primary").prepare(
+    `SELECT manifest_id, project_id, repository_id, ref, observed_sha, tree_sha,
+            repository_authority, collection_key, created_at
+     FROM github_tree_manifests
+     WHERE project_id = ? AND repository_id = ? AND ref = ?
+       AND collection_key = ? AND status = 'staging'
+     ORDER BY manifest_id LIMIT 10`
+  ).bind(
+    repository.project_id,
+    repository.repository_id,
+    repository.ref,
+    scheduledIso(scheduledTime)
+  ).all<{
+    manifest_id: string;
+    project_id: string;
+    repository_id: string;
+    ref: string;
+    observed_sha: string;
+    tree_sha: string;
+    repository_authority: "default_branch" | "tracked_ref";
+    collection_key: string;
+    created_at: string;
+  }>();
+  for (const manifest of staged.results) {
+    await failGitHubTreeManifest(
+      database,
+      {
+        manifestId: manifest.manifest_id,
+        projectId: manifest.project_id,
+        repositoryId: manifest.repository_id,
+        ref: manifest.ref,
+        observedSha: manifest.observed_sha,
+        treeSha: manifest.tree_sha,
+        repositoryAuthority: manifest.repository_authority,
+        collectionKey: manifest.collection_key,
+        createdAt: manifest.created_at
+      },
+      errorCode
+    );
+  }
+}
+
+function createRefClient(
+  repository: RepositoryRow,
+  token: string,
+  beforeRequest: GitHubRequestPacer,
+  absoluteDeadlineMs?: number
+): GitHubReadOnlyClient {
+  return new GitHubReadOnlyClient({
+    token,
+    allowedRepositoryIds: new Set([repository.external_id]),
+    maxRequests: MAX_GITHUB_REQUESTS_PER_REF,
+    beforeRequest,
+    requestTimeoutMs: 30_000,
+    ...(absoluteDeadlineMs === undefined ? {} : { absoluteDeadlineMs })
+  });
+}
+
+async function verifyRepositoryForRef(
+  repository: RepositoryRow,
+  client: GitHubReadOnlyClient,
+  expectedDefaultBranch?: string
+): Promise<string> {
   const metadata = await client.getRepository(
     repository.owner,
     repository.name,
@@ -267,50 +677,26 @@ async function syncRepository(
     throw new GitHubSyncError("GITHUB_REPOSITORY_UNAVAILABLE");
   }
   if (
-    repository.default_branch !== null &&
-    repository.default_branch !== verifiedDefaultBranch
+    (repository.default_branch !== null &&
+      repository.default_branch !== verifiedDefaultBranch) ||
+    (expectedDefaultBranch !== undefined &&
+      expectedDefaultBranch !== verifiedDefaultBranch)
   ) {
     throw new GitHubSyncError("GITHUB_RECONCILIATION_REQUIRED");
   }
-  const refs = parseTrackedRefs(repository.tracked_refs_json, verifiedDefaultBranch);
-  let firstRefError: GitHubSyncError | null = null;
-  for (const ref of refs) {
-    try {
-      await syncRef(
-        repository,
-        client,
-        env,
-        scheduledTime,
-        ref,
-        verifiedDefaultBranch,
-        fullReconciliation,
-        credentialStatus
-      );
-    } catch (error) {
-      const syncError = toSyncError(error);
-      firstRefError ??= syncError;
-      await recordSyncFailure(
-        env.MEMORY_DB,
-        repository,
-        ref,
-        syncError,
-        scheduledTime,
-        credentialStatus
-      );
-    }
-  }
-  return firstRefError;
+  return verifiedDefaultBranch;
 }
 
 async function syncRef(
-  repository: RepositoryRow,
+  repository: ScheduledRefRow,
   client: GitHubReadOnlyClient,
   env: Env,
   scheduledTime: number,
   ref: string,
   verifiedDefaultBranch: string,
   fullReconciliation: boolean,
-  credentialStatus: "active" | "expiring"
+  credentialStatus: "active" | "expiring",
+  runId: string
 ): Promise<void> {
   let stagedManifest: GitHubTreeManifestDescriptor | null = null;
   try {
@@ -323,13 +709,14 @@ async function syncRef(
       verifiedDefaultBranch,
       fullReconciliation,
       credentialStatus,
+      runId,
       (manifest) => {
         stagedManifest = manifest;
       }
     );
   } catch (error) {
     const syncError = toSyncError(error);
-    if (stagedManifest !== null) {
+    if (stagedManifest !== null && !syncError.retryable) {
       await failGitHubTreeManifest(
         env.MEMORY_DB,
         stagedManifest,
@@ -341,7 +728,7 @@ async function syncRef(
 }
 
 async function syncRefAttempt(
-  repository: RepositoryRow,
+  repository: ScheduledRefRow,
   client: GitHubReadOnlyClient,
   env: Env,
   scheduledTime: number,
@@ -349,6 +736,7 @@ async function syncRefAttempt(
   verifiedDefaultBranch: string,
   fullReconciliation: boolean,
   credentialStatus: "active" | "expiring",
+  runId: string,
   onManifestStaged: (manifest: GitHubTreeManifestDescriptor) => void
 ): Promise<void> {
   const activeHead = await readActiveGitHubTreeHead(
@@ -357,6 +745,12 @@ async function syncRefAttempt(
     repository.repository_id,
     ref
   );
+  if (
+    (activeHead?.manifestId ?? null) !== repository.selected_head_manifest_id ||
+    (activeHead?.headVersion ?? 0) !== repository.selected_head_version
+  ) {
+    throw new GitHubSyncError("GITHUB_RECONCILIATION_REQUIRED");
+  }
   const cursor = await env.MEMORY_DB.prepare(
     `SELECT observed_sha, etag FROM sync_cursors
      WHERE project_id = ? AND repository_id = ? AND ref = ?`
@@ -388,7 +782,8 @@ async function syncRefAttempt(
       scheduledTime,
       result.etag,
       result.rateLimit,
-      credentialStatus
+      credentialStatus,
+      runId
     );
     return;
   }
@@ -409,7 +804,8 @@ async function syncRefAttempt(
       scheduledTime,
       result.etag,
       result.rateLimit,
-      credentialStatus
+      credentialStatus,
+      runId
     );
     return;
   }
@@ -614,6 +1010,40 @@ async function syncRefAttempt(
     manifestEntries,
     new Date().toISOString()
   );
+  const activationAttempt = await createGitHubTreeManifestActivationAttempt({
+    runId,
+    projectId: repository.project_id,
+    repositoryId: repository.repository_id,
+    ref,
+    manifestId: manifest.manifestId
+  });
+  const activationFence: PendingGitHubSyncActivationFence = {
+    projectId: repository.project_id,
+    repositoryId: repository.repository_id,
+    ref,
+    manifestId: manifest.manifestId,
+    repositoryAuthority: manifest.repositoryAuthority,
+    runId,
+    receiptId: activationAttempt.receiptId,
+    activationToken: activationAttempt.activationToken,
+    scheduledFor: new Date(scheduledTime).toISOString(),
+    fullReconciliation,
+    expectedHeadManifestId: activeHead?.manifestId ?? null,
+    expectedHeadVersion: activeHead?.headVersion ?? 0,
+    expectedExternalId: repository.external_id,
+    expectedOwnerExternalId: repository.expected_owner_external_id as number,
+    expectedOwner: repository.owner,
+    expectedName: repository.name,
+    expectedDefaultBranch: verifiedDefaultBranch,
+    expectedTrackedRefsJson: repository.tracked_refs_json,
+    expectedRepositoryConfigurationVersion:
+      repository.repository_configuration_version,
+    expectedRepositoryUpdatedAt: repository.repository_updated_at,
+    expectedCursorObservedSha: cursor?.observed_sha ?? null,
+    expectedCursorStatus: repository.cursor_status,
+    expectedCursorUpdatedAt: repository.cursor_updated_at,
+    expectedCursorVersion: repository.cursor_version
+  };
   const candidateStatements = await prepareGitHubCandidateStatements({
     database: env.MEMORY_DB,
     projectId: repository.project_id,
@@ -622,6 +1052,7 @@ async function syncRefAttempt(
     externalRepositoryId: repository.external_id,
     manifestId: manifest.manifestId,
     observedSha,
+    activationFence,
     candidates
   });
   const syncEvent = await buildStableSyncEvent({
@@ -636,7 +1067,24 @@ async function syncRefAttempt(
     database: env.MEMORY_DB,
     descriptor: manifest,
     expectedHead: activeHead,
-    expectedCursorObservedSha: cursor?.observed_sha ?? null,
+    activationClaim: {
+      runId,
+      ...activationAttempt,
+      expectedExternalId: repository.external_id,
+      expectedOwnerExternalId: repository.expected_owner_external_id as number,
+      expectedOwner: repository.owner,
+      expectedName: repository.name,
+      expectedDefaultBranch: verifiedDefaultBranch,
+      expectedTrackedRefsJson: repository.tracked_refs_json,
+      expectedRepositoryConfigurationVersion:
+        repository.repository_configuration_version,
+      expectedRepositoryUpdatedAt: repository.repository_updated_at,
+      expectedCursorStatus: repository.cursor_status,
+      expectedCursorUpdatedAt: repository.cursor_updated_at,
+      expectedCursorVersion: repository.cursor_version,
+      expectedCursorObservedSha: cursor?.observed_sha ?? null,
+      fullReconciliation
+    },
     scheduledTime,
     nextSyncAt: computeNextSyncAt(scheduledTime, result.rateLimit),
     historyGapPossible: change.historyGapPossible,
@@ -903,13 +1351,20 @@ export function parseTrackedRefs(
   trackedRefsJson: string,
   defaultBranch: string
 ): string[] {
+  if (new TextEncoder().encode(trackedRefsJson).byteLength > 256 * 1024) {
+    throw new GitHubSyncError("GITHUB_REPOSITORY_UNAVAILABLE");
+  }
   let parsed: unknown;
   try {
     parsed = JSON.parse(trackedRefsJson);
   } catch {
     throw new GitHubSyncError("GITHUB_REPOSITORY_UNAVAILABLE");
   }
-  if (!Array.isArray(parsed) || parsed.some((value) => typeof value !== "string")) {
+  if (
+    !Array.isArray(parsed) ||
+    parsed.length > 512 ||
+    parsed.some((value) => typeof value !== "string")
+  ) {
     throw new GitHubSyncError("GITHUB_REPOSITORY_UNAVAILABLE");
   }
   const refs = [`refs/heads/${defaultBranch}`, ...parsed];
@@ -920,7 +1375,8 @@ export function parseTrackedRefs(
       ref.includes("..") ||
       ref.includes("//") ||
       ref.endsWith("/") ||
-      ref.includes("@{")
+      ref.includes("@{") ||
+      new TextEncoder().encode(ref).byteLength > 1_024
     ) {
       throw new GitHubSyncError("GITHUB_REPOSITORY_UNAVAILABLE");
     }
@@ -1290,7 +1746,27 @@ export function isDailyFullReconciliation(scheduledTime: number): boolean {
   return scheduled.getUTCHours() === 0 && scheduled.getUTCMinutes() === 0;
 }
 
-async function recordInvalidCredentialObservation(
+export function requiresFullReconciliation(
+  scheduledTime: number,
+  lastSyncAt: string | null
+): boolean {
+  if (isDailyFullReconciliation(scheduledTime) || lastSyncAt === null) {
+    return true;
+  }
+  const lastSyncAtMs = Date.parse(lastSyncAt);
+  if (!Number.isFinite(lastSyncAtMs) || lastSyncAtMs > scheduledTime) {
+    return true;
+  }
+  const scheduled = new Date(scheduledTime);
+  const utcDayStart = Date.UTC(
+    scheduled.getUTCFullYear(),
+    scheduled.getUTCMonth(),
+    scheduled.getUTCDate()
+  );
+  return lastSyncAtMs < utcDayStart;
+}
+
+export async function recordInvalidCredentialObservation(
   database: D1Database,
   credentialVersion: string,
   observedAt: number
@@ -1315,14 +1791,139 @@ async function recordInvalidCredentialObservation(
     .run();
 }
 
-async function claimRepositorySync(
+type D1PrimarySession = ReturnType<D1Database["withSession"]>;
+
+async function expireStaleRepositorySyncRuns(
+  session: D1PrimarySession,
+  repository: ScheduledRefRow,
+  claimedAt: string
+): Promise<void> {
+  await session.prepare(
+    `UPDATE github_repository_sync_runs
+     SET status = 'failed', completed_at = ?,
+         last_error_code = 'GITHUB_RECONCILIATION_REQUIRED'
+     WHERE project_id = ? AND repository_id = ? AND status = 'running'
+       AND claimed_ref = ? AND lease_expires_at <= ?`
+  )
+    .bind(
+      claimedAt,
+      repository.project_id,
+      repository.repository_id,
+      repository.ref,
+      claimedAt
+    )
+    .run();
+}
+
+async function hasExactRecoveredRepositorySyncClaim(
   database: D1Database,
-  repository: RepositoryRow,
+  input: {
+    repository: ScheduledRefRow;
+    runId: string;
+    scheduledFor: string;
+    fullReconciliation: boolean;
+    claimedAt: string;
+    leaseExpiresAt: string;
+  }
+): Promise<boolean> {
+  try {
+    const observedAt = new Date().toISOString();
+    const result = await database.withSession("first-primary").prepare(
+      `SELECT 1 AS matches
+       FROM github_repository_sync_runs AS claimed_run
+       JOIN repositories AS repository
+         ON repository.project_id = claimed_run.project_id
+        AND repository.repository_id = claimed_run.repository_id
+       JOIN sync_cursors AS cursor
+         ON cursor.project_id = claimed_run.project_id
+        AND cursor.repository_id = claimed_run.repository_id
+        AND cursor.ref = claimed_run.claimed_ref
+       LEFT JOIN github_tree_ref_heads AS head
+         ON head.project_id = claimed_run.project_id
+        AND head.repository_id = claimed_run.repository_id
+        AND head.ref = claimed_run.claimed_ref
+       WHERE claimed_run.run_id = ?
+         AND claimed_run.project_id = ?
+         AND claimed_run.repository_id = ?
+         AND claimed_run.scheduled_for = ?
+         AND claimed_run.full_reconciliation = ?
+         AND claimed_run.status = 'running'
+         AND claimed_run.started_at = ?
+         AND claimed_run.lease_expires_at = ?
+         AND claimed_run.lease_expires_at > ?
+         AND claimed_run.claimed_ref = ?
+         AND claimed_run.claimed_head_manifest_id IS ?
+         AND claimed_run.claimed_head_version = ?
+         AND claimed_run.repository_configuration_version = ?
+         AND claimed_run.cursor_version = ?
+         AND claimed_run.claim_contract_version = 1
+         AND claimed_run.completed_at IS NULL
+         AND claimed_run.last_error_code IS NULL
+         AND lower(repository.provider) = 'github'
+         AND repository.sync_enabled = 1
+         AND repository.external_id = ?
+         AND repository.expected_owner_external_id IS ?
+         AND repository.owner = ?
+         AND repository.name = ?
+         AND repository.default_branch IS ?
+         AND repository.tracked_refs_json = ?
+         AND repository.github_sync_configuration_version = ?
+         AND repository.updated_at = ?
+         AND cursor.status = ?
+         AND cursor.status <> 'paused'
+         AND cursor.updated_at = ?
+         AND cursor.cursor_version = ?
+         AND head.manifest_id IS ?
+         AND COALESCE(head.head_version, 0) = ?
+       LIMIT 1`
+    )
+      .bind(
+        input.runId,
+        input.repository.project_id,
+        input.repository.repository_id,
+        input.scheduledFor,
+        input.fullReconciliation ? 1 : 0,
+        input.claimedAt,
+        input.leaseExpiresAt,
+        observedAt,
+        input.repository.ref,
+        input.repository.selected_head_manifest_id,
+        input.repository.selected_head_version,
+        input.repository.repository_configuration_version,
+        input.repository.cursor_version,
+        input.repository.external_id,
+        input.repository.expected_owner_external_id,
+        input.repository.owner,
+        input.repository.name,
+        input.repository.default_branch,
+        input.repository.tracked_refs_json,
+        input.repository.repository_configuration_version,
+        input.repository.repository_updated_at,
+        input.repository.cursor_status,
+        input.repository.cursor_updated_at,
+        input.repository.cursor_version,
+        input.repository.selected_head_manifest_id,
+        input.repository.selected_head_version
+      )
+      .all<{ matches: number }>();
+    return result.results.length === 1 && result.results[0]?.matches === 1;
+  } catch {
+    return false;
+  }
+}
+
+export async function claimRepositorySync(
+  database: D1Database,
+  repository: ScheduledRefRow,
   scheduledTime: number,
-  fullReconciliation: boolean
+  fullReconciliation: boolean,
+  claimStartedAtMs = Date.now()
 ): Promise<string | null> {
   const scheduledFor = scheduledIso(scheduledTime);
-  const claimedAtMs = Date.now();
+  const claimedAtMs = claimStartedAtMs;
+  if (!Number.isFinite(claimedAtMs)) {
+    throw new GitHubSyncError("GITHUB_RECONCILIATION_REQUIRED");
+  }
   const claimedAt = new Date(claimedAtMs).toISOString();
   const leaseExpiresAt = new Date(claimedAtMs + SYNC_RUN_LEASE_MS).toISOString();
   const runId = await sha256(
@@ -1330,62 +1931,183 @@ async function claimRepositorySync(
       "github.repository.sync.run",
       repository.project_id,
       repository.repository_id,
+      repository.ref,
       scheduledFor
     ].join("\n")
   );
-  const staleRunStatement = database.prepare(
-    `UPDATE github_repository_sync_runs
-     SET status = 'failed', completed_at = ?,
-         last_error_code = 'GITHUB_RECONCILIATION_REQUIRED'
-     WHERE project_id = ? AND repository_id = ? AND status = 'running'
-       AND lease_expires_at <= ?`
-  ).bind(
-    claimedAt,
-    repository.project_id,
-    repository.repository_id,
-    claimedAt
-  );
-  const claimStatement = database.prepare(
+  let session = database.withSession("first-primary");
+  try {
+    await expireStaleRepositorySyncRuns(session, repository, claimedAt);
+  } catch (error) {
+    session = database.withSession("first-primary");
+    try {
+      await expireStaleRepositorySyncRuns(session, repository, claimedAt);
+    } catch {
+      throw error;
+    }
+  }
+  const claimStatement = session.prepare(
     `INSERT INTO github_repository_sync_runs
      (run_id, project_id, repository_id, scheduled_for, full_reconciliation,
-      status, started_at, lease_expires_at)
-     SELECT ?, ?, ?, ?, ?, 'running', ?, ?
-     WHERE NOT EXISTS (
-       SELECT 1 FROM github_repository_sync_runs
-       WHERE project_id = ? AND repository_id = ? AND status = 'running'
-         AND lease_expires_at > ?
-     )
-     ON CONFLICT(project_id, repository_id, scheduled_for) DO NOTHING`
+      status, started_at, lease_expires_at, claimed_ref,
+      claimed_head_manifest_id, claimed_head_version,
+      repository_configuration_version, cursor_version, claim_contract_version)
+     SELECT ?, repository.project_id, repository.repository_id, ?, ?,
+            'running', ?, ?, cursor.ref,
+            head.manifest_id, COALESCE(head.head_version, 0),
+            repository.github_sync_configuration_version,
+            cursor.cursor_version, 1
+     FROM repositories AS repository
+     JOIN sync_cursors AS cursor
+       ON cursor.project_id = repository.project_id
+      AND cursor.repository_id = repository.repository_id
+      AND cursor.ref = ?
+     LEFT JOIN github_tree_ref_heads AS head
+       ON head.project_id = cursor.project_id
+      AND head.repository_id = cursor.repository_id
+      AND head.ref = cursor.ref
+     WHERE repository.project_id = ? AND repository.repository_id = ?
+       AND lower(repository.provider) = 'github'
+       AND repository.sync_enabled = 1
+       AND repository.external_id = ?
+       AND repository.expected_owner_external_id IS ?
+       AND repository.owner = ? AND repository.name = ?
+       AND repository.default_branch IS ?
+       AND repository.tracked_refs_json = ?
+       AND repository.github_sync_configuration_version = ?
+       AND repository.updated_at = ?
+       AND cursor.status = ? AND cursor.status <> 'paused'
+       AND cursor.updated_at = ?
+       AND cursor.cursor_version = ?
+       AND head.manifest_id IS ?
+       AND COALESCE(head.head_version, 0) = ?
+       AND NOT EXISTS (
+         SELECT 1 FROM github_repository_sync_runs
+         WHERE project_id = repository.project_id
+           AND repository_id = repository.repository_id
+           AND claimed_ref = cursor.ref
+           AND status = 'running' AND lease_expires_at > ?
+       )
+     ON CONFLICT(project_id, repository_id, claimed_ref, scheduled_for)
+     DO NOTHING`
   ).bind(
     runId,
-    repository.project_id,
-    repository.repository_id,
     scheduledFor,
     fullReconciliation ? 1 : 0,
     claimedAt,
     leaseExpiresAt,
+    repository.ref,
     repository.project_id,
     repository.repository_id,
+    repository.external_id,
+    repository.expected_owner_external_id,
+    repository.owner,
+    repository.name,
+    repository.default_branch,
+    repository.tracked_refs_json,
+    repository.repository_configuration_version,
+    repository.repository_updated_at,
+    repository.cursor_status,
+    repository.cursor_updated_at,
+    repository.cursor_version,
+    repository.selected_head_manifest_id,
+    repository.selected_head_version,
     claimedAt
   );
-  await staleRunStatement.run();
-  const result = await claimStatement.run();
-  return (result.meta.changes ?? 0) === 1 ? runId : null;
+  let result: D1Result;
+  try {
+    result = await claimStatement.run();
+  } catch (error) {
+    if (
+      await hasExactRecoveredRepositorySyncClaim(database, {
+        repository,
+        runId,
+        scheduledFor,
+        fullReconciliation,
+        claimedAt,
+        leaseExpiresAt
+      })
+    ) {
+      return runId;
+    }
+    throw error;
+  }
+  if ((result.meta.changes ?? 0) === 1) {
+    return runId;
+  }
+  return (await hasExactRecoveredRepositorySyncClaim(database, {
+    repository,
+    runId,
+    scheduledFor,
+    fullReconciliation,
+    claimedAt,
+    leaseExpiresAt
+  }))
+    ? runId
+    : null;
 }
 
-async function finishRepositorySyncRun(
+export async function finishRepositorySyncRun(
   database: D1Database,
   runId: string,
-  errorCode: string | null
-): Promise<void> {
-  const completedAt = new Date().toISOString();
-  await database.prepare(
+  errorCode: string | null,
+  completedAt = new Date().toISOString()
+): Promise<string> {
+  const status = errorCode === null ? "complete" : "failed";
+  let result: D1Result;
+  try {
+    result = await database.withSession("first-primary").prepare(
     `UPDATE github_repository_sync_runs
      SET status = ?, completed_at = ?, last_error_code = ?
      WHERE run_id = ? AND status = 'running'`
-  )
-    .bind(errorCode === null ? "complete" : "failed", completedAt, errorCode, runId)
-    .run();
+    )
+      .bind(status, completedAt, errorCode, runId)
+      .run();
+  } catch (error) {
+    const recovered = await readFinishedRepositorySyncRun(
+      database,
+      runId,
+      status,
+      errorCode
+    );
+    if (recovered !== null) {
+      return recovered;
+    }
+    throw error;
+  }
+  if ((result.meta.changes ?? 0) !== 1) {
+    const recovered = await readFinishedRepositorySyncRun(
+      database,
+      runId,
+      status,
+      errorCode
+    );
+    if (recovered === null) {
+      throw new GitHubSyncError("GITHUB_RECONCILIATION_REQUIRED");
+    }
+    return recovered;
+  }
+  return completedAt;
+}
+
+async function readFinishedRepositorySyncRun(
+  database: D1Database,
+  runId: string,
+  status: "complete" | "failed",
+  errorCode: string | null
+): Promise<string | null> {
+  try {
+    const exact = await database.withSession("first-primary").prepare(
+      `SELECT completed_at FROM github_repository_sync_runs
+       WHERE run_id = ? AND status = ? AND completed_at IS NOT NULL
+         AND last_error_code IS ? LIMIT 1`
+    )
+      .bind(runId, status, errorCode)
+      .first<{ completed_at: string }>();
+    return exact?.completed_at ?? null;
+  } catch {
+    return null;
+  }
 }
 
 function scheduledIso(scheduledTime: number): string {
@@ -1395,14 +2117,25 @@ function scheduledIso(scheduledTime: number): string {
   return new Date(scheduledTime).toISOString();
 }
 
-async function recordSyncFailure(
+export async function recordSyncFailure(
   database: D1Database,
   repository: RepositoryRow,
   ref: string,
   error: GitHubSyncError,
   scheduledTime: number,
-  knownCredentialStatus: "active" | "expiring" = "active"
+  knownCredentialStatus: "active" | "expiring" = "active",
+  expectedSelection?: ScheduledRefRow,
+  expectedRunId: string | null = null
 ): Promise<void> {
+  if (
+    expectedRunId !== null &&
+    (expectedSelection === undefined ||
+      expectedSelection.project_id !== repository.project_id ||
+      expectedSelection.repository_id !== repository.repository_id ||
+      expectedSelection.ref !== ref)
+  ) {
+    throw new GitHubSyncError("GITHUB_RECONCILIATION_REQUIRED");
+  }
   const historyGapPossible =
     error.code === "GITHUB_RECONCILIATION_REQUIRED" ? 1 : 0;
   const credentialStatus = [
@@ -1414,16 +2147,144 @@ async function recordSyncFailure(
   ].includes(error.code)
     ? "blocked"
     : knownCredentialStatus;
-  await database.prepare(
+  const expectedCursorUpdatedAt = expectedSelection?.cursor_updated_at ?? null;
+  const expectedCursorStatus = expectedSelection?.cursor_status ?? null;
+  const expectedCursorVersion = expectedSelection?.cursor_version ?? null;
+  const expectedHeadManifestId =
+    expectedSelection?.selected_head_manifest_id ?? null;
+  const expectedHeadVersion = expectedSelection?.selected_head_version ?? null;
+  const expectedFullReconciliation =
+    expectedSelection === undefined
+      ? null
+      : requiresFullReconciliation(scheduledTime, expectedSelection.last_sync_at)
+        ? 1
+        : 0;
+  const expectedScheduledFor = scheduledIso(scheduledTime);
+  const terminalAt = new Date().toISOString();
+  await database.withSession("first-primary").prepare(
     `INSERT INTO sync_cursors
      (project_id, repository_id, ref, status, next_sync_at, history_gap_possible,
       last_error_code, credential_status, updated_at)
-     VALUES (?, ?, ?, 'failed', ?, ?, ?, ?, ?)
+     SELECT ?, ?, ?, 'failed', ?, ?, ?, ?, ?
+     FROM repositories AS repository
+     WHERE repository.project_id = ? AND repository.repository_id = ?
+       AND lower(repository.provider) = 'github'
+       AND repository.sync_enabled = 1
+       AND repository.external_id = ?
+       AND repository.expected_owner_external_id IS ?
+       AND repository.owner = ? AND repository.name = ?
+       AND repository.default_branch IS ?
+       AND repository.tracked_refs_json = ?
+       AND repository.github_sync_configuration_version = ?
+       AND repository.updated_at = ?
+       AND (
+         (? IS NULL AND NOT EXISTS (
+           SELECT 1 FROM github_repository_sync_runs AS active_run
+           WHERE active_run.project_id = repository.project_id
+             AND active_run.repository_id = repository.repository_id
+             AND active_run.status = 'running'
+             AND active_run.lease_expires_at > ?
+         ))
+         OR EXISTS (
+           SELECT 1 FROM github_repository_sync_runs AS claimed_run
+           WHERE claimed_run.run_id IS ?
+             AND claimed_run.project_id = repository.project_id
+             AND claimed_run.repository_id = repository.repository_id
+             AND claimed_run.status = 'running'
+             AND claimed_run.lease_expires_at > ?
+             AND claimed_run.scheduled_for = ?
+             AND claimed_run.full_reconciliation = ?
+             AND claimed_run.claimed_ref = ?
+             AND claimed_run.claimed_head_manifest_id IS ?
+             AND claimed_run.claimed_head_version = ?
+             AND claimed_run.repository_configuration_version = ?
+             AND claimed_run.cursor_version = ?
+             AND claimed_run.claim_contract_version = 1
+         )
+       )
+       AND (
+         ? IS NULL OR EXISTS (
+           SELECT 1 FROM sync_cursors AS selected_cursor
+           LEFT JOIN github_tree_ref_heads AS selected_head
+             ON selected_head.project_id = selected_cursor.project_id
+            AND selected_head.repository_id = selected_cursor.repository_id
+            AND selected_head.ref = selected_cursor.ref
+           WHERE selected_cursor.project_id = repository.project_id
+             AND selected_cursor.repository_id = repository.repository_id
+             AND selected_cursor.ref = ?
+             AND selected_cursor.status = ?
+             AND selected_cursor.status <> 'paused'
+             AND selected_cursor.updated_at = ?
+             AND selected_cursor.cursor_version = ?
+             AND selected_head.manifest_id IS ?
+             AND COALESCE(selected_head.head_version, 0) = ?
+         )
+       )
      ON CONFLICT(project_id, repository_id, ref) DO UPDATE SET
        status = excluded.status, next_sync_at = excluded.next_sync_at,
        history_gap_possible = excluded.history_gap_possible,
        last_error_code = excluded.last_error_code,
-       credential_status = excluded.credential_status, updated_at = excluded.updated_at`
+       credential_status = excluded.credential_status, updated_at = excluded.updated_at
+     WHERE sync_cursors.status <> 'paused'
+       AND EXISTS (
+         SELECT 1 FROM repositories AS current_repository
+         WHERE current_repository.project_id = excluded.project_id
+           AND current_repository.repository_id = excluded.repository_id
+           AND lower(current_repository.provider) = 'github'
+           AND current_repository.sync_enabled = 1
+           AND current_repository.external_id = ?
+           AND current_repository.expected_owner_external_id IS ?
+           AND current_repository.owner = ? AND current_repository.name = ?
+           AND current_repository.default_branch IS ?
+           AND current_repository.tracked_refs_json = ?
+           AND current_repository.github_sync_configuration_version = ?
+           AND current_repository.updated_at = ?
+       )
+       AND (
+         (? IS NULL AND NOT EXISTS (
+           SELECT 1 FROM github_repository_sync_runs AS active_run
+           WHERE active_run.project_id = excluded.project_id
+             AND active_run.repository_id = excluded.repository_id
+             AND active_run.status = 'running'
+             AND active_run.lease_expires_at > ?
+         ))
+         OR EXISTS (
+           SELECT 1 FROM github_repository_sync_runs AS claimed_run
+           WHERE claimed_run.run_id IS ?
+             AND claimed_run.project_id = excluded.project_id
+             AND claimed_run.repository_id = excluded.repository_id
+             AND claimed_run.status = 'running'
+             AND claimed_run.lease_expires_at > ?
+             AND claimed_run.scheduled_for = ?
+             AND claimed_run.full_reconciliation = ?
+             AND claimed_run.claimed_ref = ?
+             AND claimed_run.claimed_head_manifest_id IS ?
+             AND claimed_run.claimed_head_version = ?
+             AND claimed_run.repository_configuration_version = ?
+             AND claimed_run.cursor_version = ?
+             AND claimed_run.claim_contract_version = 1
+         )
+       )
+       AND (
+         ? IS NULL OR (
+           sync_cursors.status = ? AND sync_cursors.updated_at = ?
+           AND sync_cursors.cursor_version = ?
+           AND (
+             SELECT current_head.manifest_id
+             FROM github_tree_ref_heads AS current_head
+             WHERE current_head.project_id = sync_cursors.project_id
+               AND current_head.repository_id = sync_cursors.repository_id
+               AND current_head.ref = sync_cursors.ref
+           ) IS ?
+           AND COALESCE((
+             SELECT current_head.head_version
+             FROM github_tree_ref_heads AS current_head
+             WHERE current_head.project_id = sync_cursors.project_id
+               AND current_head.repository_id = sync_cursors.repository_id
+               AND current_head.ref = sync_cursors.ref
+           ), 0) = ?
+         )
+       )`
   )
     .bind(
       repository.project_id,
@@ -1437,37 +2298,353 @@ async function recordSyncFailure(
       historyGapPossible,
       error.code,
       credentialStatus,
-      new Date().toISOString()
+      terminalAt,
+      repository.project_id,
+      repository.repository_id,
+      repository.external_id,
+      repository.expected_owner_external_id,
+      repository.owner,
+      repository.name,
+      repository.default_branch,
+      repository.tracked_refs_json,
+      repository.repository_configuration_version,
+      repository.repository_updated_at,
+      expectedRunId,
+      terminalAt,
+      expectedRunId,
+      terminalAt,
+      expectedScheduledFor,
+      expectedFullReconciliation,
+      ref,
+      expectedHeadManifestId,
+      expectedHeadVersion,
+      repository.repository_configuration_version,
+      expectedCursorVersion,
+      expectedCursorUpdatedAt,
+      ref,
+      expectedCursorStatus,
+      expectedCursorUpdatedAt,
+      expectedCursorVersion,
+      expectedHeadManifestId,
+      expectedHeadVersion,
+      repository.external_id,
+      repository.expected_owner_external_id,
+      repository.owner,
+      repository.name,
+      repository.default_branch,
+      repository.tracked_refs_json,
+      repository.repository_configuration_version,
+      repository.repository_updated_at,
+      expectedRunId,
+      terminalAt,
+      expectedRunId,
+      terminalAt,
+      expectedScheduledFor,
+      expectedFullReconciliation,
+      ref,
+      expectedHeadManifestId,
+      expectedHeadVersion,
+      repository.repository_configuration_version,
+      expectedCursorVersion,
+      expectedCursorUpdatedAt,
+      expectedCursorStatus,
+      expectedCursorUpdatedAt,
+      expectedCursorVersion,
+      expectedHeadManifestId,
+      expectedHeadVersion
     )
     .run();
 }
 
-async function markUnchanged(
+interface CursorObservedShaSnapshot {
+  observed_sha: string | null;
+}
+
+async function readExactCursorObservedSha(
+  session: D1PrimarySession,
+  repository: ScheduledRefRow,
+  ref: string
+): Promise<CursorObservedShaSnapshot | null> {
+  const result = await session.prepare(
+    `SELECT observed_sha
+     FROM sync_cursors
+     WHERE project_id = ? AND repository_id = ? AND ref = ?
+       AND status = ? AND status <> 'paused'
+       AND updated_at = ? AND cursor_version = ?
+     LIMIT 1`
+  )
+    .bind(
+      repository.project_id,
+      repository.repository_id,
+      ref,
+      repository.cursor_status,
+      repository.cursor_updated_at,
+      repository.cursor_version
+    )
+    .all<CursorObservedShaSnapshot>();
+  return result.results.length === 1 ? (result.results[0] ?? null) : null;
+}
+
+async function hasExactRecoveredUnchangedCursor(
   database: D1Database,
-  repository: RepositoryRow,
+  input: {
+    repository: ScheduledRefRow;
+    ref: string;
+    expectedRunId: string;
+    scheduledFor: string;
+    nextSyncAt: string;
+    etag: string | null;
+    credentialStatus: "active" | "expiring";
+    terminalAt: string;
+    observedSha: string | null;
+    expectedCursorVersion: number;
+  }
+): Promise<boolean> {
+  try {
+    const observedAt = new Date().toISOString();
+    const result = await database.withSession("first-primary").prepare(
+      `SELECT 1 AS matches
+       FROM github_repository_sync_runs AS claimed_run
+       JOIN repositories AS repository
+         ON repository.project_id = claimed_run.project_id
+        AND repository.repository_id = claimed_run.repository_id
+       JOIN sync_cursors AS cursor
+         ON cursor.project_id = claimed_run.project_id
+        AND cursor.repository_id = claimed_run.repository_id
+        AND cursor.ref = claimed_run.claimed_ref
+       LEFT JOIN github_tree_ref_heads AS head
+         ON head.project_id = claimed_run.project_id
+        AND head.repository_id = claimed_run.repository_id
+        AND head.ref = claimed_run.claimed_ref
+       WHERE claimed_run.run_id = ?
+         AND claimed_run.project_id = ?
+         AND claimed_run.repository_id = ?
+         AND claimed_run.scheduled_for = ?
+         AND claimed_run.full_reconciliation = ?
+         AND claimed_run.claimed_ref = ?
+         AND claimed_run.claimed_head_manifest_id IS ?
+         AND claimed_run.claimed_head_version = ?
+         AND claimed_run.repository_configuration_version = ?
+         AND claimed_run.cursor_version = ?
+         AND claimed_run.claim_contract_version = 1
+         AND claimed_run.status = 'running'
+         AND claimed_run.lease_expires_at > ?
+         AND claimed_run.completed_at IS NULL
+         AND claimed_run.last_error_code IS NULL
+         AND cursor.observed_sha IS ?
+         AND cursor.status = 'complete'
+         AND cursor.last_sync_at = ?
+         AND cursor.next_sync_at = ?
+         AND cursor.history_gap_possible = 0
+         AND cursor.credential_status = ?
+         AND cursor.etag IS ?
+         AND cursor.last_error_code IS NULL
+         AND cursor.updated_at = ?
+         AND cursor.cursor_version = ?
+         AND lower(repository.provider) = 'github'
+         AND repository.sync_enabled = 1
+         AND repository.external_id = ?
+         AND repository.expected_owner_external_id IS ?
+         AND repository.owner = ?
+         AND repository.name = ?
+         AND repository.default_branch IS ?
+         AND repository.tracked_refs_json = ?
+         AND repository.github_sync_configuration_version = ?
+         AND repository.updated_at = ?
+         AND head.manifest_id IS ?
+         AND COALESCE(head.head_version, 0) = ?
+       LIMIT 1`
+    )
+      .bind(
+        input.expectedRunId,
+        input.repository.project_id,
+        input.repository.repository_id,
+        input.scheduledFor,
+        requiresFullReconciliation(
+          Date.parse(input.scheduledFor),
+          input.repository.last_sync_at
+        )
+          ? 1
+          : 0,
+        input.ref,
+        input.repository.selected_head_manifest_id,
+        input.repository.selected_head_version,
+        input.repository.repository_configuration_version,
+        input.repository.cursor_version,
+        observedAt,
+        input.observedSha,
+        input.scheduledFor,
+        input.nextSyncAt,
+        input.credentialStatus,
+        input.etag,
+        input.terminalAt,
+        input.expectedCursorVersion,
+        input.repository.external_id,
+        input.repository.expected_owner_external_id,
+        input.repository.owner,
+        input.repository.name,
+        input.repository.default_branch,
+        input.repository.tracked_refs_json,
+        input.repository.repository_configuration_version,
+        input.repository.repository_updated_at,
+        input.repository.selected_head_manifest_id,
+        input.repository.selected_head_version
+      )
+      .all<{ matches: number }>();
+    return result.results.length === 1 && result.results[0]?.matches === 1;
+  } catch {
+    return false;
+  }
+}
+
+export async function markUnchanged(
+  database: D1Database,
+  repository: ScheduledRefRow,
   ref: string,
   scheduledTime: number,
   etag: string | undefined,
   rateLimit: GitHubRateLimit | undefined,
-  credentialStatus: "active" | "expiring"
+  credentialStatus: "active" | "expiring",
+  expectedRunId: string
 ): Promise<void> {
-  await database.prepare(
+  if (
+    !Number.isSafeInteger(repository.cursor_version) ||
+    repository.cursor_version < 1 ||
+    repository.cursor_version >= Number.MAX_SAFE_INTEGER
+  ) {
+    throw new GitHubSyncError("GITHUB_RECONCILIATION_REQUIRED");
+  }
+  const scheduledFor = scheduledIso(scheduledTime);
+  const nextSyncAt = computeNextSyncAt(scheduledTime, rateLimit);
+  const normalizedEtag = etag ?? null;
+  const terminalAt = new Date().toISOString();
+  const expectedCursorVersion = repository.cursor_version + 1;
+  const session = database.withSession("first-primary");
+  const cursorSnapshot = await readExactCursorObservedSha(
+    session,
+    repository,
+    ref
+  );
+  if (cursorSnapshot === null) {
+    throw new GitHubSyncError("GITHUB_RECONCILIATION_REQUIRED");
+  }
+  const statement = session.prepare(
     `UPDATE sync_cursors
      SET status = 'complete', last_sync_at = ?, next_sync_at = ?, etag = ?,
-         credential_status = ?, last_error_code = NULL, updated_at = ?
-     WHERE project_id = ? AND repository_id = ? AND ref = ?`
+         history_gap_possible = 0, credential_status = ?,
+         last_error_code = NULL, updated_at = ?, cursor_version = cursor_version + 1
+     WHERE project_id = ? AND repository_id = ? AND ref = ?
+       AND status = ? AND status <> 'paused' AND updated_at = ?
+       AND cursor_version = ? AND observed_sha IS ?
+       AND EXISTS (
+         SELECT 1 FROM repositories AS repository
+         WHERE repository.project_id = sync_cursors.project_id
+           AND repository.repository_id = sync_cursors.repository_id
+           AND lower(repository.provider) = 'github'
+           AND repository.sync_enabled = 1
+           AND repository.external_id = ?
+           AND repository.expected_owner_external_id IS ?
+           AND repository.owner = ? AND repository.name = ?
+           AND repository.default_branch IS ?
+           AND repository.tracked_refs_json = ?
+           AND repository.github_sync_configuration_version = ?
+           AND repository.updated_at = ?
+       )
+       AND EXISTS (
+         SELECT 1 FROM github_repository_sync_runs AS claimed_run
+         WHERE claimed_run.run_id IS ?
+           AND claimed_run.project_id = sync_cursors.project_id
+           AND claimed_run.repository_id = sync_cursors.repository_id
+           AND claimed_run.scheduled_for = ?
+           AND claimed_run.full_reconciliation = ?
+           AND claimed_run.claimed_ref = ?
+           AND claimed_run.claimed_head_manifest_id IS ?
+           AND claimed_run.claimed_head_version = ?
+           AND claimed_run.repository_configuration_version = ?
+           AND claimed_run.cursor_version = ?
+           AND claimed_run.claim_contract_version = 1
+           AND claimed_run.status = 'running'
+           AND claimed_run.lease_expires_at > ?
+           AND (
+             (
+               claimed_run.claimed_head_version = 0
+               AND claimed_run.claimed_head_manifest_id IS NULL
+               AND NOT EXISTS (
+                 SELECT 1 FROM github_tree_ref_heads AS current_head
+                 WHERE current_head.project_id = claimed_run.project_id
+                   AND current_head.repository_id = claimed_run.repository_id
+                   AND current_head.ref = claimed_run.claimed_ref
+               )
+             )
+             OR EXISTS (
+               SELECT 1 FROM github_tree_ref_heads AS current_head
+               WHERE current_head.project_id = claimed_run.project_id
+                 AND current_head.repository_id = claimed_run.repository_id
+                 AND current_head.ref = claimed_run.claimed_ref
+                 AND current_head.manifest_id IS
+                   claimed_run.claimed_head_manifest_id
+                 AND current_head.head_version =
+                   claimed_run.claimed_head_version
+             )
+           )
+       )`
   )
     .bind(
-      new Date(scheduledTime).toISOString(),
-      computeNextSyncAt(scheduledTime, rateLimit),
-      etag ?? null,
+      scheduledFor,
+      nextSyncAt,
+      normalizedEtag,
       credentialStatus,
-      new Date().toISOString(),
+      terminalAt,
       repository.project_id,
       repository.repository_id,
-      ref
-    )
-    .run();
+      ref,
+      repository.cursor_status,
+      repository.cursor_updated_at,
+      repository.cursor_version,
+      cursorSnapshot.observed_sha,
+      repository.external_id,
+      repository.expected_owner_external_id,
+      repository.owner,
+      repository.name,
+      repository.default_branch,
+      repository.tracked_refs_json,
+      repository.repository_configuration_version,
+      repository.repository_updated_at,
+      expectedRunId,
+      scheduledFor,
+      requiresFullReconciliation(scheduledTime, repository.last_sync_at) ? 1 : 0,
+      ref,
+      repository.selected_head_manifest_id,
+      repository.selected_head_version,
+      repository.repository_configuration_version,
+      repository.cursor_version,
+      terminalAt
+    );
+  let result: D1Result;
+  try {
+    result = await statement.run();
+  } catch (error) {
+    if (
+      await hasExactRecoveredUnchangedCursor(database, {
+        repository,
+        ref,
+        expectedRunId,
+        scheduledFor,
+        nextSyncAt,
+        etag: normalizedEtag,
+        credentialStatus,
+        terminalAt,
+        observedSha: cursorSnapshot.observed_sha,
+        expectedCursorVersion
+      })
+    ) {
+      return;
+    }
+    throw error;
+  }
+  if ((result.meta.changes ?? 0) !== 1) {
+    throw new GitHubSyncError("GITHUB_RECONCILIATION_REQUIRED");
+  }
 }
 
 function toSyncError(error: unknown): GitHubSyncError {

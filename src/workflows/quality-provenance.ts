@@ -10,7 +10,7 @@ export interface CandidateEvidenceRow {
   source_type: string | null;
 }
 
-interface ConsolidationSourceRow {
+export interface ConsolidationSourceRow {
   source_id: string;
   evidence_id: string | null;
   evidence_repository_id: string | null;
@@ -19,6 +19,11 @@ interface ConsolidationSourceRow {
   evidence_source_type: string | null;
   session_repository_id: string | null;
   session_repository_ref: string | null;
+}
+
+export interface ConsolidationEvidenceLink {
+  sourceId: string;
+  evidenceId: string;
 }
 
 interface ConsolidationScopeInput {
@@ -79,7 +84,6 @@ export function modelEvidenceSources(rows: readonly CandidateEvidenceRow[]): Arr
   evidence_source_id: string;
   source_type: string;
   repository_authority: string | null;
-  repository_ref: string | null;
   has_repository_context: boolean;
 }> {
   const sources = new Map<
@@ -88,7 +92,6 @@ export function modelEvidenceSources(rows: readonly CandidateEvidenceRow[]): Arr
       evidence_source_id: string;
       source_type: string;
       repository_authority: string | null;
-      repository_ref: string | null;
       has_repository_context: boolean;
     }
   >();
@@ -104,7 +107,6 @@ export function modelEvidenceSources(rows: readonly CandidateEvidenceRow[]): Arr
       evidence_source_id: row.evidence_id,
       source_type: row.source_type,
       repository_authority: row.repository_authority,
-      repository_ref: row.repository_ref,
       has_repository_context: row.repository_id !== null
     });
   }
@@ -115,7 +117,9 @@ export async function loadConsolidationSourceRows(
   database: D1Database,
   projectId: string,
   consolidationId: string,
-  sessionId: string
+  sessionId: string,
+  firstInputOrder: number,
+  lastInputOrder: number
 ): Promise<ConsolidationSourceRow[]> {
   const rows = await database.prepare(
     `SELECT frozen_input.source_id,
@@ -143,6 +147,7 @@ export async function loadConsolidationSourceRows(
       AND evidence_record.sensitivity_status = 'clear'
      WHERE frozen_input.project_id = ?
        AND frozen_input.consolidation_id = ?
+       AND frozen_input.input_order BETWEEN ? AND ?
        AND EXISTS (
          SELECT 1 FROM session_consolidations AS consolidation
          WHERE consolidation.project_id = frozen_input.project_id
@@ -151,7 +156,13 @@ export async function loadConsolidationSourceRows(
        )
      ORDER BY frozen_input.input_order ASC, evidence_record.evidence_id ASC`
   )
-    .bind(projectId, consolidationId, sessionId)
+    .bind(
+      projectId,
+      consolidationId,
+      firstInputOrder,
+      lastInputOrder,
+      sessionId
+    )
     .all<ConsolidationSourceRow>();
   return rows.results;
 }
@@ -159,7 +170,8 @@ export async function loadConsolidationSourceRows(
 export function buildConsolidationScopeEvidence(
   inputs: readonly ConsolidationScopeInput[],
   sourceRows: readonly ConsolidationSourceRow[],
-  session: SessionContextRow
+  session: SessionContextRow,
+  options: { requireActualCandidateEvidence?: boolean } = {}
 ): TrustedScopeEvidence[] {
   return inputs.flatMap((input) => {
     if (input.input_kind === "summary") {
@@ -177,13 +189,19 @@ export function buildConsolidationScopeEvidence(
     }
 
     const rows = sourceRows.filter((row) => row.source_id === input.source_id);
-    const trustedEvidenceRows = rows.filter((row) =>
-      hasTrustedEvidenceContext({
-        repository_id: row.evidence_repository_id,
-        repository_ref: row.evidence_repository_ref,
-        repository_authority: row.evidence_repository_authority
-      })
+    const trustedEvidenceRows = rows.filter(
+      (row) =>
+        (!options.requireActualCandidateEvidence ||
+          (row.evidence_id !== null && row.evidence_source_type !== null)) &&
+        hasTrustedEvidenceContext({
+          repository_id: row.evidence_repository_id,
+          repository_ref: row.evidence_repository_ref,
+          repository_authority: row.evidence_repository_authority
+        })
     );
+    if (options.requireActualCandidateEvidence && trustedEvidenceRows.length === 0) {
+      return [];
+    }
     const evidenceRepositoryIds = uniqueNonNull(
       trustedEvidenceRows.map((row) => row.evidence_repository_id)
     );
@@ -218,6 +236,38 @@ export function buildConsolidationScopeEvidence(
   });
 }
 
+export function trustedConsolidationEvidenceLinks(
+  rows: readonly ConsolidationSourceRow[],
+  sourceIds: readonly string[]
+): ConsolidationEvidenceLink[] {
+  const sourceOrder = new Map(sourceIds.map((sourceId, index) => [sourceId, index]));
+  const links = new Map<string, ConsolidationEvidenceLink>();
+  for (const row of rows) {
+    if (
+      !sourceOrder.has(row.source_id) ||
+      row.evidence_id === null ||
+      row.evidence_source_type === null ||
+      !hasTrustedEvidenceContext({
+        repository_id: row.evidence_repository_id,
+        repository_ref: row.evidence_repository_ref,
+        repository_authority: row.evidence_repository_authority
+      })
+    ) {
+      continue;
+    }
+    const key = `${row.source_id}\0${row.evidence_id}`;
+    links.set(key, { sourceId: row.source_id, evidenceId: row.evidence_id });
+  }
+  return [...links.values()].sort((left, right) => {
+    const sourceComparison =
+      (sourceOrder.get(left.sourceId) ?? Number.MAX_SAFE_INTEGER) -
+      (sourceOrder.get(right.sourceId) ?? Number.MAX_SAFE_INTEGER);
+    return sourceComparison === 0
+      ? stableStringCompare(left.evidenceId, right.evidenceId)
+      : sourceComparison;
+  });
+}
+
 function hasTrustedEvidenceContext(
   row: Pick<
     CandidateEvidenceRow,
@@ -232,4 +282,8 @@ function hasTrustedEvidenceContext(
 
 function uniqueNonNull(values: readonly (string | null)[]): string[] {
   return [...new Set(values.filter((value): value is string => value !== null))];
+}
+
+function stableStringCompare(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }

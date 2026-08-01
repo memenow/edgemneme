@@ -18,6 +18,26 @@ The token identifies one principal and project. Active D1 grants determine
 whether that principal is project-wide or limited to a repository. A project is
 a hard boundary: no tool or resource resolves data from another project.
 
+## Transport request limits
+
+The complete body of a `POST /mcp` request is limited to 2,097,152 request-body
+bytes visible to the Worker. This count is taken after Cloudflare transport
+handling and does not include HTTP chunk or frame overhead. The transport limit
+is independent of tool-field limits. For requests that reach the Worker, the
+gateway counts the actual request stream, so the same limit applies when
+`Content-Length` is absent or does not describe the delivered stream. A valid
+declared length larger than the limit is rejected before the body is read.
+
+`Content-Encoding` must be absent or contain only `identity`. Any compressed or
+otherwise encoded request body returns HTTP 415 without being decompressed. A
+declared or streamed body larger than 2 MiB returns HTTP 413. Rejections made by
+the Worker use a JSON-RPC error envelope with `id: null`, error code `-32600`,
+and the unified EdgeMneme `VALIDATION_FAILED` body in `error.data`. The response
+uses `Cache-Control: no-store`; an oversized request is not transient and does
+not include `Retry-After`. Cloudflare may reject malformed HTTP framing or
+headers before the request reaches the Worker; those platform responses are not
+part of the EdgeMneme JSON-RPC error contract.
+
 ## Tools
 
 | Tool | Required role | Purpose |
@@ -34,6 +54,11 @@ a hard boundary: no tool or resource resolves data from another project.
 Query mode defaults to five results and is capped at ten. Browse mode is capped
 at fifty. Pagination is keyset-based and uses an opaque HMAC token; offset
 pagination and server-side cursor sessions are not supported.
+
+`memory_search.filters.scope` and `memory_search.filters.scope_id` form one
+atomic filter. Callers must provide both fields or omit both fields in query and
+browse modes. Supplying either field alone returns `VALIDATION_FAILED` before
+search authorization or projection access.
 
 ### Repository-bound sessions
 
@@ -136,6 +161,19 @@ one guarded D1 batch. A non-project scope must resolve to one normalized
 repository, and evidence or session provenance from another repository rejects
 the approval. Only a project maintainer may generalize evidence into project
 memory. Rejection and request-changes decisions are immutable and audited.
+`candidate_review.candidate_id` accepts an ordinary UUID or the synchronizer's
+exact lowercase deletion-review identifier:
+
+```text
+github-path-absent-observation:<64 lowercase hex>:<64 lowercase hex>:<64 lowercase hex>
+```
+
+The deletion-review form is exactly 225 characters. It identifies a bodyless
+repository path-absence observation and may be rejected or returned for changes.
+It does not bypass formal-memory quality gates: approval still requires safe
+content, a complete taxonomy proposal, and clear cited evidence, so a bodyless
+or tombstone-only deletion observation cannot be promoted.
+
 When model analysis is unavailable, the candidate remains `pending_review` with
 no validated citation subset. A maintainer may approve that deferred candidate
 only by explicitly resubmitting `content`, `kind`, `memory_class`, `scope`, and

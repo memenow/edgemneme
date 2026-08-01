@@ -1,8 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
-import githubSyncWorker, {
+import { createGitHubRequestPacer } from "../src/github/client";
+import {
   classifyCredentialExpiration,
   isDailyFullReconciliation,
-  recordCredentialExpirationObservation
+  recordCredentialExpirationObservation,
+  runScheduledGitHubSync
 } from "../workers/github-sync/index";
 
 const REPOSITORY_SHA = "b".repeat(40);
@@ -288,23 +290,86 @@ function createScheduledDatabase(options: {
   expectedOwnerId?: number | null;
   leaveRunOpen?: boolean;
 } = {}) {
+  interface SyncCursorState {
+    observedSha: string | null;
+    etag: string | null;
+    status: string;
+    updatedAt: string;
+    version: number;
+    lastSyncAt: string | null;
+  }
+
+  interface SyncRunState {
+    runId: string;
+    projectId: string;
+    repositoryId: string;
+    scheduledFor: string;
+    fullReconciliation: number;
+    leaseExpiresAt: string;
+    claimedRef: string;
+    claimedHeadManifestId: string | null;
+    claimedHeadVersion: number;
+    repositoryConfigurationVersion: number;
+    cursorVersion: number;
+    status: "running" | "complete" | "failed";
+    completedAt: string | null;
+    errorCode: string | null;
+  }
+
+  interface ActivationWitnessState {
+    activationToken: string;
+    receiptId: string;
+    runId: string;
+    projectId: string;
+    repositoryId: string;
+    ref: string;
+    manifestId: string;
+    activationRequestDigest: string;
+  }
+
+  interface ActivationReceiptState {
+    receiptId: string;
+    activationToken: string;
+    projectId: string;
+    repositoryId: string;
+    ref: string;
+    manifestId: string;
+    runId: string;
+    expectedHeadManifestId: string | null;
+    expectedHeadVersion: number;
+    activatedHeadVersion: number;
+    expectedCursorObservedSha: string | null;
+    expectedCursorStatus: string;
+    expectedCursorUpdatedAt: string;
+    expectedCursorVersion: number;
+    expectedRepositoryConfigurationVersion: number;
+    expectedRepositoryUpdatedAt: string;
+    observedSha: string;
+    syncEventId: string;
+    syncEventPayloadDigest: string;
+    activationRequestDigest: string;
+    scheduledFor: string;
+    fullReconciliation: number;
+  }
+
   const retentionCursors = new Map([
     ["staging", { afterProjectId: "", afterManifestId: "", version: 0 }],
     ["failed", { afterProjectId: "", afterManifestId: "", version: 0 }]
   ]);
   const runKeys = new Set<string>();
   const runClaims: Array<{ key: string; fullReconciliation: number }> = [];
-  const activeRunByRepository = new Map<
-    string,
-    { runId: string; leaseExpiresAt: string }
-  >();
+  const runsById = new Map<string, SyncRunState>();
+  const activeRunByRepository = new Map<string, string>();
+  const activationWitnesses = new Map<string, ActivationWitnessState>();
+  const activationReceipts = new Map<string, ActivationReceiptState>();
   const finishedRuns: Array<{ status: string; errorCode: string | null }> = [];
   let lastCredentialStatus: string | null = null;
   let lastSyncError: string | null = null;
   let lastSyncCredentialStatus: string | null = null;
   let lastHistoryGapPossible: number | null = null;
-  let activeManifestId = "existing-manifest";
+  let activeManifestId = "a".repeat(64);
   let activeObservedSha = REPOSITORY_SHA;
+  let activeHeadVersion = 1;
   let stagedManifest: Record<string, unknown> | null = null;
   const repository = {
     repository_id: "repository-1",
@@ -316,8 +381,40 @@ function createScheduledDatabase(options: {
     owner: "memenow",
     name: "repository-42",
     default_branch: "main",
-    tracked_refs_json: "[]"
+    tracked_refs_json: "[]",
+    repository_configuration_version: 1,
+    repository_updated_at: "1970-01-01T00:00:00.000Z"
   };
+  const cursor: SyncCursorState = {
+    observedSha: REPOSITORY_SHA,
+    etag: '"ref-etag"',
+    status: "complete",
+    updatedAt: "1970-01-01T00:00:00.000Z",
+    version: 1,
+    lastSyncAt: null
+  };
+  const repositoryKey = `${repository.project_id}:${repository.repository_id}`;
+
+  const finishRun = (
+    runId: string,
+    status: "complete" | "failed",
+    errorCode: string | null,
+    completedAt: string
+  ): number => {
+    const run = runsById.get(runId);
+    if (run === undefined || run.status !== "running") {
+      return 0;
+    }
+    run.status = status;
+    run.completedAt = completedAt;
+    run.errorCode = errorCode;
+    if (activeRunByRepository.get(repositoryKey) === runId) {
+      activeRunByRepository.delete(repositoryKey);
+    }
+    finishedRuns.push({ status, errorCode });
+    return 1;
+  };
+
   const applyStatement = (statement: CapturedStatement) => {
     if (statement.sql.includes("UPDATE github_tree_manifest_retention_cursors")) {
       const lane = String(statement.bindings[2]);
@@ -349,32 +446,83 @@ function createScheduledDatabase(options: {
       statement.sql.includes("UPDATE github_repository_sync_runs") &&
       statement.sql.includes("last_error_code = 'GITHUB_RECONCILIATION_REQUIRED'")
     ) {
-      const cutoff = String(statement.bindings[3]);
+      const cutoff = String(statement.bindings[4]);
       let changes = 0;
-      for (const [repositoryKey, activeRun] of activeRunByRepository) {
-        if (activeRun.leaseExpiresAt <= cutoff) {
-          activeRunByRepository.delete(repositoryKey);
+      for (const [activeRepositoryKey, runId] of activeRunByRepository) {
+        const activeRun = runsById.get(runId);
+        if (
+          activeRun !== undefined &&
+          activeRun.status === "running" &&
+          activeRun.leaseExpiresAt <= cutoff
+        ) {
+          activeRun.status = "failed";
+          activeRunByRepository.delete(activeRepositoryKey);
           changes += 1;
         }
       }
       return { meta: { changes } };
     }
     if (statement.sql.includes("INSERT INTO github_repository_sync_runs")) {
-      const key = `${String(statement.bindings[1])}:${String(
-        statement.bindings[2]
-      )}:${String(statement.bindings[3])}`;
-      const repositoryKey = `${String(statement.bindings[1])}:${String(
-        statement.bindings[2]
-      )}`;
-      if (runKeys.has(key) || activeRunByRepository.has(repositoryKey)) {
+      const runId = String(statement.bindings[0]);
+      const claimProjectId = String(statement.bindings[6]);
+      const claimRepositoryId = String(statement.bindings[7]);
+      const claimRepositoryKey = `${claimProjectId}:${claimRepositoryId}`;
+      const key = `${claimRepositoryKey}:${String(statement.bindings[1])}`;
+      const activeRunId = activeRunByRepository.get(claimRepositoryKey);
+      const activeRun = activeRunId === undefined
+        ? undefined
+        : runsById.get(activeRunId);
+      const claimMatchesSelection =
+        claimProjectId === repository.project_id &&
+        claimRepositoryId === repository.repository_id &&
+        statement.bindings[8] === repository.external_id &&
+        statement.bindings[9] === repository.expected_owner_external_id &&
+        statement.bindings[10] === repository.owner &&
+        statement.bindings[11] === repository.name &&
+        statement.bindings[12] === repository.default_branch &&
+        statement.bindings[13] === repository.tracked_refs_json &&
+        statement.bindings[14] === repository.repository_configuration_version &&
+        statement.bindings[15] === repository.repository_updated_at &&
+        statement.bindings[16] === cursor.status &&
+        statement.bindings[17] === cursor.updatedAt &&
+        statement.bindings[18] === cursor.version &&
+        statement.bindings[19] === activeManifestId &&
+        statement.bindings[20] === activeHeadVersion;
+      if (
+        !claimMatchesSelection ||
+        runKeys.has(key) ||
+        (activeRun !== undefined &&
+          activeRun.status === "running" &&
+          activeRun.leaseExpiresAt > String(statement.bindings[21]))
+      ) {
         return { meta: { changes: 0 } };
       }
       runKeys.add(key);
-      activeRunByRepository.set(repositoryKey, {
-        runId: String(statement.bindings[0]),
-        leaseExpiresAt: String(statement.bindings[6])
+      const run: SyncRunState = {
+        runId,
+        projectId: claimProjectId,
+        repositoryId: claimRepositoryId,
+        scheduledFor: String(statement.bindings[1]),
+        fullReconciliation: Number(statement.bindings[2]),
+        leaseExpiresAt: String(statement.bindings[4]),
+        claimedRef: String(statement.bindings[5]),
+        claimedHeadManifestId:
+          statement.bindings[19] === null
+            ? null
+            : String(statement.bindings[19]),
+        claimedHeadVersion: Number(statement.bindings[20]),
+        repositoryConfigurationVersion: Number(statement.bindings[14]),
+        cursorVersion: Number(statement.bindings[18]),
+        status: "running",
+        completedAt: null,
+        errorCode: null
+      };
+      runsById.set(runId, run);
+      activeRunByRepository.set(claimRepositoryKey, runId);
+      runClaims.push({
+        key,
+        fullReconciliation: run.fullReconciliation
       });
-      runClaims.push({ key, fullReconciliation: Number(statement.bindings[4]) });
       return { meta: { changes: 1 } };
     }
     if (statement.sql.includes("INSERT INTO github_tree_manifests")) {
@@ -402,33 +550,194 @@ function createScheduledDatabase(options: {
       };
       return { meta: { changes: 1 } };
     }
+    if (statement.sql.includes("INSERT INTO github_tree_activation_witnesses")) {
+      const witness: ActivationWitnessState = {
+        activationToken: String(statement.bindings[0]),
+        receiptId: String(statement.bindings[1]),
+        runId: String(statement.bindings[2]),
+        projectId: String(statement.bindings[3]),
+        repositoryId: String(statement.bindings[4]),
+        ref: String(statement.bindings[5]),
+        manifestId: String(statement.bindings[6]),
+        activationRequestDigest: String(statement.bindings[7])
+      };
+      const run = runsById.get(witness.runId);
+      if (
+        run === undefined ||
+        run.status !== "running" ||
+        run.projectId !== witness.projectId ||
+        run.repositoryId !== witness.repositoryId ||
+        run.claimedRef !== witness.ref
+      ) {
+        return { meta: { changes: 0 } };
+      }
+      activationWitnesses.set(witness.activationToken, witness);
+      return { meta: { changes: 1 } };
+    }
     if (statement.sql.includes("INSERT INTO github_tree_ref_heads")) {
+      const witness = [...activationWitnesses.values()].find(
+        (candidate) =>
+          candidate.projectId === statement.bindings[0] &&
+          candidate.repositoryId === statement.bindings[1] &&
+          candidate.ref === statement.bindings[2] &&
+          candidate.manifestId === statement.bindings[3]
+      );
+      const run = witness === undefined ? undefined : runsById.get(witness.runId);
+      if (
+        run === undefined ||
+        run.status !== "running" ||
+        run.claimedHeadManifestId !== activeManifestId ||
+        run.claimedHeadVersion !== activeHeadVersion
+      ) {
+        return { meta: { changes: 0 } };
+      }
       activeManifestId = String(statement.bindings[3]);
       activeObservedSha = String(stagedManifest?.observed_sha ?? activeObservedSha);
+      activeHeadVersion += 1;
+      return { meta: { changes: 1 } };
+    }
+    if (
+      statement.sql.includes("UPDATE sync_cursors") &&
+      statement.sql.includes("SET observed_sha = ?")
+    ) {
+      cursor.observedSha = String(statement.bindings[0]);
+      cursor.lastSyncAt = String(statement.bindings[1]);
+      cursor.status = "observed";
+      cursor.etag = statement.bindings[5] === null
+        ? null
+        : String(statement.bindings[5]);
+      cursor.updatedAt = String(statement.bindings[6]);
+      cursor.version = Number(statement.bindings[13]) + 1;
+      lastSyncError = null;
+      lastHistoryGapPossible = Number(statement.bindings[3]);
+      lastSyncCredentialStatus = String(statement.bindings[4]);
+      return { meta: { changes: 1 } };
+    }
+    if (
+      statement.sql.includes("UPDATE github_repository_sync_runs") &&
+      statement.sql.includes("SET status = 'complete'")
+    ) {
+      const runId = String(statement.bindings[1]);
+      const witness = activationWitnesses.get(String(statement.bindings[18]));
+      const run = runsById.get(runId);
+      if (
+        witness === undefined ||
+        witness.receiptId !== statement.bindings[19] ||
+        witness.runId !== runId ||
+        run === undefined ||
+        run.status !== "running" ||
+        activeManifestId !== statement.bindings[16] ||
+        activeHeadVersion !== statement.bindings[17] ||
+        cursor.observedSha !== statement.bindings[13] ||
+        cursor.updatedAt !== statement.bindings[14] ||
+        cursor.version !== statement.bindings[15]
+      ) {
+        return { meta: { changes: 0 } };
+      }
+      return {
+        meta: {
+          changes: finishRun(
+            runId,
+            "complete",
+            null,
+            String(statement.bindings[0])
+          )
+        }
+      };
+    }
+    if (statement.sql.includes("INSERT INTO github_tree_activation_receipts")) {
+      const receipt: ActivationReceiptState = {
+        receiptId: String(statement.bindings[0]),
+        activationToken: String(statement.bindings[1]),
+        projectId: String(statement.bindings[2]),
+        repositoryId: String(statement.bindings[3]),
+        ref: String(statement.bindings[4]),
+        manifestId: String(statement.bindings[5]),
+        runId: String(statement.bindings[6]),
+        expectedHeadManifestId:
+          statement.bindings[7] === null ? null : String(statement.bindings[7]),
+        expectedHeadVersion: Number(statement.bindings[8]),
+        activatedHeadVersion: Number(statement.bindings[9]),
+        expectedCursorObservedSha:
+          statement.bindings[10] === null
+            ? null
+            : String(statement.bindings[10]),
+        expectedCursorStatus: String(statement.bindings[11]),
+        expectedCursorUpdatedAt: String(statement.bindings[12]),
+        expectedCursorVersion: Number(statement.bindings[13]),
+        expectedRepositoryConfigurationVersion: Number(statement.bindings[15]),
+        expectedRepositoryUpdatedAt: String(statement.bindings[16]),
+        observedSha: String(statement.bindings[17]),
+        syncEventId: String(statement.bindings[18]),
+        syncEventPayloadDigest: String(statement.bindings[19]),
+        activationRequestDigest: String(statement.bindings[20]),
+        scheduledFor: String(statement.bindings[21]),
+        fullReconciliation: Number(statement.bindings[22])
+      };
+      const witness = activationWitnesses.get(receipt.activationToken);
+      const run = runsById.get(receipt.runId);
+      if (
+        witness === undefined ||
+        witness.receiptId !== receipt.receiptId ||
+        witness.activationRequestDigest !== receipt.activationRequestDigest ||
+        run?.status !== "complete" ||
+        activeManifestId !== receipt.manifestId ||
+        activeHeadVersion !== receipt.activatedHeadVersion ||
+        cursor.observedSha !== receipt.observedSha ||
+        cursor.version !== Number(statement.bindings[14])
+      ) {
+        throw new Error("GitHub tree activation receipt final state is invalid");
+      }
+      activationReceipts.set(receipt.receiptId, receipt);
       return { meta: { changes: 1 } };
     }
     if (
       statement.sql.includes("UPDATE github_repository_sync_runs") &&
       statement.sql.includes("SET status = ?")
     ) {
-      finishedRuns.push({
-        status: String(statement.bindings[0]),
-        errorCode:
-          statement.bindings[2] === null ? null : String(statement.bindings[2])
-      });
-      if (options.leaveRunOpen !== true) {
-        for (const [repositoryKey, activeRun] of activeRunByRepository) {
-          if (activeRun.runId === statement.bindings[3]) {
-            activeRunByRepository.delete(repositoryKey);
-          }
-        }
+      if (options.leaveRunOpen === true) {
+        return { meta: { changes: 0 } };
       }
-      return { meta: { changes: options.leaveRunOpen === true ? 0 : 1 } };
+      const status = String(statement.bindings[0]) as "complete" | "failed";
+      return {
+        meta: {
+          changes: finishRun(
+            String(statement.bindings[3]),
+            status,
+            statement.bindings[2] === null ? null : String(statement.bindings[2]),
+            String(statement.bindings[1])
+          )
+        }
+      };
+    }
+    if (
+      statement.sql.includes("WITH configured AS") &&
+      statement.sql.includes("INSERT INTO sync_cursors")
+    ) {
+      return { meta: { changes: 1 } };
+    }
+    if (
+      statement.sql.includes("UPDATE sync_cursors") &&
+      statement.sql.includes("SET status = 'complete'")
+    ) {
+      cursor.status = "complete";
+      cursor.lastSyncAt = String(statement.bindings[0]);
+      cursor.etag = statement.bindings[2] === null
+        ? null
+        : String(statement.bindings[2]);
+      cursor.updatedAt = String(statement.bindings[4]);
+      cursor.version += 1;
+      lastSyncError = null;
+      lastSyncCredentialStatus = String(statement.bindings[3]);
+      return { meta: { changes: 1 } };
     }
     if (statement.sql.includes("INSERT INTO sync_cursors")) {
       if (statement.sql.includes("'failed'")) {
         lastSyncError = String(statement.bindings[5]);
         lastSyncCredentialStatus = String(statement.bindings[6]);
+        cursor.status = "failed";
+        cursor.updatedAt = String(statement.bindings[7]);
+        cursor.version += 1;
       } else {
         lastSyncError = null;
         lastHistoryGapPossible = Number(statement.bindings[6]);
@@ -462,10 +771,24 @@ function createScheduledDatabase(options: {
             '[{"id":42,"permissions":{"pull":true,"push":false,"admin":false}}]'
         };
       }
+      if (sql.includes("SELECT completed_at FROM github_repository_sync_runs")) {
+        const run = runsById.get(String(statement.bindings[0]));
+        return run !== undefined &&
+          run.status === statement.bindings[1] &&
+          run.errorCode === statement.bindings[2]
+          ? { completed_at: run.completedAt }
+          : null;
+      }
       if (
-        sql.includes("SELECT head.manifest_id, manifest.observed_sha")
+        sql.includes(
+          "SELECT head.manifest_id, head.head_version, manifest.observed_sha"
+        )
       ) {
-        return { manifest_id: activeManifestId, observed_sha: activeObservedSha };
+        return {
+          manifest_id: activeManifestId,
+          head_version: activeHeadVersion,
+          observed_sha: activeObservedSha
+        };
       }
       if (sql.includes("FROM github_tree_manifests") && sql.includes("collection_key")) {
         return stagedManifest;
@@ -482,22 +805,88 @@ function createScheduledDatabase(options: {
       if (sql.includes("SELECT head.manifest_id, cursor.observed_sha")) {
         return { manifest_id: activeManifestId, observed_sha: activeObservedSha };
       }
-      if (sql.includes("FROM sync_cursors")) {
-        return { observed_sha: REPOSITORY_SHA, etag: '"ref-etag"' };
+      if (sql.includes("FROM github_tree_activation_receipts")) {
+        const receipt = activationReceipts.get(String(statement.bindings[0]));
+        if (
+          receipt === undefined ||
+          receipt.activationToken !== statement.bindings[1] ||
+          receipt.projectId !== statement.bindings[2] ||
+          receipt.repositoryId !== statement.bindings[3] ||
+          receipt.ref !== statement.bindings[4] ||
+          receipt.manifestId !== statement.bindings[5] ||
+          receipt.runId !== statement.bindings[6] ||
+          receipt.expectedHeadManifestId !== statement.bindings[7] ||
+          receipt.expectedHeadVersion !== statement.bindings[8] ||
+          receipt.activatedHeadVersion !== statement.bindings[9] ||
+          receipt.expectedCursorObservedSha !== statement.bindings[10] ||
+          receipt.expectedCursorStatus !== statement.bindings[11] ||
+          receipt.expectedCursorUpdatedAt !== statement.bindings[12] ||
+          receipt.expectedCursorVersion !== statement.bindings[13] ||
+          receipt.expectedRepositoryConfigurationVersion !== statement.bindings[14] ||
+          receipt.expectedRepositoryUpdatedAt !== statement.bindings[15] ||
+          receipt.observedSha !== statement.bindings[16] ||
+          receipt.syncEventId !== statement.bindings[17] ||
+          receipt.syncEventPayloadDigest !== statement.bindings[18] ||
+          receipt.activationRequestDigest !== statement.bindings[19] ||
+          receipt.scheduledFor !== statement.bindings[20] ||
+          receipt.fullReconciliation !== statement.bindings[21]
+        ) {
+          return null;
+        }
+        return { receipt_id: receipt.receiptId };
+      }
+      if (sql.includes("SELECT observed_sha, etag FROM sync_cursors")) {
+        return { observed_sha: cursor.observedSha, etag: cursor.etag };
       }
       return null;
     });
-    statement.all = vi.fn().mockImplementation(async () => ({
-      results: sql.includes("FROM repositories") ? [repository] : []
-    }));
+    statement.all = vi.fn().mockImplementation(async () => {
+      if (sql.includes("FROM repositories")) {
+        return { results: [repository] };
+      }
+      if (sql.includes("ROW_NUMBER() OVER")) {
+        const configured = JSON.parse(
+          String(statement.bindings[0])
+        ) as Array<{ repository_id: string; ref: string }>;
+        const selected = configured.find(
+          (candidate) => candidate.repository_id === repository.repository_id
+        );
+        return {
+          results:
+            selected === undefined
+              ? []
+              : [
+                  {
+                    ...repository,
+                    ref: selected.ref,
+                    cursor_status: cursor.status,
+                    cursor_updated_at: cursor.updatedAt,
+                    cursor_version: cursor.version,
+                    selected_head_manifest_id: activeManifestId,
+                    selected_head_version: activeHeadVersion,
+                    last_sync_at: cursor.lastSyncAt ?? String(statement.bindings[1])
+                  }
+                ]
+        };
+      }
+      return { results: [] };
+    });
     return statement;
   };
   const database = {
     withSession: vi.fn().mockReturnValue({ prepare }),
     prepare: vi.fn().mockImplementation(prepare),
-    batch: vi.fn().mockImplementation(async (statements: CapturedStatement[]) =>
-      statements.map(applyStatement)
-    )
+    batch: vi.fn().mockImplementation(async (statements: CapturedStatement[]) => {
+      if (
+        options.leaveRunOpen === true &&
+        statements.some((statement) =>
+          statement.sql.includes("INSERT INTO github_tree_activation_witnesses")
+        )
+      ) {
+        return statements.map(() => ({ meta: { changes: 0 } }));
+      }
+      return statements.map(applyStatement);
+    })
   } as unknown as D1Database;
   return {
     database,
@@ -609,7 +998,7 @@ async function runScheduled(
 ): Promise<void> {
   vi.stubGlobal("fetch", fetcher);
   try {
-    await githubSyncWorker.scheduled(
+    await runScheduledGitHubSync(
       { scheduledTime } as ScheduledController,
       {
         MEMORY_DB: database,
@@ -617,7 +1006,7 @@ async function runScheduled(
         GITHUB_CLASSIC_TOKEN: "synthetic-token",
         GITHUB_CREDENTIAL_VERSION: CREDENTIAL_VERSION
       },
-      {} as ExecutionContext
+      { beforeRequest: createGitHubRequestPacer({ minimumIntervalMs: 0 }) }
     );
   } finally {
     vi.unstubAllGlobals();

@@ -64,14 +64,12 @@ describe("quality workflow provenance", () => {
         evidence_source_id: "project-evidence",
         source_type: "repository_file",
         repository_authority: null,
-        repository_ref: null,
         has_repository_context: false
       },
       {
         evidence_source_id: "repository-evidence",
         source_type: "repository_file",
         repository_authority: "default_branch",
-        repository_ref: "refs/heads/main",
         has_repository_context: true
       }
     ]);
@@ -181,13 +179,20 @@ describe("quality workflow provenance", () => {
         database,
         "project-1",
         "consolidation-1",
-        "session-1"
+        "session-1",
+        50,
+        99
       )
     ).resolves.toEqual([sourceRow({ source_id: "candidate-1" })]);
     expect(records[0]?.bindings).toEqual(["project-1"]);
+    expect(records[1]?.sql).toContain(
+      "frozen_input.input_order BETWEEN ? AND ?"
+    );
     expect(records[1]?.bindings).toEqual([
       "project-1",
       "consolidation-1",
+      50,
+      99,
       "session-1"
     ]);
   });

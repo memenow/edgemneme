@@ -15,7 +15,12 @@ const AUTHORITY_MIGRATIONS = [
   "migrations/0010_github_credential_expiry_and_repository_identity.sql",
   "migrations/0011_github_tree_manifests.sql",
   "migrations/0012_projection_rebuild_outbox_index.sql",
-  "migrations/0013_projection_rebuild_unknown_status.sql"
+  "migrations/0013_projection_rebuild_unknown_status.sql",
+  "migrations/0014_ordinary_workflow_reconciliation_index.sql",
+  "migrations/0015_github_sync_default_branch.sql",
+  "migrations/0016_consolidation_lease.sql",
+  "migrations/0017_github_sync_activation_receipts.sql",
+  "migrations/0018_consolidation_batch_receipts.sql"
 ] as const;
 
 const SEARCH_MIGRATIONS = [
@@ -869,7 +874,7 @@ describe("authoritative D1 migrations", () => {
          WHERE project_id = 'project-1' AND repository_id = 'repository-1'
            AND ref = 'refs/heads/main'`
       ).run()
-    ).toThrow(/ref scope ownership is referenced/iu);
+    ).toThrow(/GitHub sync cursors cannot be deleted/iu);
     expectSqlError(
       database,
       "DELETE FROM sessions WHERE session_id = 'session-owned'",
@@ -946,6 +951,262 @@ describe("authoritative D1 migrations", () => {
     ).toEqual({ count: 1 });
     expect(database.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
     expect(database.prepare("PRAGMA quick_check").get()).toEqual({ quick_check: "ok" });
+  });
+
+  it("keeps the activation migration compatible with old sync writers and fences ABA", () => {
+    const database = new DatabaseSync(":memory:");
+    database.exec("PRAGMA foreign_keys = ON");
+    applyAuthorityMigrations(database, 16);
+    seedGitHubActivationMigrationFixture(database);
+    database.exec(`
+      INSERT INTO github_repository_sync_runs
+        (run_id, project_id, repository_id, scheduled_for,
+         full_reconciliation, status, started_at, lease_expires_at)
+      VALUES
+        ('legacy-run', 'activation-project', 'activation-repository',
+         '2026-07-30T00:00:00.000Z', 0, 'running',
+         '2026-07-30T00:00:00.000Z', '2099-01-01T00:00:00.000Z');
+    `);
+
+    applyMigrationAtomically(
+      database,
+      "migrations/0017_github_sync_activation_receipts.sql"
+    );
+    const witnessCleanupPlan = database
+      .prepare(
+        `EXPLAIN QUERY PLAN
+         SELECT activation_token
+         FROM github_tree_activation_witnesses
+         WHERE project_id = ?
+         ORDER BY created_at, activation_token`
+      )
+      .all("activation-project") as Array<{ detail: string }>;
+    expect(witnessCleanupPlan.map((row) => row.detail).join("\n")).toMatch(
+      /github_tree_activation_witnesses_by_project/iu
+    );
+    expect(
+      database
+        .prepare(
+          `SELECT claim_contract_version, claimed_ref,
+                  repository_configuration_version, cursor_version
+           FROM github_repository_sync_runs WHERE run_id = 'legacy-run'`
+        )
+        .get()
+    ).toEqual({
+      claim_contract_version: 0,
+      claimed_ref: null,
+      repository_configuration_version: null,
+      cursor_version: null
+    });
+    expect(() =>
+      database.exec(`
+        UPDATE repositories
+        SET tracked_refs_json = '["refs/heads/feature"]'
+        WHERE project_id = 'activation-project'
+          AND repository_id = 'activation-repository';
+        UPDATE sync_cursors
+        SET updated_at = '2026-07-30T00:00:01.000Z'
+        WHERE project_id = 'activation-project'
+          AND repository_id = 'activation-repository'
+          AND ref = 'refs/heads/main';
+        UPDATE github_repository_sync_runs
+        SET status = 'complete', completed_at = '2026-07-30T00:00:01.000Z'
+        WHERE run_id = 'legacy-run';
+      `)
+    ).not.toThrow();
+    expect(
+      database
+        .prepare(
+          `SELECT
+             (SELECT github_sync_configuration_version FROM repositories
+              WHERE repository_id = 'activation-repository') AS repository_version,
+             (SELECT cursor_version FROM sync_cursors
+              WHERE repository_id = 'activation-repository'
+                AND ref = 'refs/heads/main') AS cursor_version`
+        )
+        .get()
+    ).toEqual({ repository_version: 2, cursor_version: 2 });
+    expect(() =>
+      database.exec(
+        `UPDATE github_repository_sync_runs
+         SET scheduled_for = '2026-07-30T06:00:00.000Z'
+         WHERE run_id = 'legacy-run'`
+      )
+    ).toThrow(/sync run claim is immutable/iu);
+    expect(() =>
+      database.exec(
+        `UPDATE github_repository_sync_runs
+         SET status = 'running', completed_at = NULL
+         WHERE run_id = 'legacy-run'`
+      )
+    ).toThrow(/sync run is terminal/iu);
+    expect(() =>
+      database.exec(
+        `DELETE FROM sync_cursors
+         WHERE project_id = 'activation-project'
+           AND repository_id = 'activation-repository'
+           AND ref = 'refs/heads/main'`
+      )
+    ).toThrow(/sync cursors cannot be deleted/iu);
+    expect(() =>
+      database.exec(
+        `INSERT INTO sync_cursors
+          (project_id, repository_id, ref, status, credential_status,
+           history_gap_possible, updated_at, cursor_version)
+         VALUES
+          ('activation-project', 'activation-repository', 'refs/heads/feature',
+           'idle', 'active', 0, '2026-07-30T00:00:02.000Z', 2)`
+      )
+    ).toThrow(/initial version must be one/iu);
+    expect(schemaObjectCount(
+      database,
+      "table",
+      "github_sync_activation_schema_preflight"
+    )).toBe(0);
+    expect(database.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
+  });
+
+  it("keeps GitHub sync runs append-only outside synthetic cleanup", () => {
+    const database = new DatabaseSync(":memory:");
+    database.exec("PRAGMA foreign_keys = ON");
+    applyAuthorityMigrations(database);
+    seedGitHubActivationMigrationFixture(database);
+    seedSyntheticAuthority(database);
+    database.exec(`
+      INSERT INTO github_repository_sync_runs
+        (run_id, project_id, repository_id, scheduled_for,
+         full_reconciliation, status, started_at, lease_expires_at,
+         claimed_ref, claimed_head_manifest_id, claimed_head_version,
+         repository_configuration_version, cursor_version,
+         claim_contract_version)
+      VALUES
+        ('ordinary-claimed-run', 'activation-project', 'activation-repository',
+         '2026-07-30T00:00:00.000Z', 0, 'running',
+         '2026-07-30T00:00:00.000Z', '2099-01-01T00:00:00.000Z',
+         'refs/heads/main', NULL, 0, 1, 1, 1);
+      INSERT INTO synthetic_cleanup_registry
+        (project_id, principal_id, expires_at, created_at)
+      VALUES
+        ('synthetic-project', 'synthetic-principal',
+         '2026-07-26T00:00:00.000Z', '2026-07-25T00:00:00.000Z');
+      INSERT INTO repositories
+        (repository_id, project_id, provider, external_id,
+         expected_owner_external_id, owner, name, default_branch,
+         tracked_refs_json, sync_enabled, created_at, updated_at)
+      VALUES
+        ('synthetic-repository', 'synthetic-project', 'github', 9301, 7,
+         'owner', 'synthetic-repository', 'main', '[]', 1,
+         '2026-07-25T00:00:00.000Z', '2026-07-25T00:00:00.000Z');
+      INSERT INTO github_repository_sync_runs
+        (run_id, project_id, repository_id, scheduled_for,
+         full_reconciliation, status, started_at, lease_expires_at)
+      VALUES
+        ('synthetic-run', 'synthetic-project', 'synthetic-repository',
+         '2026-07-25T00:00:00.000Z', 0, 'running',
+         '2026-07-25T00:00:00.000Z', '2026-07-25T00:15:00.000Z');
+    `);
+
+    expect(() =>
+      database.exec(
+        "DELETE FROM github_repository_sync_runs " +
+          "WHERE run_id = 'ordinary-claimed-run'"
+      )
+    ).toThrow(/GitHub repository sync runs cannot be deleted/iu);
+    expect(() =>
+      database.exec(
+        "DELETE FROM github_repository_sync_runs WHERE run_id = 'synthetic-run'"
+      )
+    ).not.toThrow();
+    expect(
+      database
+        .prepare(
+          `SELECT COUNT(*) AS count FROM github_repository_sync_runs
+           WHERE run_id = 'synthetic-run'`
+        )
+        .get()
+    ).toEqual({ count: 0 });
+    expect(database.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
+  });
+
+  it("requires GitHub repository configuration versions to start at one", () => {
+    const database = new DatabaseSync(":memory:");
+    database.exec("PRAGMA foreign_keys = ON");
+    applyAuthorityMigrations(database);
+    seedGitHubActivationMigrationFixture(database);
+
+    expect(() =>
+      database.exec(`
+        INSERT INTO repositories
+          (repository_id, project_id, provider, external_id,
+           expected_owner_external_id, owner, name, default_branch,
+           tracked_refs_json, sync_enabled, created_at, updated_at,
+           github_sync_configuration_version)
+        VALUES
+          ('repository-invalid-version', 'activation-project', 'github', 302, 7,
+           'owner', 'invalid-version', 'main', '[]', 1,
+           '2026-07-30T00:00:00.000Z', '2026-07-30T00:00:00.000Z', 2)
+      `)
+    ).toThrow(/GitHub repository configuration initial version must be one/iu);
+    database.exec(`
+      INSERT INTO repositories
+        (repository_id, project_id, provider, external_id,
+         expected_owner_external_id, owner, name, default_branch,
+         tracked_refs_json, sync_enabled, created_at, updated_at)
+      VALUES
+        ('repository-default-version', 'activation-project', 'github', 303, 7,
+         'owner', 'default-version', 'main', '[]', 1,
+         '2026-07-30T00:00:00.000Z', '2026-07-30T00:00:00.000Z')
+    `);
+    expect(
+      database
+        .prepare(
+          `SELECT github_sync_configuration_version AS version
+           FROM repositories WHERE repository_id = 'repository-default-version'`
+        )
+        .get()
+    ).toEqual({ version: 1 });
+    expect(database.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
+  });
+
+  it("rejects a legacy head version that JavaScript cannot fence exactly", () => {
+    const database = new DatabaseSync(":memory:");
+    database.exec("PRAGMA foreign_keys = ON");
+    applyAuthorityMigrations(database, 16);
+    seedGitHubActivationMigrationFixture(database);
+    database.exec(`
+      INSERT INTO github_tree_manifests
+        (manifest_id, project_id, repository_id, ref, observed_sha, tree_sha,
+         repository_authority, collection_key, status, created_at)
+      VALUES
+        ('${"a".repeat(64)}', 'activation-project', 'activation-repository',
+         'refs/heads/main', '${"b".repeat(40)}', '${"c".repeat(40)}',
+         'default_branch', '2026-07-30T00:00:00.000Z', 'staging',
+         '2026-07-30T00:00:00.000Z');
+      UPDATE github_tree_manifests
+      SET status = 'complete', entry_count = 0,
+          entries_checksum = '${"d".repeat(64)}',
+          completed_at = '2026-07-30T00:00:00.000Z'
+      WHERE manifest_id = '${"a".repeat(64)}';
+      INSERT INTO github_tree_ref_heads
+        (project_id, repository_id, ref, manifest_id, head_version,
+         activated_at, updated_at)
+      VALUES
+        ('activation-project', 'activation-repository', 'refs/heads/main',
+         '${"a".repeat(64)}', 9007199254740992,
+         '2026-07-30T00:00:00.000Z', '2026-07-30T00:00:00.000Z');
+    `);
+
+    expect(() =>
+      applyMigrationAtomically(
+        database,
+        "migrations/0017_github_sync_activation_receipts.sql"
+      )
+    ).toThrow(/invalid_head_version_count/iu);
+    expect(schemaObjectCount(
+      database,
+      "table",
+      "github_tree_activation_receipts"
+    )).toBe(0);
   });
 });
 
@@ -1404,6 +1665,31 @@ function seedRepositoryAuthority(database: DatabaseSync): void {
     VALUES
       ('repository-1', 'project-1', 'github', 301, 'owner', 'one', '${now}', '${now}'),
       ('repository-2', 'project-2', 'github', 302, 'owner', 'two', '${now}', '${now}');
+  `);
+}
+
+function seedGitHubActivationMigrationFixture(database: DatabaseSync): void {
+  const now = "2026-07-30T00:00:00.000Z";
+  database.exec(`
+    INSERT INTO projects
+      (project_id, project_ref, locator, display_name, project_version,
+       created_at, updated_at)
+    VALUES
+      ('activation-project', 'activation-project', 'activation-project',
+       'Activation Project', 0, '${now}', '${now}');
+    INSERT INTO repositories
+      (repository_id, project_id, provider, external_id,
+       expected_owner_external_id, owner, name, default_branch,
+       tracked_refs_json, sync_enabled, created_at, updated_at)
+    VALUES
+      ('activation-repository', 'activation-project', 'github', 301, 7,
+       'owner', 'repository', 'main', '[]', 1, '${now}', '${now}');
+    INSERT INTO sync_cursors
+      (project_id, repository_id, ref, status, history_gap_possible,
+       credential_status, updated_at)
+    VALUES
+      ('activation-project', 'activation-repository', 'refs/heads/main',
+       'idle', 0, 'active', '${now}');
   `);
 }
 

@@ -21,6 +21,15 @@
    memory belongs to exactly one normalized repository context.
 8. Repository evidence cannot be promoted into another repository. Cross-project
    reads, writes, promotion, search, and projection reuse are forbidden.
+9. Session consolidation is complete only after every deterministic model batch
+   has an immutable, fenced D1 receipt, including batches with no suggestions.
+10. A GitHub Cron invocation only schedules durable work. Per-ref Workflow items,
+    the credential lane, activation receipts, and terminal receipts remain the
+    authoritative execution record across retries and control-plane ambiguity.
+11. The protected deployment and migration Actions may reconcile only GitHub
+    synchronization ledgers, and only after proving an exact disabled Worker,
+    an empty schedule, and no nonterminal GitHub Workflow. This operational D1
+    writer cannot create or change formal memory.
 
 ## Project and repository isolation
 
@@ -85,17 +94,37 @@ Cloudflare Cron (* * * * * UTC)
 
 Cloudflare Cron (0 */6 * * * UTC)
   -> github-sync
-     -> fixed-origin GitHub REST GET client
-     -> account repository-access and credential-expiry gate
-     -> repository and owner numeric-identity gate
-     -> per-repository lease and daily current-tree reconciliation
-     -> staged checksummed D1 tree manifest covering every blob entry
-     -> 16 KiB size gate or GITHUB_PARTIAL_SYNC
-     -> secret, PII, prompt, log, and path gate
-     -> evidence-linked candidate or bodyless sensitive-content tombstone
-     -> atomic manifest-head/cursor CAS and stable path delta
-        -> deletion evidence plus pending maintainer review, never a formal-memory write
-     -> Queue event and MemoryWorkflow review state
+     -> create or recover one stable dispatch Workflow and one retention Workflow
+
+GitHubDispatchWorkflow
+  -> account repository-access and credential-expiry gate through the D1 PAT lane
+  -> materialize every due ref as an identity-frozen D1 dispatch item
+  -> seal the exact item count with an immutable materialization receipt
+  -> create GitHubRefSyncWorkflow children in batches of at most 100
+
+GitHubRefSyncWorkflow (one bounded ref attempt)
+  -> acquire the fenced D1 credential lane
+  -> fixed-origin GitHub REST GET client
+  -> repository and owner numeric-identity gate
+  -> daily or ancestry-gap current-tree reconciliation
+  -> staged checksummed D1 tree manifest covering every blob entry
+  -> 16 KiB per-blob, 2,000-text-file, 16 MiB, and request/deadline gates
+  -> secret, PII, prompt, log, and path gate
+  -> evidence-linked candidate or bodyless sensitive-content tombstone
+  -> atomic manifest-head/cursor CAS and stable path delta
+     -> deletion evidence plus pending maintainer review, never a formal-memory write
+  -> immutable terminal receipt and durable D1 review outbox event
+     -> later memory-orchestrator Queue dispatch
+
+GitHubRetentionWorkflow
+  -> independently purge eligible failed manifests in bounded D1 transactions
+
+Protected deployment or migration Action (GitHub sync disabled)
+  -> prove exact disabled Worker, empty Cron schedule, and no nonterminal Workflow
+  -> reconcile only GitHub synchronization ledgers through receipt-fenced D1 writes
+  -> revalidate the control plane and require two fenced zero-work observations
+     60 seconds apart
+  -> keep the post-backup migration gate read-only
 ```
 
 Complete GitHub tree manifests, their entries, and deltas are immutable. A
@@ -115,8 +144,12 @@ added/changed/deleted deltas, deletion evidence, deletion observations, review
 requests, and synchronization outbox event commit in one D1 batch. A truncated
 tree, content-policy partial result, request-budget failure, checksum mismatch,
 stale head, or failed batch leaves the previous head and cursor intact.
-The daily collection key includes the scheduled time, so a 00:00 UTC pass can
-detect path deletion even when the commit SHA did not change.
+The normalized scheduled slot and each ref's last successful synchronization
+freeze `full_reconciliation` on the dispatch item. The first due item for a ref
+in each UTC day performs a complete current-tree comparison even when its child
+starts later. If the midnight trigger is missed, the next dispatcher backfills
+the requirement. Force-pushes and ancestry gaps also require full
+reconciliation and preserve `history_gap_possible`.
 
 ## Formal write protocol
 
@@ -135,6 +168,29 @@ zero-row update:
 
 D1 rolls back the entire batch if either trigger aborts. The caller receives
 `VERSION_CONFLICT` and must reread before retrying.
+
+## Consolidation batch protocol
+
+Session consolidation claims one row with an owner, unique claim ID, monotonic
+lease epoch, and operation witness. The Workflow freezes the input buckets and
+runs every bucket in a separately named, deterministic step. Before each batch
+it renews a 20-minute lease; the batch itself has a 15-minute execution timeout.
+
+A model batch is applied through one fenced D1 transaction. The transaction
+validates the current owner, claim, epoch, and operation; rejects an active
+content-hash duplicate inside the insert; writes only the winning candidate,
+evidence, review, and consolidation-output rows; and appends an immutable batch
+receipt. The receipt binds the frozen input digest, model-result digest, exact
+output manifest, and completion time. A valid zero-output batch still writes a
+receipt. An ambiguous response can be recovered only by reloading an exact
+receipt through `first-primary`. A later claim may reuse that durable receipt,
+but cannot rewrite it. Once a receipt exists, D1 freezes the consolidation input
+set and digest plus its candidate content, analysis, taxonomy, scope, output
+slot, evidence-link set, and review identity
+while permitting normal candidate and review status transitions. The final step
+validates the exact expected receipt coordinates and compact receipt metadata,
+without loading manifest bodies, before it releases the lease and marks
+consolidation complete.
 
 ## Workflow recovery
 
@@ -216,13 +272,19 @@ atomic batches rather than an in-memory lock or `blockConcurrencyWhile()`.
 Candidate analysis and session consolidation use one non-streaming, forced
 Workers AI function call from `@cf/zai-org/glm-5.2`. The user payload is canonical
 JSON, and the function parameters define the machine-readable output contract.
-Cloudflare's model page advertises a 262,144-token context window, while the
-Workers AI request path currently enforces a 256,000-token combined input and
-requested-completion ceiling. EdgeMneme assigns the largest safe completion
-allowance from that service ceiling by subtracting UTF-8 upper bounds for the
+Cloudflare's model page publishes a 262,144-token context window for GLM-5.2.
+EdgeMneme uses that context window as the total request budget and assigns the
+largest safe completion allowance by subtracting UTF-8 upper bounds for the
 messages and serialized tool contract plus a fixed chat-template reserve. It
-does not add a smaller application output cap. There is no silent model
-fallback.
+does not add a smaller generation-token cap. The non-streaming function argument
+transport is independently limited to 1 MiB before JSON parsing. After schema
+parsing, local semantic validation measures the serialized UTF-8 JSON and allows
+at most 256 KiB for candidate analysis and 1 MiB for consolidation suggestions;
+the tool contract exposes the same bounds. This check counts bytes rather than
+assuming one byte per character. A consolidation batch persists the accepted
+result and returns no model payload from its Workflow step. The only large
+durable step result is the batch-index array, whose 9,000-entry maximum remains
+below Workflow's 1 MiB step-result limit. There is no silent model fallback.
 
 The model receives server-created opaque scope option IDs, the semantic scope
 type, selection guidance, and evidence source IDs. It does not receive the raw

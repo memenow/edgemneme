@@ -14,7 +14,9 @@ import {
   beginGitHubTreeManifest,
   buildGitHubTreeManifestDescriptor,
   completeGitHubTreeManifest,
+  createGitHubTreeManifestActivationAttempt,
   persistGitHubTreeManifestEntries,
+  type GitHubTreeManifestActivationClaim,
   type GitHubTreeManifestDescriptor,
   type GitHubTreeManifestEntry
 } from "../src/github/tree-manifest";
@@ -31,7 +33,8 @@ const MIGRATIONS = [
   "migrations/0008_canonical_repository_scope_ownership.sql",
   "migrations/0009_repository_scope_runtime_guards.sql",
   "migrations/0010_github_credential_expiry_and_repository_identity.sql",
-  "migrations/0011_github_tree_manifests.sql"
+  "migrations/0011_github_tree_manifests.sql",
+  "migrations/0017_github_sync_activation_receipts.sql"
 ];
 
 const REF = "refs/heads/main";
@@ -1282,12 +1285,13 @@ async function activate(
   database: D1Database,
   manifest: GitHubTreeManifestDescriptor
 ): Promise<void> {
+  const activationClaim = await prepareActivationClaim(database, manifest);
   const payloadJson = JSON.stringify({ manifest_id: manifest.manifestId });
   await activateGitHubTreeManifest({
     database,
     descriptor: manifest,
     expectedHead: null,
-    expectedCursorObservedSha: null,
+    activationClaim,
     scheduledTime: Date.parse(manifest.collectionKey),
     nextSyncAt: "2026-07-28T06:00:00.000Z",
     historyGapPossible: false,
@@ -1299,6 +1303,123 @@ async function activate(
       payloadJson
     }
   });
+}
+
+async function prepareActivationClaim(
+  database: D1Database,
+  manifest: GitHubTreeManifestDescriptor
+): Promise<GitHubTreeManifestActivationClaim> {
+  const cursorUpdatedAt = manifest.collectionKey;
+  await database
+    .prepare(
+      `INSERT INTO sync_cursors
+       (project_id, repository_id, ref, status, history_gap_possible,
+        credential_status, updated_at)
+       VALUES (?, ?, ?, 'idle', 0, 'active', ?)
+       ON CONFLICT(project_id, repository_id, ref) DO NOTHING`
+    )
+    .bind(
+      manifest.projectId,
+      manifest.repositoryId,
+      manifest.ref,
+      cursorUpdatedAt
+    )
+    .run();
+  const repository = await database
+    .withSession("first-primary")
+    .prepare(
+      `SELECT external_id, expected_owner_external_id, owner, name,
+              default_branch, tracked_refs_json,
+              github_sync_configuration_version, updated_at
+       FROM repositories
+       WHERE project_id = ? AND repository_id = ?`
+    )
+    .bind(manifest.projectId, manifest.repositoryId)
+    .first<{
+      external_id: number;
+      expected_owner_external_id: number;
+      owner: string;
+      name: string;
+      default_branch: string;
+      tracked_refs_json: string;
+      github_sync_configuration_version: number;
+      updated_at: string;
+    }>();
+  const cursor = await database
+    .withSession("first-primary")
+    .prepare(
+      `SELECT status, updated_at, cursor_version
+       FROM sync_cursors
+       WHERE project_id = ? AND repository_id = ? AND ref = ?`
+    )
+    .bind(manifest.projectId, manifest.repositoryId, manifest.ref)
+    .first<{
+      status: string;
+      updated_at: string;
+      cursor_version: number;
+    }>();
+  if (repository === null || cursor === null) {
+    throw new Error("Synthetic activation claim is unavailable.");
+  }
+  const runId = await sha256(
+    [
+      "synthetic.github.sync.run",
+      manifest.projectId,
+      manifest.repositoryId,
+      manifest.ref,
+      manifest.manifestId
+    ].join("\n")
+  );
+  const scheduledFor = new Date(
+    Date.parse(manifest.collectionKey)
+  ).toISOString();
+  await database
+    .prepare(
+      `INSERT INTO github_repository_sync_runs
+       (run_id, project_id, repository_id, scheduled_for,
+        full_reconciliation, status, started_at, lease_expires_at,
+        claimed_ref, claimed_head_manifest_id, claimed_head_version,
+        repository_configuration_version, cursor_version, claim_contract_version)
+       VALUES (?, ?, ?, ?, 1, 'running', ?,
+               '2099-01-01T00:00:00.000Z', ?, NULL, 0, ?, ?, 1)
+       ON CONFLICT DO NOTHING`
+    )
+    .bind(
+      runId,
+      manifest.projectId,
+      manifest.repositoryId,
+      scheduledFor,
+      cursorUpdatedAt,
+      manifest.ref,
+      repository.github_sync_configuration_version,
+      cursor.cursor_version
+    )
+    .run();
+  const attempt = await createGitHubTreeManifestActivationAttempt({
+    runId,
+    projectId: manifest.projectId,
+    repositoryId: manifest.repositoryId,
+    ref: manifest.ref,
+    manifestId: manifest.manifestId
+  });
+  return {
+    runId,
+    ...attempt,
+    expectedExternalId: repository.external_id,
+    expectedOwnerExternalId: repository.expected_owner_external_id,
+    expectedOwner: repository.owner,
+    expectedName: repository.name,
+    expectedDefaultBranch: repository.default_branch,
+    expectedTrackedRefsJson: repository.tracked_refs_json,
+    expectedRepositoryConfigurationVersion:
+      repository.github_sync_configuration_version,
+    expectedRepositoryUpdatedAt: repository.updated_at,
+    expectedCursorStatus: cursor.status,
+    expectedCursorUpdatedAt: cursor.updated_at,
+    expectedCursorVersion: cursor.cursor_version,
+    expectedCursorObservedSha: null,
+    fullReconciliation: true
+  };
 }
 
 function manifestStatus(

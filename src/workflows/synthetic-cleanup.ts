@@ -59,6 +59,7 @@ interface ProjectionDeletionRow {
 }
 
 const SYNTHETIC_PROJECT_SCOPED_TABLES = [
+  "consolidation_batch_receipts",
   "consolidation_outputs",
   "consolidation_inputs",
   "session_consolidations",
@@ -75,6 +76,11 @@ const SYNTHETIC_PROJECT_SCOPED_TABLES = [
   "workflow_runs",
   "idempotency_records",
   "taxonomy_policies",
+  "github_repository_sync_finish_receipts",
+  "github_sync_dispatch_item_rejection_receipts",
+  "github_sync_dispatch_items",
+  "github_tree_activation_receipts",
+  "github_tree_activation_witnesses",
   "github_repository_sync_runs",
   "github_tree_ref_heads",
   "github_tree_manifest_deltas",
@@ -88,8 +94,7 @@ const SYNTHETIC_PROJECT_SCOPED_TABLES = [
   "repositories",
   "outbox_events",
   "projection_snapshots",
-  "audit_events",
-  "synthetic_cleanup_registry"
+  "audit_events"
 ] as const;
 const CONTROL_PLANE_TERMINAL_STATUSES = new Set(["complete", "errored", "terminated"]);
 const MAX_VECTOR_IDS = 1_000;
@@ -581,7 +586,30 @@ async function deleteAuthority(memoryDb: D1Database, row: RegistryRow): Promise<
     ).bind(row.principal_id, row.project_id),
     ...SYNTHETIC_PROJECT_SCOPED_TABLES.map((table) =>
       memoryDb.prepare(`DELETE FROM ${table} WHERE project_id = ?`).bind(row.project_id)
-    )
+    ),
+    memoryDb.prepare(
+      `DELETE FROM github_sync_dispatch_materialization_receipts
+       WHERE dispatch_id IN (
+         SELECT dispatch_id FROM github_sync_dispatches
+         WHERE credential_version = 'system.synthetic.' || ?
+       )`
+    ).bind(row.project_id),
+    memoryDb.prepare(
+      `DELETE FROM github_sync_dispatches
+       WHERE credential_version = 'system.synthetic.' || ?`
+    ).bind(row.project_id),
+    memoryDb.prepare(
+      `DELETE FROM github_credential_sync_lane_release_receipts
+       WHERE credential_version = 'system.synthetic.' || ?`
+    ).bind(row.project_id),
+    memoryDb.prepare(
+      `DELETE FROM github_credential_sync_lane
+       WHERE credential_version = 'system.synthetic.' || ?`
+    ).bind(row.project_id),
+    memoryDb.prepare(
+      `DELETE FROM synthetic_cleanup_registry
+       WHERE project_id = ? AND principal_id = ?`
+    ).bind(row.project_id, row.principal_id)
   ];
   statements.push(
     memoryDb.prepare(

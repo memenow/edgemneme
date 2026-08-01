@@ -36,7 +36,15 @@ const MEMORY_MIGRATIONS = [
   "migrations/0008_canonical_repository_scope_ownership.sql",
   "migrations/0009_repository_scope_runtime_guards.sql",
   "migrations/0010_github_credential_expiry_and_repository_identity.sql",
-  "migrations/0011_github_tree_manifests.sql"
+  "migrations/0011_github_tree_manifests.sql",
+  "migrations/0012_projection_rebuild_outbox_index.sql",
+  "migrations/0013_projection_rebuild_unknown_status.sql",
+  "migrations/0014_ordinary_workflow_reconciliation_index.sql",
+  "migrations/0015_github_sync_default_branch.sql",
+  "migrations/0016_consolidation_lease.sql",
+  "migrations/0017_github_sync_activation_receipts.sql",
+  "migrations/0018_consolidation_batch_receipts.sql",
+  "migrations/0019_github_sync_workflows.sql"
 ] as const;
 
 describe("scheduled synthetic cleanup", () => {
@@ -134,6 +142,7 @@ describe("scheduled synthetic cleanup", () => {
       202
     );
     seedGitHubCredential(database, "runner-principal", "runner-project");
+    seedGitHubWorkflowRows(database, "runner-project");
 
     expect(repositoryScopedCounts(database, "runner-project")).toEqual({
       repositories: 2,
@@ -141,7 +150,7 @@ describe("scheduled synthetic cleanup", () => {
       grant_contexts: 1,
       memory_contexts: 1,
       sync_cursors: 1,
-      sync_runs: 1,
+      sync_runs: 2,
       tree_manifests: 2,
       tree_lifecycle_events: 1,
       tree_entries: 2,
@@ -193,6 +202,11 @@ describe("scheduled synthetic cleanup", () => {
       "github_rate_observations",
       "github_access_baselines",
       ...(PROJECT_SCOPED_TABLES as string[]),
+      "github_sync_dispatch_materialization_receipts",
+      "github_sync_dispatches",
+      "github_credential_sync_lane_release_receipts",
+      "github_credential_sync_lane",
+      "synthetic_cleanup_registry",
       "principals",
       "projects"
     ]);
@@ -232,9 +246,33 @@ describe("scheduled synthetic cleanup", () => {
               WHERE project_id = ?) AS memory_contexts,
              (SELECT COUNT(*) FROM sync_cursors WHERE project_id = ?) AS sync_cursors,
              (SELECT COUNT(*) FROM github_repository_sync_runs
-              WHERE project_id = ?) AS sync_runs`
+              WHERE project_id = ?) AS sync_runs,
+             (SELECT COUNT(*) FROM github_sync_dispatch_items
+              WHERE project_id = ?) AS dispatch_items,
+             (SELECT COUNT(*) FROM github_repository_sync_finish_receipts
+              WHERE project_id = ?) AS finish_receipts,
+             (SELECT COUNT(*) FROM github_sync_dispatch_item_rejection_receipts
+              WHERE project_id = ?) AS rejection_receipts,
+             (SELECT COUNT(*) FROM github_sync_dispatch_materialization_receipts
+              WHERE dispatch_id IN (
+                SELECT dispatch_id FROM github_sync_dispatches
+                WHERE credential_version = 'system.synthetic.' || ?
+              )) AS materialization_receipts,
+             (SELECT COUNT(*) FROM github_sync_dispatches
+              WHERE credential_version = 'system.synthetic.' || ?) AS dispatches,
+             (SELECT COUNT(*) FROM github_credential_sync_lane_release_receipts
+              WHERE credential_version = 'system.synthetic.' || ?) AS lane_release_receipts,
+             (SELECT COUNT(*) FROM github_credential_sync_lane
+              WHERE credential_version = 'system.synthetic.' || ?) AS credential_lanes`
         )
         .get(
+          PROJECT_ID,
+          PROJECT_ID,
+          PROJECT_ID,
+          PROJECT_ID,
+          PROJECT_ID,
+          PROJECT_ID,
+          PROJECT_ID,
           PROJECT_ID,
           PROJECT_ID,
           PROJECT_ID,
@@ -248,7 +286,14 @@ describe("scheduled synthetic cleanup", () => {
       grant_contexts: 1,
       memory_contexts: 1,
       sync_cursors: 1,
-      sync_runs: 1
+      sync_runs: 2,
+      dispatch_items: 2,
+      finish_receipts: 1,
+      rejection_receipts: 1,
+      materialization_receipts: 1,
+      dispatches: 1,
+      lane_release_receipts: 1,
+      credential_lanes: 1
     });
     fixture.r2.keys.add(`${PREFIX}1/manifest.json`);
     fixture.r2.keys.add(`${PREFIX}1/README.md`);
@@ -284,6 +329,38 @@ describe("scheduled synthetic cleanup", () => {
         "memory_search_projection_deletions",
         "project_id = ?",
         PROJECT_ID
+      )
+    ).toBe(0);
+    expect(
+      count(
+        fixture.memory,
+        "github_sync_dispatch_materialization_receipts",
+        "dispatch_id = ?",
+        createHash("sha256").update(`${PROJECT_ID}\ndispatch`).digest("hex")
+      )
+    ).toBe(0);
+    expect(
+      count(
+        fixture.memory,
+        "github_sync_dispatches",
+        "credential_version = ?",
+        `system.synthetic.${PROJECT_ID}`
+      )
+    ).toBe(0);
+    expect(
+      count(
+        fixture.memory,
+        "github_credential_sync_lane_release_receipts",
+        "credential_version = ?",
+        `system.synthetic.${PROJECT_ID}`
+      )
+    ).toBe(0);
+    expect(
+      count(
+        fixture.memory,
+        "github_credential_sync_lane",
+        "credential_version = ?",
+        `system.synthetic.${PROJECT_ID}`
       )
     ).toBe(0);
     expect(
@@ -652,6 +729,7 @@ function seedMemory(database: DatabaseSync): void {
   `);
   seedRepositoryScopedRows(database, PROJECT_ID, PRINCIPAL_ID, 101);
   seedGitHubCredential(database, PRINCIPAL_ID, PROJECT_ID);
+  seedGitHubWorkflowRows(database, PROJECT_ID);
 }
 
 function seedGitHubCredential(
@@ -684,6 +762,148 @@ function seedGitHubCredential(
       event_digest)
      VALUES (?, ?, 14, '2026-08-08T00:00:00.000Z', ?, ?)`
   ).run(`${credentialVersion}.warning.14`, credentialVersion, now, "synthetic-digest");
+}
+
+function seedGitHubWorkflowRows(database: DatabaseSync, projectId: string): void {
+  const credentialVersion = `system.synthetic.${projectId}`;
+  const repositoryId = `${projectId}-repository`;
+  const ref = "refs/heads/feature";
+  const now = "2026-07-25T00:00:00.000Z";
+  const leaseUntil = "2026-07-25T00:20:00.000Z";
+  const runId = `${projectId}-workflow-sync-run`;
+  const dispatchId = createHash("sha256").update(`${projectId}\ndispatch`).digest("hex");
+  const itemId = createHash("sha256").update(`${projectId}\nitem`).digest("hex");
+  const rejectedItemId = createHash("sha256")
+    .update(`${projectId}\nrejected-item`)
+    .digest("hex");
+  const receiptId = createHash("sha256").update(`${projectId}\nfinish`).digest("hex");
+  const rejectionReceiptId = createHash("sha256")
+    .update(`${projectId}\nrejection`)
+    .digest("hex");
+  const materializationReceiptId = createHash("sha256")
+    .update(`${projectId}\nmaterialization`)
+    .digest("hex");
+  const laneReceiptId = createHash("sha256")
+    .update(`${projectId}\nlane-release`)
+    .digest("hex");
+  const laneClaimId = createHash("sha256")
+    .update(`${projectId}\nlane-claim`)
+    .digest("hex");
+  const dispatchWorkflowId = `ghd-${createHash("sha256")
+    .update(`${projectId}\ndispatch-workflow`)
+    .digest("hex")}`;
+  const refWorkflowId = `ghr-${createHash("sha256")
+    .update(`${projectId}\nref-workflow`)
+    .digest("hex")}`;
+  const rejectedWorkflowId = `ghr-${createHash("sha256")
+    .update(`${projectId}\nrejected-workflow`)
+    .digest("hex")}`;
+
+  database.prepare(
+    `INSERT INTO github_repository_sync_runs
+     (run_id, project_id, repository_id, scheduled_for, full_reconciliation,
+      status, started_at, lease_expires_at, completed_at, claimed_ref,
+      claimed_head_manifest_id, claimed_head_version,
+      repository_configuration_version, cursor_version, claim_contract_version)
+     VALUES (?, ?, ?, ?, 0, 'complete', ?, ?, ?, ?, NULL, 0, 1, 1, 1)`
+  ).run(runId, projectId, repositoryId, now, now, leaseUntil, now, ref);
+  database.prepare(
+    `INSERT INTO github_sync_dispatches
+     (dispatch_id, credential_version, workflow_instance_id, scheduled_for,
+      utc_date, status, created_at, completed_at)
+     VALUES (?, ?, ?, ?, '2026-07-25', 'complete', ?, ?)`
+  ).run(dispatchId, credentialVersion, dispatchWorkflowId, now, now, now);
+  database.prepare(
+    `INSERT INTO github_sync_dispatch_items
+     (item_id, dispatch_id, project_id, repository_id, ref, scheduled_for,
+      full_reconciliation, repository_configuration_version, cursor_version,
+      selected_head_manifest_id, selected_head_version, repository_updated_at,
+      cursor_status, cursor_updated_at, workflow_instance_id, status, run_id,
+      created_at, completed_at)
+     VALUES (?, ?, ?, ?, ?, ?, 0, 1, 1, NULL, 0, ?, 'complete', ?, ?,
+             'complete', ?, ?, ?)`
+  ).run(
+    itemId,
+    dispatchId,
+    projectId,
+    repositoryId,
+    ref,
+    now,
+    now,
+    now,
+    refWorkflowId,
+    runId,
+    now,
+    now
+  );
+  database.prepare(
+    `INSERT INTO github_sync_dispatch_items
+     (item_id, dispatch_id, project_id, repository_id, ref, scheduled_for,
+      full_reconciliation, repository_configuration_version, cursor_version,
+      selected_head_manifest_id, selected_head_version, repository_updated_at,
+      cursor_status, cursor_updated_at, workflow_instance_id, status, run_id,
+      created_at, completed_at, last_error_code)
+     VALUES (?, ?, ?, ?, 'refs/heads/rejected', ?, 0, 1, 1, NULL, 0, ?,
+             'complete', ?, ?, 'failed', NULL, ?, ?,
+             'GITHUB_RECONCILIATION_REQUIRED')`
+  ).run(
+    rejectedItemId,
+    dispatchId,
+    projectId,
+    repositoryId,
+    now,
+    now,
+    now,
+    rejectedWorkflowId,
+    now,
+    now
+  );
+  database.prepare(
+    `INSERT INTO github_repository_sync_finish_receipts
+     (receipt_id, run_id, dispatch_item_id, project_id, repository_id, ref,
+      status, last_error_code, completed_at)
+     VALUES (?, ?, ?, ?, ?, ?, 'complete', NULL, ?)`
+  ).run(receiptId, runId, itemId, projectId, repositoryId, ref, now);
+  database.prepare(
+    `INSERT INTO github_sync_dispatch_item_rejection_receipts
+     (receipt_id, dispatch_item_id, dispatch_id, credential_version,
+      project_id, repository_id, ref, last_error_code, completed_at)
+     VALUES (?, ?, ?, ?, ?, ?, 'refs/heads/rejected',
+             'GITHUB_RECONCILIATION_REQUIRED', ?)`
+  ).run(
+    rejectionReceiptId,
+    rejectedItemId,
+    dispatchId,
+    credentialVersion,
+    projectId,
+    repositoryId,
+    now
+  );
+  database.prepare(
+    `INSERT INTO github_sync_dispatch_materialization_receipts
+     (receipt_id, dispatch_id, item_count, completed_at)
+     VALUES (?, ?, 2, ?)`
+  ).run(materializationReceiptId, dispatchId, now);
+  database.prepare(
+    `INSERT INTO github_credential_sync_lane
+     (credential_version, holder_kind, holder_id, lease_claim_id, lease_epoch,
+      lease_until, available_after, updated_at)
+     VALUES (?, 'ref', ?, ?, 1, ?, ?, ?)`
+  ).run(credentialVersion, itemId, laneClaimId, leaseUntil, now, now);
+  database.prepare(
+    `INSERT INTO github_credential_sync_lane_release_receipts
+     (receipt_id, credential_version, holder_kind, holder_id, lease_claim_id,
+      lease_epoch, lease_until, released_at, available_after)
+     VALUES (?, ?, 'ref', ?, ?, 1, ?, ?, '2026-07-25T00:00:00.080Z')`
+  ).run(laneReceiptId, credentialVersion, itemId, laneClaimId, leaseUntil, now);
+  database.prepare(
+    `UPDATE github_credential_sync_lane
+     SET holder_kind = NULL, holder_id = NULL, lease_claim_id = NULL,
+         lease_until = NULL, available_after = '2026-07-25T00:00:00.080Z',
+         updated_at = ?
+     WHERE credential_version = ? AND holder_kind = 'ref' AND holder_id = ?
+       AND lease_claim_id = ? AND lease_epoch = 1 AND lease_until = ?`
+  ).run(now, credentialVersion, itemId, laneClaimId, leaseUntil);
 }
 
 function seedRepositoryScopedRows(

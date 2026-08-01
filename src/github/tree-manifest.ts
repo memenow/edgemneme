@@ -14,6 +14,13 @@ import {
   deletionObservationSql,
   deletionReviewRequestSql
 } from "./tree-manifest-sql";
+import {
+  pendingGitHubSyncActivationGuardBindings,
+  pendingGitHubSyncActivationGuardSql,
+  pendingGitHubSyncActivationPrestateGuardBindings,
+  pendingGitHubSyncActivationPrestateGuardSql,
+  type PendingGitHubSyncActivationFence
+} from "./sync-activation-fence";
 
 export type GitHubTreeManifestDisposition =
   | GitHubBlobDisposition
@@ -42,6 +49,53 @@ export interface GitHubTreeManifestDescriptor {
 export interface GitHubTreeHead {
   manifestId: string;
   observedSha: string;
+  headVersion: number;
+}
+
+export interface GitHubTreeManifestActivationClaim {
+  runId: string;
+  receiptId: string;
+  activationToken: string;
+  expectedExternalId: number;
+  expectedOwnerExternalId: number;
+  expectedOwner: string;
+  expectedName: string;
+  expectedDefaultBranch: string;
+  expectedTrackedRefsJson: string;
+  expectedRepositoryConfigurationVersion: number;
+  expectedRepositoryUpdatedAt: string;
+  expectedCursorStatus: string;
+  expectedCursorUpdatedAt: string;
+  expectedCursorVersion: number;
+  expectedCursorObservedSha: string | null;
+  fullReconciliation: boolean;
+}
+
+export async function createGitHubTreeManifestActivationAttempt(input: {
+  runId: string;
+  projectId: string;
+  repositoryId: string;
+  ref: string;
+  manifestId: string;
+}): Promise<{ receiptId: string; activationToken: string }> {
+  const receiptId = await sha256(
+    [
+      "github.tree.activation.receipt",
+      input.runId,
+      input.projectId,
+      input.repositoryId,
+      input.ref,
+      input.manifestId
+    ].join("\n")
+  );
+  const activationToken = await sha256(
+    [
+      "github.tree.activation.attempt",
+      receiptId,
+      crypto.randomUUID()
+    ].join("\n")
+  );
+  return { receiptId, activationToken };
 }
 
 interface StoredManifestRow {
@@ -290,7 +344,7 @@ export async function activateGitHubTreeManifest(input: {
   database: D1Database;
   descriptor: GitHubTreeManifestDescriptor;
   expectedHead: GitHubTreeHead | null;
-  expectedCursorObservedSha: string | null;
+  activationClaim: GitHubTreeManifestActivationClaim;
   scheduledTime: number;
   nextSyncAt: string;
   historyGapPossible: boolean;
@@ -307,13 +361,85 @@ export async function activateGitHubTreeManifest(input: {
     database,
     descriptor,
     expectedHead,
+    activationClaim,
     historyGapPossible,
     credentialStatus,
     syncEvent
   } = input;
-  const now = new Date().toISOString();
+  if (!Number.isFinite(input.scheduledTime)) {
+    throw reconciliationRequired();
+  }
+  const activationAt = new Date().toISOString();
   const scheduledAt = new Date(input.scheduledTime).toISOString();
+  const parsedNextSyncAt = Date.parse(input.nextSyncAt);
   const expectedManifestId = expectedHead?.manifestId ?? null;
+  const expectedHeadVersion = expectedHead?.headVersion ?? 0;
+  const expectedReceiptId = await sha256(
+    [
+      "github.tree.activation.receipt",
+      activationClaim.runId,
+      descriptor.projectId,
+      descriptor.repositoryId,
+      descriptor.ref,
+      descriptor.manifestId
+    ].join("\n")
+  );
+  if (
+    activationClaim.receiptId !== expectedReceiptId ||
+    !DIGEST_PATTERN.test(activationClaim.activationToken) ||
+    descriptor.collectionKey !== scheduledAt ||
+    !Number.isFinite(parsedNextSyncAt) ||
+    new Date(parsedNextSyncAt).toISOString() !== input.nextSyncAt ||
+    syncEvent.payloadDigest !== (await sha256(syncEvent.payloadJson)) ||
+    (expectedHead === null
+      ? expectedHeadVersion !== 0
+      : !Number.isSafeInteger(expectedHeadVersion) ||
+        expectedHeadVersion < 1 ||
+        expectedHeadVersion >= Number.MAX_SAFE_INTEGER) ||
+    !Number.isSafeInteger(
+      activationClaim.expectedRepositoryConfigurationVersion
+    ) ||
+    activationClaim.expectedRepositoryConfigurationVersion < 1 ||
+    activationClaim.expectedRepositoryConfigurationVersion >
+      Number.MAX_SAFE_INTEGER ||
+    !Number.isSafeInteger(activationClaim.expectedCursorVersion) ||
+    activationClaim.expectedCursorVersion < 1 ||
+    activationClaim.expectedCursorVersion >= Number.MAX_SAFE_INTEGER
+  ) {
+    throw reconciliationRequired();
+  }
+  const activationRequestDigest = await sha256(
+    JSON.stringify([
+      descriptor,
+      expectedManifestId,
+      expectedHeadVersion,
+      activationClaim,
+      scheduledAt,
+      input.nextSyncAt,
+      historyGapPossible,
+      credentialStatus,
+      input.etag,
+      syncEvent.eventId,
+      syncEvent.payloadDigest
+    ])
+  );
+  if (
+    await hasCommittedActivationReceipt(
+      database,
+      descriptor,
+      expectedManifestId,
+      expectedHeadVersion,
+      activationClaim,
+      scheduledAt,
+      syncEvent,
+      activationRequestDigest
+    )
+  ) {
+    return;
+  }
+  if (expectedManifestId === descriptor.manifestId) {
+    throw reconciliationRequired();
+  }
   const refDigest = await sha256(["github.ref", descriptor.ref].join("\n"));
   if (descriptor.repositoryAuthority === "tracked_ref") {
     const ownership = await database
@@ -330,7 +456,88 @@ export async function activateGitHubTreeManifest(input: {
     }
   }
 
+  const activationFence: PendingGitHubSyncActivationFence = {
+    projectId: descriptor.projectId,
+    repositoryId: descriptor.repositoryId,
+    ref: descriptor.ref,
+    manifestId: descriptor.manifestId,
+    repositoryAuthority: descriptor.repositoryAuthority,
+    runId: activationClaim.runId,
+    receiptId: activationClaim.receiptId,
+    activationToken: activationClaim.activationToken,
+    scheduledFor: scheduledAt,
+    fullReconciliation: activationClaim.fullReconciliation,
+    expectedHeadManifestId: expectedManifestId,
+    expectedHeadVersion,
+    expectedExternalId: activationClaim.expectedExternalId,
+    expectedOwnerExternalId: activationClaim.expectedOwnerExternalId,
+    expectedOwner: activationClaim.expectedOwner,
+    expectedName: activationClaim.expectedName,
+    expectedDefaultBranch: activationClaim.expectedDefaultBranch,
+    expectedTrackedRefsJson: activationClaim.expectedTrackedRefsJson,
+    expectedRepositoryConfigurationVersion:
+      activationClaim.expectedRepositoryConfigurationVersion,
+    expectedRepositoryUpdatedAt:
+      activationClaim.expectedRepositoryUpdatedAt,
+    expectedCursorObservedSha: activationClaim.expectedCursorObservedSha,
+    expectedCursorStatus: activationClaim.expectedCursorStatus,
+    expectedCursorUpdatedAt: activationClaim.expectedCursorUpdatedAt,
+    expectedCursorVersion: activationClaim.expectedCursorVersion
+  };
+  const guardSql = pendingGitHubSyncActivationGuardSql();
+  const guardBindings =
+    pendingGitHubSyncActivationGuardBindings(activationFence);
+  const prestateGuardSql = pendingGitHubSyncActivationPrestateGuardSql();
+  const prestateGuardBindings =
+    pendingGitHubSyncActivationPrestateGuardBindings(activationFence);
+  const witnessStatement = database
+    .prepare(
+      `INSERT INTO github_tree_activation_witnesses
+       (activation_token, receipt_id, run_id, project_id, repository_id, ref,
+        manifest_id, activation_request_digest, created_at)
+       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
+       WHERE ${prestateGuardSql}`
+    )
+    .bind(
+      activationClaim.activationToken,
+      activationClaim.receiptId,
+      activationClaim.runId,
+      descriptor.projectId,
+      descriptor.repositoryId,
+      descriptor.ref,
+      descriptor.manifestId,
+      activationRequestDigest,
+      activationAt,
+      ...prestateGuardBindings
+    );
+  const headStatement = database
+    .prepare(
+      `INSERT INTO github_tree_ref_heads
+       (project_id, repository_id, ref, manifest_id, head_version,
+        activated_at, updated_at)
+       SELECT ?, ?, ?, ?, 1, ?, ?
+       WHERE ${guardSql}
+       ON CONFLICT(project_id, repository_id, ref) DO UPDATE SET
+         manifest_id = excluded.manifest_id,
+         head_version = github_tree_ref_heads.head_version + 1,
+         activated_at = excluded.activated_at,
+         updated_at = excluded.updated_at
+       WHERE github_tree_ref_heads.manifest_id IS ?
+         AND github_tree_ref_heads.head_version = ?`
+    )
+    .bind(
+      descriptor.projectId,
+      descriptor.repositoryId,
+      descriptor.ref,
+      descriptor.manifestId,
+      activationAt,
+      activationAt,
+      ...guardBindings,
+      expectedManifestId,
+      expectedHeadVersion
+    );
   const statements: D1PreparedStatement[] = [
+    witnessStatement,
     database
       .prepare(addedDeltaSql())
       .bind(
@@ -345,15 +552,12 @@ export async function activateGitHubTreeManifest(input: {
         descriptor.ref,
         expectedManifestId,
         descriptor.manifestId,
-        now,
+        activationAt,
         descriptor.projectId,
         descriptor.manifestId,
         expectedManifestId,
         expectedManifestId,
-        descriptor.projectId,
-        descriptor.repositoryId,
-        descriptor.ref,
-        descriptor.manifestId
+        ...guardBindings
       )
   ];
   if (expectedManifestId !== null) {
@@ -373,14 +577,11 @@ export async function activateGitHubTreeManifest(input: {
           descriptor.ref,
           expectedManifestId,
           descriptor.manifestId,
-          now,
+          activationAt,
           expectedManifestId,
           descriptor.projectId,
           descriptor.manifestId,
-          descriptor.projectId,
-          descriptor.repositoryId,
-          descriptor.ref,
-          descriptor.manifestId
+          ...guardBindings
         ),
       database
         .prepare(deletedDeltaSql())
@@ -400,14 +601,11 @@ export async function activateGitHubTreeManifest(input: {
           descriptor.ref,
           expectedManifestId,
           descriptor.manifestId,
-          now,
+          activationAt,
           descriptor.manifestId,
           descriptor.projectId,
           expectedManifestId,
-          descriptor.projectId,
-          descriptor.repositoryId,
-          descriptor.ref,
-          descriptor.manifestId
+          ...guardBindings
         )
     );
   }
@@ -416,149 +614,48 @@ export async function activateGitHubTreeManifest(input: {
       .prepare(deletionEvidenceSql())
       .bind(
         refDigest,
-        now,
+        activationAt,
         descriptor.projectId,
         descriptor.repositoryId,
         descriptor.ref,
         descriptor.manifestId,
-        descriptor.manifestId
+        ...guardBindings
       ),
     database
       .prepare(deletionObservationSql())
       .bind(
-        now,
-        now,
+        activationAt,
+        activationAt,
         descriptor.projectId,
         descriptor.repositoryId,
         descriptor.ref,
         descriptor.manifestId,
-        descriptor.manifestId
+        ...guardBindings
       ),
     database
       .prepare(deletionObservationEvidenceSql())
       .bind(
-        now,
+        activationAt,
         descriptor.projectId,
         descriptor.repositoryId,
         descriptor.ref,
         descriptor.manifestId,
-        descriptor.manifestId
+        ...guardBindings
       ),
     database
       .prepare(deletionReviewRequestSql())
       .bind(
-        now,
-        now,
+        activationAt,
+        activationAt,
         descriptor.projectId,
         descriptor.repositoryId,
         descriptor.ref,
         descriptor.manifestId,
-        descriptor.manifestId
+        ...guardBindings
       )
   );
-  const headInsertionIndex = statements.length;
   statements.push(
-    database
-      .prepare(
-        `INSERT INTO github_tree_ref_heads
-         (project_id, repository_id, ref, manifest_id, head_version,
-          activated_at, updated_at)
-         SELECT ?, ?, ?, ?, 1, ?, ?
-         FROM github_tree_manifests AS manifest
-         WHERE manifest.project_id = ? AND manifest.manifest_id = ?
-           AND manifest.status = 'complete'
-           AND (
-             (? IS NULL AND NOT EXISTS (
-               SELECT 1 FROM github_tree_ref_heads AS current_head
-               WHERE current_head.project_id = manifest.project_id
-                 AND current_head.repository_id = manifest.repository_id
-                 AND current_head.ref = manifest.ref
-             ))
-             OR EXISTS (
-               SELECT 1 FROM github_tree_ref_heads AS current_head
-               WHERE current_head.project_id = manifest.project_id
-                 AND current_head.repository_id = manifest.repository_id
-                 AND current_head.ref = manifest.ref
-                 AND current_head.manifest_id IS ?
-             )
-           )
-           AND (
-             (? IS NULL AND NOT EXISTS (
-               SELECT 1 FROM sync_cursors AS current_cursor
-               WHERE current_cursor.project_id = manifest.project_id
-                 AND current_cursor.repository_id = manifest.repository_id
-                 AND current_cursor.ref = manifest.ref
-             ))
-             OR EXISTS (
-               SELECT 1 FROM sync_cursors AS current_cursor
-               WHERE current_cursor.project_id = manifest.project_id
-                 AND current_cursor.repository_id = manifest.repository_id
-                 AND current_cursor.ref = manifest.ref
-                 AND current_cursor.observed_sha IS ?
-             )
-           )
-         ON CONFLICT(project_id, repository_id, ref) DO UPDATE SET
-           manifest_id = excluded.manifest_id,
-           head_version = github_tree_ref_heads.head_version + 1,
-           activated_at = excluded.activated_at,
-           updated_at = excluded.updated_at
-         WHERE github_tree_ref_heads.manifest_id IS ?`
-      )
-      .bind(
-        descriptor.projectId,
-        descriptor.repositoryId,
-        descriptor.ref,
-        descriptor.manifestId,
-        now,
-        now,
-        descriptor.projectId,
-        descriptor.manifestId,
-        expectedManifestId,
-        expectedManifestId,
-        input.expectedCursorObservedSha,
-        input.expectedCursorObservedSha,
-        expectedManifestId
-      ),
     ...(input.candidateStatements ?? []),
-    database
-      .prepare(
-        `INSERT INTO sync_cursors
-         (project_id, repository_id, ref, observed_sha, status, last_sync_at,
-          next_sync_at, history_gap_possible, credential_status, etag,
-          last_error_code, updated_at)
-         SELECT ?, ?, ?, ?, 'observed', ?, ?, ?, ?, ?, NULL, ?
-         FROM github_tree_ref_heads AS head
-         WHERE head.project_id = ? AND head.repository_id = ? AND head.ref = ?
-           AND head.manifest_id = ?
-         ON CONFLICT(project_id, repository_id, ref) DO UPDATE SET
-           observed_sha = excluded.observed_sha,
-           status = excluded.status,
-           last_sync_at = excluded.last_sync_at,
-           next_sync_at = excluded.next_sync_at,
-           history_gap_possible = excluded.history_gap_possible,
-           credential_status = excluded.credential_status,
-           etag = excluded.etag,
-           last_error_code = NULL,
-           updated_at = excluded.updated_at
-         WHERE sync_cursors.observed_sha IS ?`
-      )
-      .bind(
-        descriptor.projectId,
-        descriptor.repositoryId,
-        descriptor.ref,
-        descriptor.observedSha,
-        scheduledAt,
-        input.nextSyncAt,
-        historyGapPossible ? 1 : 0,
-        credentialStatus,
-        input.etag,
-        now,
-        descriptor.projectId,
-        descriptor.repositoryId,
-        descriptor.ref,
-        descriptor.manifestId,
-        input.expectedCursorObservedSha
-      ),
     database
       .prepare(
         `INSERT INTO outbox_events
@@ -567,57 +664,355 @@ export async function activateGitHubTreeManifest(input: {
          SELECT ?, project.project_id, project.project_version,
                 'github.sync.requested', ?, ?, ?
          FROM projects AS project
-         JOIN github_tree_ref_heads AS head
-           ON head.project_id = project.project_id
-          AND head.repository_id = ? AND head.ref = ?
-          AND head.manifest_id = ?
-         WHERE project.project_id = ?
-         ON CONFLICT(event_id) DO NOTHING`
+         WHERE project.project_id = ? AND ${guardSql}
+         ON CONFLICT(event_id) DO UPDATE SET
+           attempt = -1
+         WHERE NOT (
+           outbox_events.project_id IS excluded.project_id
+           AND outbox_events.event_type IS excluded.event_type
+           AND outbox_events.payload_digest IS excluded.payload_digest
+           AND outbox_events.payload_json IS excluded.payload_json
+         )`
       )
       .bind(
         syncEvent.eventId,
         syncEvent.payloadDigest,
         syncEvent.payloadJson,
-        now,
+        activationAt,
+        descriptor.projectId,
+        ...guardBindings
+      ),
+    headStatement,
+    database
+      .prepare(
+        `UPDATE sync_cursors
+         SET observed_sha = ?, status = 'observed', last_sync_at = ?,
+             next_sync_at = ?, history_gap_possible = ?,
+             credential_status = ?, etag = ?, last_error_code = NULL,
+             updated_at = ?
+         WHERE project_id = ? AND repository_id = ? AND ref = ?
+           AND observed_sha IS ?
+           AND status = ? AND status <> 'paused'
+           AND updated_at = ? AND cursor_version = ?
+           AND EXISTS (
+             SELECT 1
+             FROM repositories AS repository
+             JOIN github_repository_sync_runs AS sync_run
+               ON sync_run.run_id = ?
+              AND sync_run.project_id = repository.project_id
+              AND sync_run.repository_id = repository.repository_id
+             JOIN github_tree_ref_heads AS head
+               ON head.project_id = repository.project_id
+              AND head.repository_id = repository.repository_id
+              AND head.ref = sync_cursors.ref
+             WHERE repository.project_id = sync_cursors.project_id
+               AND repository.repository_id =
+                 sync_cursors.repository_id
+               AND lower(repository.provider) = 'github'
+               AND repository.sync_enabled = 1
+               AND repository.external_id = ?
+               AND repository.expected_owner_external_id IS ?
+               AND repository.owner = ? AND repository.name = ?
+               AND repository.default_branch IS ?
+               AND repository.tracked_refs_json = ?
+               AND repository.github_sync_configuration_version = ?
+               AND repository.updated_at = ?
+               AND sync_run.claimed_ref = sync_cursors.ref
+               AND sync_run.claimed_head_manifest_id IS ?
+               AND sync_run.claimed_head_version = ?
+               AND sync_run.scheduled_for = ?
+               AND sync_run.full_reconciliation = ?
+               AND sync_run.repository_configuration_version = ?
+               AND sync_run.cursor_version = ?
+               AND sync_run.claim_contract_version = 1
+               AND sync_run.status = 'running'
+               AND sync_run.completed_at IS NULL
+               AND sync_run.lease_expires_at >
+                 strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+               AND EXISTS (
+                 SELECT 1
+                 FROM github_tree_activation_witnesses AS witness
+                 WHERE witness.activation_token = ?
+                   AND witness.receipt_id = ?
+                   AND witness.run_id = sync_run.run_id
+                   AND witness.project_id = repository.project_id
+                   AND witness.repository_id = repository.repository_id
+                   AND witness.ref = sync_cursors.ref
+                   AND witness.manifest_id = ?
+                   AND witness.activation_request_digest = ?
+               )
+               AND head.manifest_id = ?
+               AND head.head_version = ?
+           )`
+      )
+      .bind(
+        descriptor.observedSha,
+        scheduledAt,
+        input.nextSyncAt,
+        historyGapPossible ? 1 : 0,
+        credentialStatus,
+        input.etag,
+        activationAt,
+        descriptor.projectId,
+        descriptor.repositoryId,
+        descriptor.ref,
+        activationClaim.expectedCursorObservedSha,
+        activationClaim.expectedCursorStatus,
+        activationClaim.expectedCursorUpdatedAt,
+        activationClaim.expectedCursorVersion,
+        activationClaim.runId,
+        activationClaim.expectedExternalId,
+        activationClaim.expectedOwnerExternalId,
+        activationClaim.expectedOwner,
+        activationClaim.expectedName,
+        activationClaim.expectedDefaultBranch,
+        activationClaim.expectedTrackedRefsJson,
+        activationClaim.expectedRepositoryConfigurationVersion,
+        activationClaim.expectedRepositoryUpdatedAt,
+        expectedManifestId,
+        expectedHeadVersion,
+        scheduledAt,
+        activationClaim.fullReconciliation ? 1 : 0,
+        activationClaim.expectedRepositoryConfigurationVersion,
+        activationClaim.expectedCursorVersion,
+        activationClaim.activationToken,
+        activationClaim.receiptId,
+        descriptor.manifestId,
+        activationRequestDigest,
+        descriptor.manifestId,
+        expectedHeadVersion + 1
+      ),
+    database
+      .prepare(
+        `UPDATE github_repository_sync_runs
+         SET status = 'complete', completed_at = ?, last_error_code = NULL
+         WHERE run_id = ? AND project_id = ? AND repository_id = ?
+           AND claimed_ref = ? AND scheduled_for = ?
+           AND claimed_head_manifest_id IS ?
+           AND claimed_head_version = ?
+           AND full_reconciliation = ?
+           AND repository_configuration_version = ?
+           AND cursor_version = ?
+           AND claim_contract_version = 1
+           AND status = 'running' AND completed_at IS NULL
+           AND lease_expires_at >
+             strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+           AND EXISTS (
+             SELECT 1
+             FROM repositories AS repository
+             WHERE repository.project_id =
+                 github_repository_sync_runs.project_id
+               AND repository.repository_id =
+                 github_repository_sync_runs.repository_id
+               AND lower(repository.provider) = 'github'
+               AND repository.sync_enabled = 1
+               AND repository.github_sync_configuration_version = ?
+               AND repository.updated_at = ?
+           )
+           AND EXISTS (
+             SELECT 1
+             FROM github_tree_ref_heads AS head
+             JOIN sync_cursors AS cursor
+               ON cursor.project_id = head.project_id
+              AND cursor.repository_id = head.repository_id
+              AND cursor.ref = head.ref
+              AND cursor.observed_sha = ?
+              AND cursor.status = 'observed'
+              AND cursor.updated_at = ?
+              AND cursor.cursor_version = ?
+             WHERE head.project_id =
+                 github_repository_sync_runs.project_id
+               AND head.repository_id =
+                 github_repository_sync_runs.repository_id
+               AND head.ref = github_repository_sync_runs.claimed_ref
+               AND head.manifest_id = ?
+               AND head.head_version = ?
+           )
+           AND EXISTS (
+             SELECT 1
+             FROM github_tree_activation_witnesses AS witness
+             WHERE witness.activation_token = ?
+               AND witness.receipt_id = ?
+               AND witness.run_id = github_repository_sync_runs.run_id
+               AND witness.project_id =
+                 github_repository_sync_runs.project_id
+               AND witness.repository_id =
+                 github_repository_sync_runs.repository_id
+               AND witness.ref = github_repository_sync_runs.claimed_ref
+               AND witness.manifest_id = ?
+               AND witness.activation_request_digest = ?
+           )`
+      )
+      .bind(
+        activationAt,
+        activationClaim.runId,
+        descriptor.projectId,
+        descriptor.repositoryId,
+        descriptor.ref,
+        scheduledAt,
+        expectedManifestId,
+        expectedHeadVersion,
+        activationClaim.fullReconciliation ? 1 : 0,
+        activationClaim.expectedRepositoryConfigurationVersion,
+        activationClaim.expectedCursorVersion,
+        activationClaim.expectedRepositoryConfigurationVersion,
+        activationClaim.expectedRepositoryUpdatedAt,
+        descriptor.observedSha,
+        activationAt,
+        activationClaim.expectedCursorVersion + 1,
+        descriptor.manifestId,
+        expectedHeadVersion + 1,
+        activationClaim.activationToken,
+        activationClaim.receiptId,
+        descriptor.manifestId,
+        activationRequestDigest
+      ),
+    database
+      .prepare(
+        `INSERT INTO github_tree_activation_receipts
+         (receipt_id, activation_token, project_id, repository_id, ref,
+          manifest_id, run_id, expected_head_manifest_id,
+          expected_head_version, activated_head_version,
+          expected_cursor_observed_sha, expected_cursor_status,
+          expected_cursor_updated_at, expected_cursor_version,
+          activated_cursor_version,
+          expected_repository_configuration_version,
+          expected_repository_updated_at, observed_sha, sync_event_id,
+          sync_event_payload_digest, activation_request_digest, scheduled_for,
+          full_reconciliation, next_sync_at, history_gap_possible,
+          credential_status, etag, activated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                 ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .bind(
+        activationClaim.receiptId,
+        activationClaim.activationToken,
+        descriptor.projectId,
         descriptor.repositoryId,
         descriptor.ref,
         descriptor.manifestId,
-        descriptor.projectId
+        activationClaim.runId,
+        expectedManifestId,
+        expectedHeadVersion,
+        expectedHeadVersion + 1,
+        activationClaim.expectedCursorObservedSha,
+        activationClaim.expectedCursorStatus,
+        activationClaim.expectedCursorUpdatedAt,
+        activationClaim.expectedCursorVersion,
+        activationClaim.expectedCursorVersion + 1,
+        activationClaim.expectedRepositoryConfigurationVersion,
+        activationClaim.expectedRepositoryUpdatedAt,
+        descriptor.observedSha,
+        syncEvent.eventId,
+        syncEvent.payloadDigest,
+        activationRequestDigest,
+        scheduledAt,
+        activationClaim.fullReconciliation ? 1 : 0,
+        input.nextSyncAt,
+        historyGapPossible ? 1 : 0,
+        credentialStatus,
+        input.etag,
+        activationAt
       )
   );
-  const [headStatement] = statements.splice(headInsertionIndex, 1);
-  if (headStatement === undefined) {
-    throw reconciliationRequired();
-  }
-  statements.unshift(headStatement);
-  const headStatementIndex = 0;
-  const results = await database.batch(statements);
-  const headResult = results[headStatementIndex];
-  if ((headResult?.meta.changes ?? 0) !== 1) {
-    const current = await readActiveHead(database, descriptor);
-    if (current?.manifestId !== descriptor.manifestId) {
+  try {
+    await database.batch(statements);
+    return;
+  } catch (error) {
+    if (
+      await hasCommittedActivationReceipt(
+        database,
+        descriptor,
+        expectedManifestId,
+        expectedHeadVersion,
+        activationClaim,
+        scheduledAt,
+        syncEvent,
+        activationRequestDigest
+      )
+    ) {
+      return;
+    }
+    if (activationReceiptAssertionFailed(error)) {
       throw reconciliationRequired();
     }
+    throw error;
   }
-  const committed = await database
+}
+
+async function hasCommittedActivationReceipt(
+  database: D1Database,
+  descriptor: GitHubTreeManifestDescriptor,
+  expectedHeadManifestId: string | null,
+  expectedHeadVersion: number,
+  activationClaim: GitHubTreeManifestActivationClaim,
+  scheduledAt: string,
+  syncEvent: {
+    eventId: string;
+    payloadDigest: string;
+  },
+  activationRequestDigest: string
+): Promise<boolean> {
+  const row = await database
     .withSession("first-primary")
     .prepare(
-      `SELECT head.manifest_id, cursor.observed_sha
-       FROM github_tree_ref_heads AS head
-       JOIN sync_cursors AS cursor
-         ON cursor.project_id = head.project_id
-        AND cursor.repository_id = head.repository_id
-        AND cursor.ref = head.ref
-       WHERE head.project_id = ? AND head.repository_id = ? AND head.ref = ?`
+      `SELECT receipt_id
+       FROM github_tree_activation_receipts
+       WHERE receipt_id = ? AND activation_token = ?
+         AND project_id = ? AND repository_id = ?
+         AND ref = ? AND manifest_id = ? AND run_id = ?
+         AND expected_head_manifest_id IS ?
+         AND expected_head_version = ?
+         AND activated_head_version = ?
+         AND expected_cursor_observed_sha IS ?
+         AND expected_cursor_status = ?
+         AND expected_cursor_updated_at = ?
+         AND expected_cursor_version = ?
+         AND expected_repository_configuration_version = ?
+         AND expected_repository_updated_at = ?
+         AND observed_sha = ?
+         AND sync_event_id = ?
+         AND sync_event_payload_digest = ?
+         AND activation_request_digest = ?
+         AND scheduled_for = ? AND full_reconciliation = ?
+         AND activated_cursor_version = expected_cursor_version + 1`
     )
-    .bind(descriptor.projectId, descriptor.repositoryId, descriptor.ref)
-    .first<{ manifest_id: string; observed_sha: string | null }>();
-  if (
-    committed?.manifest_id !== descriptor.manifestId ||
-    committed.observed_sha !== descriptor.observedSha
-  ) {
-    throw reconciliationRequired();
-  }
+    .bind(
+      activationClaim.receiptId,
+      activationClaim.activationToken,
+      descriptor.projectId,
+      descriptor.repositoryId,
+      descriptor.ref,
+      descriptor.manifestId,
+      activationClaim.runId,
+      expectedHeadManifestId,
+      expectedHeadVersion,
+      expectedHeadVersion + 1,
+      activationClaim.expectedCursorObservedSha,
+      activationClaim.expectedCursorStatus,
+      activationClaim.expectedCursorUpdatedAt,
+      activationClaim.expectedCursorVersion,
+      activationClaim.expectedRepositoryConfigurationVersion,
+      activationClaim.expectedRepositoryUpdatedAt,
+      descriptor.observedSha,
+      syncEvent.eventId,
+      syncEvent.payloadDigest,
+      activationRequestDigest,
+      scheduledAt,
+      activationClaim.fullReconciliation ? 1 : 0
+    )
+    .first<{ receipt_id: string }>();
+  return row !== null;
+}
+
+function activationReceiptAssertionFailed(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return (
+    message.includes("GitHub tree activation receipt final state is invalid") ||
+    message.includes("github_tree_activation_receipts.") ||
+    message.includes("github_tree_activation_witnesses.") ||
+    message.includes("GitHub tree activation witness pre-state is invalid")
+  );
 }
 
 export async function readActiveGitHubTreeHead(
@@ -629,7 +1024,7 @@ export async function readActiveGitHubTreeHead(
   const row = await database
     .withSession("first-primary")
     .prepare(
-      `SELECT head.manifest_id, manifest.observed_sha
+      `SELECT head.manifest_id, head.head_version, manifest.observed_sha
        FROM github_tree_ref_heads AS head
        JOIN github_tree_manifests AS manifest
          ON manifest.project_id = head.project_id
@@ -640,22 +1035,18 @@ export async function readActiveGitHubTreeHead(
          AND manifest.status = 'complete'`
     )
     .bind(projectId, repositoryId, ref)
-    .first<{ manifest_id: string; observed_sha: string }>();
+    .first<{
+      manifest_id: string;
+      head_version: number;
+      observed_sha: string;
+    }>();
   return row === null
     ? null
-    : { manifestId: row.manifest_id, observedSha: row.observed_sha };
-}
-
-async function readActiveHead(
-  database: D1Database,
-  descriptor: GitHubTreeManifestDescriptor
-): Promise<GitHubTreeHead | null> {
-  return await readActiveGitHubTreeHead(
-    database,
-    descriptor.projectId,
-    descriptor.repositoryId,
-    descriptor.ref
-  );
+    : {
+        manifestId: row.manifest_id,
+        observedSha: row.observed_sha,
+        headVersion: row.head_version
+      };
 }
 
 async function readManifest(

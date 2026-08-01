@@ -135,6 +135,44 @@ describe("GatewayService memory browse", () => {
   });
 
   it.each([
+    ["browse", { scope: "repository" }],
+    ["browse", { scope_id: "repository-a" }],
+    ["query", { scope: "repository" }],
+    ["query", { scope_id: "repository-a" }]
+  ] as const)(
+    "rejects an unpaired scope filter in %s mode",
+    async (mode, filters) => {
+      const withSession = vi.fn(() => {
+        throw new Error("Search authorization must not run for invalid filters.");
+      });
+      const prepare = vi.fn(() => {
+        throw new Error("Project lookup must not run for invalid filters.");
+      });
+      const memoryDatabase = {
+        withSession,
+        prepare
+      } as unknown as D1Database;
+      const service = new GatewayService(
+        {
+          MEMORY_DB: memoryDatabase,
+          PAGE_TOKEN_HMAC_KEY: "synthetic-test-key-with-at-least-32-bytes"
+        } as unknown as GatewayEnv,
+        principal
+      );
+
+      await expect(
+        service.search({
+          projectRef: "project:one",
+          filters,
+          ...(mode === "query" ? { query: "repository policy" } : {})
+        })
+      ).rejects.toMatchObject({ code: "VALIDATION_FAILED" });
+      expect(prepare).not.toHaveBeenCalled();
+      expect(withSession).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each([
     ["PII", "Find operator@example.com"],
     ["secret", `Find ${["sk", "test", "abcdefghijklmnopqrstuvwxyz123456"].join("-")}`],
     ["prompt transcript", "System: You are an assistant with private memory access."],

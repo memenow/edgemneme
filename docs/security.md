@@ -18,20 +18,65 @@ D1, R2, Queue messages, Workflow payloads, logs, exceptions, tests, or model
 input.
 
 The tracked `github-sync` configuration is inert: its runtime gate is false, its
-Cron Trigger list is empty, and it declares no required credential secret. An
-enabled deployment renders all three values explicitly and verifies the remote
-schedule plus an exact one-item secret allowlist containing only
-`GITHUB_CLASSIC_TOKEN`. A disabled transition deploys the runtime guard
-before deleting the Cloudflare secret, then verifies that both the Cron list and
-the complete Worker secret list are empty. The scheduled handler checks the runtime gate
-before any D1, GitHub, or token access. GitHub environment-secret deletion and
-PAT revocation remain explicit operator actions after reconciliation.
+Cron Trigger list is empty, and it declares no required credential secret. It
+still declares the exact three private Workflow entrypoints required by an
+enabled deployment. Enabling renders the runtime gate, one six-hour Cron, and
+one required secret, then verifies the exact Workflow set, schedule, and
+one-item secret allowlist containing only `GITHUB_CLASSIC_TOKEN`.
+
+A disabled transition is five-stage and fail-closed. It deploys the runtime
+guard with no Cron while retaining the secret, exhaustively proves that the
+exact three GitHub Workflows have no nonterminal instances, reconciles only the
+GitHub synchronization ledgers, requires two clear observations 60 seconds
+apart, and only then deletes and verifies the Worker secret. The scheduled
+handler checks the runtime gate before any D1, GitHub, or token access.
+
+The ledger helper is available only to the protected deployment and migration
+Actions. Every pass is bounded to 20 candidates per phase, 18 Cloudflare HTTP
+requests, and 288 D1 statements. It uses a fixed D1 REST origin, parameterized
+queries, 1 MiB encoded request and response body limits, primary-service
+attestation, a native number/null parameter preflight, immutable receipts, and
+exact CAS verification. The exact
+disabled Worker, empty schedule, and empty Workflow control plane are checked
+before and after every pass, including a pass that returns `pending`. This proof
+allows the helper to settle a matching unexpired operational lease without
+racing a live Workflow. It cannot write formal memories, revisions, project
+versions, or audit chains; D1 remains authoritative and the project coordinator
+remains the only formal-memory commit path.
+
+The 60-second cadence leaves headroom under Cloudflare's shared
+[Client API limit](https://developers.cloudflare.com/fundamentals/api/reference/limits/).
+HTTP 429, unknown or malformed responses, repeated cursors, partial schema,
+version drift, or new work fails closed without secret deletion and without a
+silent API retry. Receipt verification makes a later reviewed rerun resumable.
+The initial migration drain may reconcile before backup; the final post-backup
+gate is read-only. GitHub environment-secret deletion and PAT revocation remain
+explicit operator actions after reconciliation.
 
 The protected `MEMORY_GATEWAY_EXPECTED_HOST` deployment variable contains only
 the exact public hostname. Before any deployment write, the workflow requires
 the public URL to be an HTTPS `/mcp` endpoint on that host. The same pin is
 passed to the bearer-bearing canary but not to the Wrangler renderer or custom
 route configuration, including when the gateway uses `workers.dev`.
+
+## MCP ingress boundary
+
+The public Worker serves only `/mcp`. It validates browser origins, applies edge
+and client rate limits, authenticates the project bearer token, and applies the
+principal rate limit before handing a POST body to the MCP transport. The whole
+POST body is then bounded to 2 MiB of request-body bytes visible to the Worker.
+This excludes HTTP chunk and frame overhead. `Content-Length` enables an early
+rejection but is never trusted as the authoritative count of a delivered stream.
+
+The gateway accepts only an absent or identity `Content-Encoding`; it does not
+decompress client bodies. It reads an accepted stream in bounded chunks, cancels
+the reader after detecting the first byte over the limit, reconstructs an exact
+bounded request, and only then invokes the MCP parser. Malformed declared
+lengths, unsupported encodings, and oversized bodies return HTTP 400, 415, and
+413 respectively in a non-cacheable JSON-RPC error envelope when the request
+reaches the Worker. Cloudflare can reject malformed HTTP framing or headers
+before Worker execution with its own platform response. This boundary limits
+parser memory exposure and avoids compressed-body expansion inside the Worker.
 
 ## Project and repository isolation
 
@@ -78,18 +123,80 @@ The GitHub client:
 - verifies both repository and owner numeric IDs before accessing refs or
   content; owner/name are routing labels only;
 - synchronizes the configured default branch in addition to explicit tracked
-  refs and fails closed on an unreviewed default-branch rename;
+  refs, prevents enabling a GitHub repository without that configured branch,
+  and fails closed on an unreviewed default-branch rename;
 - requires a successful `/user` response to include a strictly formatted
   `GitHub-Authentication-Token-Expiration` header and fails closed before
   repository enumeration when it is missing, malformed, or expired;
-- enforces per-blob, file-count, and total-byte limits; and
-- enforces a shared 900-request invocation budget before issuing each request,
-  with exhaustion reported as `GITHUB_PARTIAL_SYNC`.
+- enforces per-blob, file-count, and total-byte limits;
+- streams every successful GitHub JSON response through an endpoint-specific
+  byte limit, cancels an oversized body, and reports a partial sync without
+  advancing the cursor or selected head;
+- gives access-baseline discovery its own 900-request internal budget;
+- gives every ref Workflow a new 2,005-request client, a 2,000-text-file limit,
+  a 16 MiB retrieval limit, per-fetch cancellation, and an absolute run
+  deadline;
+- materializes every due ref as a durable item instead of imposing a per-Cron
+  two-ref rotation; and
+- routes dispatcher and ref access through one D1 credential lane that fences
+  the credential version, holder, unique claim, lease epoch, and expiration,
+  with deterministic jitter and backoff between contenders.
+
+These internal budgets are fail-closed application bounds, not reservations of
+GitHub or Cloudflare capacity. GitHub may reject a request earlier under its
+[primary or secondary REST limits](https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api),
+and the Worker remains subject to its configured
+[Cloudflare platform limits](https://developers.cloudflare.com/workers/platform/limits/).
+The GitHub sync Worker explicitly configures a 10,000-subrequest platform limit.
+Each of its three Workflow definitions also pins a 10,000-step limit. Prior
+dispatch reconciliation reserves a shared 7,200-subrequest maximum before
+writes, including configured retries, so at least 2,800 subrequests remain for
+the dispatcher's baseline, materialization, and fan-out path.
+That is a per-invocation Cloudflare ceiling, not an aggregate reservation for a
+Cron fan-out. Every due ref can be durably scheduled, but EdgeMneme does not
+promise that an arbitrary number of maximum-cost refs will finish in the same
+six-hour slot. Budget or deadline exhaustion is reported as
+`GITHUB_PARTIAL_SYNC` before another fetch is issued and never advances the
+active head or cursor.
+
+Each dispatch item freezes the selected ref, scheduled slot, reconciliation
+mode, active manifest and head version, repository configuration version, and
+cursor version. A per-ref run claim includes that identity. Manifest
+activation starts by inserting an immutable witness that validates that exact
+pre-state and an unexpired run lease. The same D1 batch writes the deltas,
+candidate artifacts, outbox event, active head, cursor, and terminal run state,
+then inserts an immutable receipt whose trigger validates the complete final
+state. A response-loss retry succeeds only when its activation token and request
+digest match that committed receipt. Stale configuration, cursor, head, or run
+claims fail closed instead of being accepted after an ABA state transition.
+An item rejected before a run is claimed writes an immutable rejection receipt;
+a claimed child writes an immutable finish receipt bound to the exact dispatch
+item and terminal run state. Production dispatch ledgers, materialization
+receipts, credential lanes,
+synchronization cursors, run claims, witnesses, and receipts cannot be deleted;
+the bounded synthetic-project cleanup path is the only exception.
+
+Session consolidation uses the same fail-closed transaction posture. Every
+deterministic model batch is fenced by the current owner, unique claim ID,
+monotonic lease epoch, and operation witness. Candidate, evidence, review, and
+output rows commit with one immutable batch receipt, including for an empty
+result. An ambiguous response can recover only an exact receipt through a fresh
+primary read; a same-hash race loser rolls back instead of manufacturing a
+candidate or receipt. Consolidation cannot finish until all expected receipts
+have been validated. Receipt insertion verifies each bounded manifest in full;
+indexed D1 guards then freeze the stable input, candidate, output, evidence-link,
+and review identity it proved. Completion reads only compact receipt coordinates and
+metadata, so the 9,000-batch boundary cannot materialize manifest bodies in a
+Worker isolate.
 
 A PAT (classic) with `repo` scope is not truly read-only. If stolen, it can
 exercise the full scope outside EdgeMneme. The accepted design therefore
 requires a short expiration, explicit repository-ID baseline approval, alerts
 for access expansion, and immediate revocation during rotation.
+Authenticated-repository pages are projected immediately to numeric repository
+and owner IDs plus permission booleans. The connector retains no raw repository
+objects across pages and fails with `GITHUB_PARTIAL_SYNC` before exceeding
+10,000 repositories or 100 pages; it never accepts a truncated access baseline.
 
 D1 records only the credential version, observed expiration time, public status,
 and idempotent 14-, 7-, and 1-day warning events. It never records the token,
@@ -104,6 +211,11 @@ Secret-shaped values, private keys, bearer tokens, email addresses, US Social
 Security numbers, prompt transcripts, and raw log dumps are rejected from model
 input. This scanner is defense in depth; operators must still avoid submitting
 credentials, customer data, full prompts, raw logs, or large diffs.
+Before a candidate reaches Workers AI, the complete canonical model payload is
+also inspected under the aggregate memory-model byte limit. Raw repository refs
+are excluded from model evidence metadata; opaque evidence IDs, source type,
+repository authority, and a repository-context boolean are sufficient for the
+model's constrained scope choice.
 
 GitHub ingestion uses a 16 KiB memory-model input limit. Text no larger than
 16 KiB becomes `clear` evidence linked to a deterministic queued candidate only

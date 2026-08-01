@@ -1,5 +1,19 @@
 const API_ORIGIN = "https://api.github.com";
 const API_VERSION = "2026-03-10";
+const GITHUB_SUCCESS_JSON_MAX_BYTES = {
+  user: 64 * 1024,
+  repositoryPage: 4 * 1024 * 1024,
+  repository: 512 * 1024,
+  ref: 256 * 1024,
+  commit: 4 * 1024 * 1024,
+  compare: 8 * 1024 * 1024,
+  tree: 8 * 1024 * 1024,
+  blob: 128 * 1024
+} as const;
+const AUTHENTICATED_REPOSITORIES_PER_PAGE = 100;
+export const MAX_AUTHENTICATED_REPOSITORIES = 10_000;
+const MAX_AUTHENTICATED_REPOSITORY_PAGES =
+  MAX_AUTHENTICATED_REPOSITORIES / AUTHENTICATED_REPOSITORIES_PER_PAGE;
 const SEGMENT = "[A-Za-z0-9_.-]+";
 const SHA = "[A-Fa-f0-9]{40,128}";
 const ALLOWED_PATHS = [
@@ -13,11 +27,25 @@ const ALLOWED_PATHS = [
   new RegExp(`^/repos/${SEGMENT}/${SEGMENT}/git/blobs/${SHA}$`, "u")
 ] as const;
 
-interface GitHubClientOptions {
+export interface GitHubRequestPacer {
+  wait(): Promise<void>;
+}
+
+export interface GitHubRequestPacerOptions {
+  minimumIntervalMs: number;
+  now?: () => number;
+  sleep?: (delayMs: number) => Promise<void>;
+}
+
+export interface GitHubClientOptions {
   token: string;
   fetcher?: typeof fetch;
   allowedRepositoryIds: ReadonlySet<number>;
   maxRequests?: number;
+  beforeRequest?: GitHubRequestPacer;
+  requestTimeoutMs?: number;
+  absoluteDeadlineMs?: number;
+  now?: () => number;
 }
 
 export interface GitHubUser {
@@ -33,7 +61,6 @@ export interface RepositoryMetadata {
 
 export interface RepositoryAccess {
   id: number;
-  full_name: string;
   owner: { id: number };
   permissions: {
     pull: boolean;
@@ -148,6 +175,10 @@ export class GitHubReadOnlyClient {
   private readonly token: string;
   private readonly fetcher: typeof fetch;
   private readonly allowedRepositoryIds: ReadonlySet<number>;
+  private readonly beforeRequest: GitHubRequestPacer | undefined;
+  private readonly requestTimeoutMs: number;
+  private readonly absoluteDeadlineMs: number | undefined;
+  private readonly now: () => number;
   private readonly verifiedRepositories = new Set<string>();
   private remainingRequests: number | null;
 
@@ -155,6 +186,10 @@ export class GitHubReadOnlyClient {
     this.token = options.token;
     this.fetcher = options.fetcher ?? fetch;
     this.allowedRepositoryIds = options.allowedRepositoryIds;
+    this.beforeRequest = options.beforeRequest;
+    this.requestTimeoutMs = options.requestTimeoutMs ?? 30_000;
+    this.absoluteDeadlineMs = options.absoluteDeadlineMs;
+    this.now = options.now ?? Date.now;
     if (
       options.maxRequests !== undefined &&
       (!Number.isSafeInteger(options.maxRequests) || options.maxRequests < 1)
@@ -162,6 +197,19 @@ export class GitHubReadOnlyClient {
       throw new TypeError("maxRequests must be a positive safe integer");
     }
     this.remainingRequests = options.maxRequests ?? null;
+    if (
+      !Number.isSafeInteger(this.requestTimeoutMs) ||
+      this.requestTimeoutMs < 1 ||
+      this.requestTimeoutMs > 120_000
+    ) {
+      throw new TypeError("requestTimeoutMs must be between one and 120000");
+    }
+    if (
+      this.absoluteDeadlineMs !== undefined &&
+      (!Number.isFinite(this.absoluteDeadlineMs) || this.absoluteDeadlineMs < 0)
+    ) {
+      throw new TypeError("absoluteDeadlineMs must be a non-negative finite number");
+    }
   }
 
   static isAllowedEndpoint(method: string, path: string): boolean {
@@ -202,31 +250,53 @@ export class GitHubReadOnlyClient {
       affiliation: "owner,collaborator,organization_member",
       sort: "full_name",
       direction: "asc",
-      per_page: "100",
+      per_page: String(AUTHENTICATED_REPOSITORIES_PER_PAGE),
       page: "1"
     }).toString();
-    const repositories: RepositoryAccess[] = [];
+    const repositories = new Map<number, RepositoryAccess>();
     const scopes = new Set<string>();
     let rateLimit: GitHubRateLimit | undefined;
     let pageCount = 0;
     while (nextUrl !== undefined) {
       pageCount += 1;
-      if (pageCount > 10_000) {
-        throw repositoryUnavailable();
+      if (pageCount > MAX_AUTHENTICATED_REPOSITORY_PAGES) {
+        throw new GitHubSyncError("GITHUB_PARTIAL_SYNC");
       }
       const response = await this.send(nextUrl);
       if (!response.ok) {
-        throw mapGitHubError(response);
+        throw await mapGitHubError(response);
       }
-      const page = (await response.json()) as unknown;
-      if (!Array.isArray(page)) {
+      const page = await readBoundedGitHubJson(
+        response,
+        successJsonMaxBytes(nextUrl)
+      );
+      if (
+        !Array.isArray(page) ||
+        page.length > AUTHENTICATED_REPOSITORIES_PER_PAGE
+      ) {
         throw repositoryUnavailable();
       }
       for (const item of page) {
-        if (!isRepositoryAccess(item)) {
+        const repository = parseRepositoryAccess(item);
+        if (repository === null) {
           throw repositoryUnavailable();
         }
-        repositories.push(item);
+        const prior = repositories.get(repository.id);
+        if (prior !== undefined && prior.owner.id !== repository.owner.id) {
+          throw new GitHubSyncError("GITHUB_RECONCILIATION_REQUIRED");
+        }
+        repositories.set(repository.id, {
+          id: repository.id,
+          owner: { id: repository.owner.id },
+          permissions: {
+            pull: (prior?.permissions.pull ?? false) || repository.permissions.pull,
+            push: (prior?.permissions.push ?? false) || repository.permissions.push,
+            admin: (prior?.permissions.admin ?? false) || repository.permissions.admin
+          }
+        });
+        if (repositories.size > MAX_AUTHENTICATED_REPOSITORIES) {
+          throw new GitHubSyncError("GITHUB_PARTIAL_SYNC");
+        }
       }
       for (const scope of parseScopes(response.headers)) {
         scopes.add(scope);
@@ -235,7 +305,9 @@ export class GitHubReadOnlyClient {
       nextUrl = readNextPage(response.headers.get("link"));
     }
     return {
-      repositories,
+      repositories: [...repositories.values()].sort(
+        (left, right) => left.id - right.id
+      ),
       scopes: [...scopes].sort(),
       rateLimit
     };
@@ -391,7 +463,7 @@ export class GitHubReadOnlyClient {
       throw repositoryUnavailable();
     }
     if (response.status !== 304 && !response.ok) {
-      throw mapGitHubError(response);
+      throw await mapGitHubError(response);
     }
     const credentialExpiresAt = requireCredentialExpiration
       ? parseCredentialExpiration(response.headers)
@@ -407,7 +479,10 @@ export class GitHubReadOnlyClient {
     }
     return {
       status: "modified",
-      value: (await response.json()) as T,
+      value: (await readBoundedGitHubJson(
+        response,
+        successJsonMaxBytes(url)
+      )) as T,
       ...metadata
     };
   }
@@ -417,7 +492,7 @@ export class GitHubReadOnlyClient {
     const headers = new Headers({
       Accept: "application/vnd.github+json",
       Authorization: `Bearer ${this.token}`,
-      "User-Agent": "EdgeMneme/0.1",
+      "User-Agent": "EdgeMneme",
       "X-GitHub-Api-Version": API_VERSION
     });
     if (ifNoneMatch !== undefined) {
@@ -436,13 +511,41 @@ export class GitHubReadOnlyClient {
       }
       this.remainingRequests -= 1;
     }
-    const response = await this.fetcher(
-      new Request(url, {
-        method: "GET",
-        redirect: "manual",
-        headers
-      })
-    );
+    await this.beforeRequest?.wait();
+    const now = this.now();
+    if (!Number.isFinite(now)) {
+      throw new TypeError("GitHub client clock must return a finite number");
+    }
+    const remainingMs =
+      this.absoluteDeadlineMs === undefined
+        ? this.requestTimeoutMs
+        : Math.min(this.requestTimeoutMs, this.absoluteDeadlineMs - now);
+    if (remainingMs < 1) {
+      throw new GitHubSyncError("GITHUB_PARTIAL_SYNC");
+    }
+    const signal = AbortSignal.timeout(Math.max(1, Math.floor(remainingMs)));
+    let response: Response;
+    try {
+      response = await this.fetcher(
+        new Request(url, {
+          method: "GET",
+          redirect: "manual",
+          headers,
+          signal
+        })
+      );
+    } catch {
+      if (signal.aborted) {
+        throw new GitHubSyncError("GITHUB_PARTIAL_SYNC", {
+          retryable: true,
+          retryAfterMs: 1_000
+        });
+      }
+      throw new GitHubSyncError("GITHUB_REPOSITORY_UNAVAILABLE", {
+        retryable: true,
+        retryAfterMs: 1_000
+      });
+    }
     if (response.status >= 300 && response.status < 400 && response.status !== 304) {
       throw repositoryUnavailable();
     }
@@ -462,6 +565,50 @@ export class GitHubReadOnlyClient {
       throw repositoryUnavailable();
     }
   }
+}
+
+export function createGitHubRequestPacer(
+  options: GitHubRequestPacerOptions
+): GitHubRequestPacer {
+  if (
+    !Number.isFinite(options.minimumIntervalMs) ||
+    options.minimumIntervalMs < 0
+  ) {
+    throw new TypeError("minimumIntervalMs must be a non-negative finite number");
+  }
+  const now = options.now ?? Date.now;
+  const sleep =
+    options.sleep ??
+    ((delayMs: number) =>
+      new Promise<void>((resolve) => {
+        setTimeout(resolve, delayMs);
+      }));
+  let previousStartAt: number | null = null;
+  let gate = Promise.resolve();
+  return {
+    wait(): Promise<void> {
+      const turn = gate.then(async () => {
+        const current = now();
+        if (!Number.isFinite(current)) {
+          throw new TypeError("request pacer clock must return a finite number");
+        }
+        const delayMs =
+          previousStartAt === null
+            ? 0
+            : Math.max(0, previousStartAt + options.minimumIntervalMs - current);
+        if (delayMs > 0) {
+          await sleep(delayMs);
+        }
+        const startedAt = now();
+        if (!Number.isFinite(startedAt)) {
+          throw new TypeError("request pacer clock must return a finite number");
+        }
+        previousStartAt = startedAt;
+      });
+      gate = turn.catch(() => undefined);
+      return turn;
+    }
+  };
 }
 
 function assertAllowedUrl(url: URL): void {
@@ -541,23 +688,52 @@ function readNextPage(link: string | null): URL | undefined {
   return undefined;
 }
 
-function isRepositoryAccess(value: unknown): value is RepositoryAccess {
+function parseRepositoryAccess(value: unknown): RepositoryAccess | null {
   if (typeof value !== "object" || value === null) {
-    return false;
+    return null;
   }
-  const candidate = value as Partial<RepositoryAccess>;
-  return (
-    Number.isSafeInteger(candidate.id) &&
-    typeof candidate.full_name === "string" &&
-    Number.isSafeInteger(candidate.owner?.id) &&
-    typeof candidate.permissions?.pull === "boolean" &&
-    typeof candidate.permissions.push === "boolean" &&
-    typeof candidate.permissions.admin === "boolean"
-  );
+  const candidate = value as {
+    id?: unknown;
+    full_name?: unknown;
+    owner?: { id?: unknown };
+    permissions?: { pull?: unknown; push?: unknown; admin?: unknown };
+  };
+  const id = candidate.id;
+  const ownerId = candidate.owner?.id;
+  const pull = candidate.permissions?.pull;
+  const push = candidate.permissions?.push;
+  const admin = candidate.permissions?.admin;
+  if (
+    typeof id !== "number" ||
+    !Number.isSafeInteger(id) ||
+    id <= 0 ||
+    typeof candidate.full_name !== "string" ||
+    typeof ownerId !== "number" ||
+    !Number.isSafeInteger(ownerId) ||
+    ownerId <= 0 ||
+    typeof pull !== "boolean" ||
+    typeof push !== "boolean" ||
+    typeof admin !== "boolean"
+  ) {
+    return null;
+  }
+  return {
+    id,
+    owner: { id: ownerId },
+    permissions: {
+      pull,
+      push,
+      admin
+    }
+  };
 }
 
 function encodeSegment(value: string): string {
-  if (!new RegExp(`^${SEGMENT}$`, "u").test(value)) {
+  if (
+    value === "." ||
+    value === ".." ||
+    !new RegExp(`^${SEGMENT}$`, "u").test(value)
+  ) {
     throw repositoryUnavailable();
   }
   return encodeURIComponent(value);
@@ -668,8 +844,70 @@ function repositoryUnavailable(): GitHubSyncError {
   return new GitHubSyncError("GITHUB_REPOSITORY_UNAVAILABLE");
 }
 
-function mapGitHubError(response: Response): GitHubSyncError {
+function successJsonMaxBytes(url: URL): number {
+  const path = url.pathname;
+  if (path === "/user") return GITHUB_SUCCESS_JSON_MAX_BYTES.user;
+  if (path === "/user/repos") {
+    return GITHUB_SUCCESS_JSON_MAX_BYTES.repositoryPage;
+  }
+  if (path.includes("/git/ref/")) return GITHUB_SUCCESS_JSON_MAX_BYTES.ref;
+  if (path.includes("/commits/")) return GITHUB_SUCCESS_JSON_MAX_BYTES.commit;
+  if (path.includes("/compare/")) return GITHUB_SUCCESS_JSON_MAX_BYTES.compare;
+  if (path.includes("/git/trees/")) return GITHUB_SUCCESS_JSON_MAX_BYTES.tree;
+  if (path.includes("/git/blobs/")) return GITHUB_SUCCESS_JSON_MAX_BYTES.blob;
+  return GITHUB_SUCCESS_JSON_MAX_BYTES.repository;
+}
+
+async function readBoundedGitHubJson(
+  response: Response,
+  maxBytes: number
+): Promise<unknown> {
+  const contentLength = response.headers.get("content-length");
+  if (
+    contentLength !== null &&
+    /^[0-9]+$/u.test(contentLength) &&
+    Number(contentLength) > maxBytes
+  ) {
+    await response.body?.cancel().catch(() => undefined);
+    throw new GitHubSyncError("GITHUB_PARTIAL_SYNC");
+  }
+
+  const body = response.body;
+  if (body === null) {
+    return JSON.parse("") as unknown;
+  }
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value.byteLength > maxBytes - total) {
+        await reader.cancel().catch(() => undefined);
+        throw new GitHubSyncError("GITHUB_PARTIAL_SYNC");
+      }
+      total += value.byteLength;
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return JSON.parse(new TextDecoder().decode(bytes)) as unknown;
+}
+
+async function mapGitHubError(response: Response): Promise<GitHubSyncError> {
   const rateLimit = parseRateLimit(response.headers);
+  const message = response.status === 403
+    ? await readBoundedGitHubErrorMessage(response)
+    : "";
   if (response.status === 401) {
     return new GitHubSyncError("GITHUB_AUTHORIZATION_REQUIRED", { rateLimit });
   }
@@ -679,7 +917,10 @@ function mapGitHubError(response: Response): GitHubSyncError {
   if (
     response.status === 429 ||
     (response.status === 403 &&
-      (rateLimit?.remaining === 0 || rateLimit?.retryAfterMs !== undefined))
+      (rateLimit?.remaining === 0 ||
+        rateLimit?.retryAfterMs !== undefined ||
+        message.includes("secondary rate limit") ||
+        message.includes("abuse detection")))
   ) {
     const resetDelay =
       rateLimit?.resetAt === undefined
@@ -692,5 +933,67 @@ function mapGitHubError(response: Response): GitHubSyncError {
       rateLimit
     });
   }
+  if (response.status >= 500 && response.status <= 599) {
+    return new GitHubSyncError("GITHUB_REPOSITORY_UNAVAILABLE", {
+      retryable: true,
+      retryAfterMs: rateLimit?.retryAfterMs ?? 1_000,
+      rateLimit
+    });
+  }
+  if (response.status === 403) {
+    const namesClassicToken =
+      message.includes("classic personal access token") ||
+      message.includes("personal access token (classic)") ||
+      message.includes("personal access tokens (classic)");
+    if (
+      namesClassicToken &&
+      (message.includes("disabled") || message.includes("not allowed"))
+    ) {
+      return new GitHubSyncError("GITHUB_CLASSIC_PAT_BLOCKED", { rateLimit });
+    }
+    return new GitHubSyncError("GITHUB_PERMISSION_INSUFFICIENT", { rateLimit });
+  }
   return new GitHubSyncError("GITHUB_REPOSITORY_UNAVAILABLE", { rateLimit });
+}
+
+async function readBoundedGitHubErrorMessage(response: Response): Promise<string> {
+  try {
+    const contentLength = response.headers.get("content-length");
+    if (
+      contentLength !== null &&
+      Number.isFinite(Number(contentLength)) &&
+      Number(contentLength) > 16_384
+    ) {
+      return "";
+    }
+    const body = response.body;
+    if (body === null) return "";
+    const reader = body.getReader();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > 16_384) {
+        void reader.cancel().catch(() => undefined);
+        return "";
+      }
+      chunks.push(value);
+    }
+    const bytes = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    const payload = JSON.parse(new TextDecoder().decode(bytes)) as {
+      message?: unknown;
+    };
+    return typeof payload.message === "string"
+      ? payload.message.slice(0, 4_096).toLowerCase()
+      : "";
+  } catch {
+    return "";
+  }
 }

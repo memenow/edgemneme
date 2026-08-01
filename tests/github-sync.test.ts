@@ -1,5 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
-import type { GitHubReadOnlyClient } from "../src/github/client";
+import {
+  createGitHubRequestPacer,
+  MAX_AUTHENTICATED_REPOSITORIES,
+  type GitHubReadOnlyClient,
+  type GitHubRequestPacer
+} from "../src/github/client";
 import githubSyncWorker, {
   buildGitHubBlobCandidate,
   buildStableSyncEvent,
@@ -10,6 +15,7 @@ import githubSyncWorker, {
   evaluateAccessBaseline,
   parseApprovedAccessBaseline,
   parseTrackedRefs,
+  runScheduledGitHubSync,
   type AccessBaseline
 } from "../workers/github-sync/index";
 
@@ -20,6 +26,10 @@ const SAFE_BLOB_SHA = "d".repeat(40);
 const SENSITIVE_BLOB_SHA = "e".repeat(40);
 const PROMPT_BLOB_SHA = "f".repeat(40);
 const RAW_LOG_BLOB_SHA = "1".repeat(40);
+const RELEASE_SHA = "2".repeat(40);
+const RELEASE_TREE_SHA = "3".repeat(40);
+const SECOND_REPOSITORY_SHA = "4".repeat(40);
+const SECOND_REPOSITORY_TREE_SHA = "5".repeat(40);
 const TOKEN_EXPIRATION_HEADER = "2099-10-26 00:00:00 UTC";
 const TOKEN_EXPIRATION_ISO = "2099-10-26T00:00:00.000Z";
 
@@ -291,6 +301,10 @@ describe("GitHub sync policy", () => {
       "GITHUB_RECONCILIATION_REQUIRED",
       "GITHUB_RECONCILIATION_REQUIRED"
     ]);
+    expect(failures.map((bindings) => bindings.slice(1, 3))).toEqual([
+      ["repository-1", "refs/heads/main"],
+      ["repository-2", "refs/heads/main"]
+    ]);
   });
 
   it("fails every configured repository without network access when baseline is missing", async () => {
@@ -309,6 +323,10 @@ describe("GitHub sync policy", () => {
     expect(failures.map((bindings) => bindings[5])).toEqual([
       "GITHUB_RECONCILIATION_REQUIRED",
       "GITHUB_RECONCILIATION_REQUIRED"
+    ]);
+    expect(failures.map((bindings) => bindings.slice(1, 3))).toEqual([
+      ["repository-1", "refs/heads/main"],
+      ["repository-2", "refs/heads/main"]
     ]);
   });
 
@@ -393,6 +411,14 @@ describe("GitHub sync policy", () => {
     expect(() => parseTrackedRefs('["refs/heads/../admin"]', "main")).toThrowError(
       "GITHUB_REPOSITORY_UNAVAILABLE"
     );
+    expect(() =>
+      parseTrackedRefs(
+        JSON.stringify(
+          Array.from({ length: 513 }, (_, index) => `refs/heads/branch-${index}`)
+        ),
+        "main"
+      )
+    ).toThrowError("GITHUB_REPOSITORY_UNAVAILABLE");
   });
 
   it("classifies initial, unchanged, fast-forward, and force-push observations", () => {
@@ -653,13 +679,21 @@ describe("GitHub sync policy", () => {
       statement.sql.includes("'github_blob'")
     );
     const evidenceLink = statements.find((statement) =>
-      statement.sql.includes("INSERT INTO observation_evidence")
+      statement.sql.includes("INSERT INTO observation_evidence") &&
+      statement.sql.includes("json_extract(value, '$[0]')")
     );
     const outbox = statements.filter((statement) =>
       statement.sql.includes("INSERT INTO outbox_events")
     );
 
     expect(failures).toEqual([]);
+    expect(batches).toHaveLength(1);
+    expect(batches[0]?.[0]?.sql).toContain(
+      "INSERT INTO github_tree_activation_witnesses"
+    );
+    expect(batches[0]?.[batches[0].length - 1]?.sql).toContain(
+      "INSERT INTO github_tree_activation_receipts"
+    );
     expect(observation?.sql).toContain("'queued'");
     expect(observation?.sql).toContain("ON CONFLICT(project_id, observation_id)");
     const observationRows = parseJsonRows(observation?.bindings[3]);
@@ -719,13 +753,79 @@ describe("GitHub sync policy", () => {
     expect(JSON.stringify(statements)).not.toContain(rawLogContent);
   });
 
+  it("shares one request pacer across baseline and selected-ref clients", async () => {
+    const batches: CapturedStatement[][] = [];
+    const failures: unknown[][] = [];
+    const database = createFullSyncDatabase(batches, failures);
+    const fetcher = createFullSyncFetcher([]);
+    const beforeRequest = { wait: vi.fn().mockResolvedValue(undefined) };
+
+    await runScheduledWorker(database, fetcher, beforeRequest);
+
+    expect(failures).toEqual([]);
+    expect(fetcher).toHaveBeenCalledTimes(6);
+    expect(beforeRequest.wait).toHaveBeenCalledTimes(6);
+  });
+
+  it("keeps the production scheduled handler limited to stable Workflow starts", async () => {
+    const databaseAccess = vi.fn(() => {
+      throw new Error("scheduled handler accessed D1");
+    });
+    const dispatchCreate = vi.fn().mockResolvedValue({});
+    const retentionCreate = vi.fn().mockResolvedValue({});
+
+    await githubSyncWorker.scheduled(
+      {
+        scheduledTime: Date.parse("2026-07-29T06:17:00.000Z")
+      } as ScheduledController,
+      {
+        MEMORY_DB: { prepare: databaseAccess } as unknown as D1Database,
+        GITHUB_SYNC_ENABLED: "true",
+        GITHUB_CLASSIC_TOKEN: "synthetic-token",
+        GITHUB_CREDENTIAL_VERSION: "credential-current",
+        GITHUB_DISPATCH_WORKFLOW: {
+          create: dispatchCreate,
+          get: vi.fn()
+        } as unknown as Workflow,
+        GITHUB_RETENTION_WORKFLOW: {
+          create: retentionCreate,
+          get: vi.fn()
+        } as unknown as Workflow
+      },
+      {} as ExecutionContext
+    );
+
+    expect(databaseAccess).not.toHaveBeenCalled();
+    expect(dispatchCreate).toHaveBeenCalledOnce();
+    expect(retentionCreate).toHaveBeenCalledOnce();
+    expect(dispatchCreate.mock.calls[0]?.[0]).toMatchObject({
+      id: expect.stringMatching(/^ghd-[0-9a-f]{64}$/u),
+      params: { scheduledFor: "2026-07-29T06:00:00.000Z" }
+    });
+    expect(retentionCreate.mock.calls[0]?.[0]).toMatchObject({
+      id: expect.stringMatching(/^ghc-[0-9a-f]{64}$/u),
+      params: { utcDate: "2026-07-29" }
+    });
+    expect(JSON.stringify(dispatchCreate.mock.calls)).not.toContain(
+      "synthetic-token"
+    );
+  });
+
   it("uses the verified GitHub default branch to label tracked-ref evidence", async () => {
     const batches: CapturedStatement[][] = [];
     const failures: unknown[][] = [];
-    const database = createFullSyncDatabase(batches, failures, {
-      default_branch: "main",
-      tracked_refs_json: '["refs/heads/release"]'
-    });
+    const database = createFullSyncDatabase(
+      batches,
+      failures,
+      {
+        default_branch: "main",
+        tracked_refs_json: '["refs/heads/release"]'
+      },
+      [],
+      null,
+      [],
+      new Set(["repository-1:refs/heads/release"])
+    );
     const clientProvenance = {
       repository_id: "repository-attacker",
       repository_ref: "refs/heads/attacker",
@@ -791,12 +891,33 @@ describe("GitHub sync policy", () => {
 
     expect(batches).toEqual([]);
     expect(failures).toHaveLength(1);
+    expect(failures[0]?.slice(1, 3)).toEqual([
+      "repository-1",
+      "refs/heads/main"
+    ]);
     expect(failures[0]?.[5]).toBe("GITHUB_RECONCILIATION_REQUIRED");
     expect(
       fetcher.mock.calls.some(([input]) =>
         new URL((input as Request).url).pathname.includes("/git/ref/")
       )
     ).toBe(false);
+  });
+
+  it("records a rate limit against the exact selected ref", async () => {
+    const batches: CapturedStatement[][] = [];
+    const failures: unknown[][] = [];
+    const database = createFullSyncDatabase(batches, failures);
+    const fetcher = createFullSyncFetcher([], { refStatus: 429 });
+
+    await runScheduledWorker(database, fetcher);
+
+    expect(batches).toEqual([]);
+    expect(failures).toHaveLength(1);
+    expect(failures[0]?.slice(1, 3)).toEqual([
+      "repository-1",
+      "refs/heads/main"
+    ]);
+    expect(failures[0]?.[5]).toBe("GITHUB_RATE_LIMITED");
   });
 
   it("records GITHUB_PARTIAL_SYNC without fetching or persisting an oversized text blob", async () => {
@@ -935,6 +1056,99 @@ describe("GitHub sync policy", () => {
     ).toBe(true);
   });
 
+  it("completes a 2,000-blob ref with compare overhead without starving another repository", async () => {
+    const batches: CapturedStatement[][] = [];
+    const failures: unknown[][] = [];
+    const database = createFullSyncDatabase(
+      batches,
+      failures,
+      {
+        default_branch: "main",
+        tracked_refs_json: '["refs/heads/release"]'
+      },
+      [],
+      {
+        manifestId: "4".repeat(64),
+        observedSha: PREVIOUS_SHA,
+        etag: '"previous-etag"'
+      },
+      [repositoryRow("repository-2", 84)]
+    );
+    const fetcher = createRequestBudgetFetcher(2_000, true);
+
+    await runScheduledWorker(database, fetcher);
+
+    expect(failures).toEqual([]);
+    expect(requestExactCount(fetcher, "/repos/memenow/repository-42")).toBe(1);
+    expect(requestCount(fetcher, "/compare/")).toBe(1);
+    expect(requestCount(fetcher, "/git/blobs/")).toBe(2_000);
+    expect(requestCount(fetcher, "/git/ref/heads/release")).toBe(0);
+    expect(requestExactCount(fetcher, "/repos/memenow/repository-84")).toBe(1);
+    expect(requestCount(fetcher, `/commits/${SECOND_REPOSITORY_SHA}`)).toBe(1);
+    expect(requestCount(fetcher, `/git/trees/${SECOND_REPOSITORY_TREE_SHA}`)).toBe(1);
+    expect(fetcher).toHaveBeenCalledTimes(2 + (2_000 + 5) + 4);
+  }, 60_000);
+
+  it("keeps the largest supported access-baseline scan from consuming the ref budget", async () => {
+    const batches: CapturedStatement[][] = [];
+    const failures: unknown[][] = [];
+    const database = createFullSyncDatabase(batches, failures);
+    const maximumPages = MAX_AUTHENTICATED_REPOSITORIES / 100;
+    const fetcher = createBaselinePaginationFetcher(maximumPages);
+
+    await runScheduledWorker(database, fetcher);
+
+    expect(failures).toEqual([]);
+    expect(requestExactCount(fetcher, "/user")).toBe(1);
+    expect(requestExactCount(fetcher, "/user/repos")).toBe(maximumPages);
+    expect(requestExactCount(fetcher, "/repos/memenow/repository-42")).toBe(1);
+    expect(requestCount(fetcher, "/git/ref/heads/main")).toBe(1);
+    expect(fetcher).toHaveBeenCalledTimes(maximumPages + 1 + 4);
+  }, 60_000);
+
+  it("fails the exact selected ref before an unsupported baseline page", async () => {
+    const batches: CapturedStatement[][] = [];
+    const failures: unknown[][] = [];
+    const database = createFullSyncDatabase(batches, failures);
+    const maximumPages = MAX_AUTHENTICATED_REPOSITORIES / 100;
+    const fetcher = createBaselinePaginationFetcher(maximumPages + 1);
+
+    await runScheduledWorker(database, fetcher);
+
+    expect(requestExactCount(fetcher, "/user")).toBe(1);
+    expect(requestExactCount(fetcher, "/user/repos")).toBe(maximumPages);
+    expect(requestExactCount(fetcher, "/repos/memenow/repository-42")).toBe(0);
+    expect(failures).toHaveLength(1);
+    expect(failures[0]?.slice(1, 3)).toEqual([
+      "repository-1",
+      "refs/heads/main"
+    ]);
+    expect(failures[0]?.[5]).toBe("GITHUB_PARTIAL_SYNC");
+  }, 60_000);
+
+  it("marks a 2,001st eligible blob partial without issuing another blob request", async () => {
+    const batches: CapturedStatement[][] = [];
+    const failures: unknown[][] = [];
+    const database = createFullSyncDatabase(batches, failures);
+    const fetcher = createRequestBudgetFetcher(2_001);
+
+    await runScheduledWorker(database, fetcher);
+
+    expect(requestCount(fetcher, "/git/blobs/")).toBe(2_000);
+    expect(failures).toHaveLength(1);
+    expect(failures[0]?.slice(1, 3)).toEqual([
+      "repository-1",
+      "refs/heads/main"
+    ]);
+    expect(failures[0]?.[5]).toBe("GITHUB_PARTIAL_SYNC");
+    expectFailureLifecycleBatch(batches);
+    expect(
+      batches
+        .flat()
+        .some((statement) => statement.sql.includes("INSERT INTO github_tree_ref_heads"))
+    ).toBe(false);
+  }, 60_000);
+
   it("records GITHUB_PARTIAL_SYNC without persisting text above the 16 KiB model limit", async () => {
     const batches: CapturedStatement[][] = [];
     const failures: unknown[][] = [];
@@ -1027,6 +1241,8 @@ function repositoryRow(
     name: `repository-${externalId}`,
     default_branch: "main",
     tracked_refs_json: "[]",
+    repository_configuration_version: 1,
+    repository_updated_at: "1970-01-01T00:00:00.000Z",
     ...overrides
   };
 }
@@ -1054,14 +1270,25 @@ function createScheduledDatabase(
               : null
           ),
           all: vi.fn().mockResolvedValue({
-            results: sql.includes("FROM repositories") ? repositories : []
+            results: sql.includes("FROM repositories")
+              ? repositories
+              : selectSyntheticScheduledRefs(sql, bindings, repositories)
+          }),
+          run: vi.fn().mockImplementation(async () => {
+            if (
+              sql.includes("INSERT INTO sync_cursors") &&
+              sql.includes("'failed'")
+            ) {
+              failures.push(bindings);
+            }
+            return { meta: { changes: 1 } };
           })
         });
         return {
           bind: vi.fn().mockImplementation(bound),
-          all: vi.fn().mockResolvedValue({
+          all: vi.fn().mockImplementation(async () => ({
             results: sql.includes("FROM repositories") ? repositories : []
-          })
+          }))
         };
       })
     }),
@@ -1095,13 +1322,81 @@ function createScheduledDatabase(
   } as unknown as D1Database;
 }
 
+function selectSyntheticScheduledRefs(
+  sql: string,
+  bindings: unknown[],
+  repositories: ReturnType<typeof repositoryRow>[],
+  selectedKeys?: ReadonlySet<string>
+): ScheduledRefFixture[] {
+  if (!sql.includes("ROW_NUMBER() OVER")) {
+    return [];
+  }
+  const configured = JSON.parse(String(bindings[0])) as ConfiguredRefFixture[];
+  const limit = Number(bindings[2]);
+  const firstByRepository = new Map<string, ConfiguredRefFixture>();
+  for (const candidate of configured.sort((left, right) =>
+    `${left.project_id}\n${left.repository_id}\n${left.ref}`.localeCompare(
+      `${right.project_id}\n${right.repository_id}\n${right.ref}`
+    )
+  )) {
+    const key = `${candidate.repository_id}:${candidate.ref}`;
+    if (selectedKeys !== undefined && !selectedKeys.has(key)) {
+      continue;
+    }
+    firstByRepository.set(
+      candidate.repository_id,
+      firstByRepository.get(candidate.repository_id) ?? candidate
+    );
+  }
+  return [...firstByRepository.values()].slice(0, limit).flatMap((candidate) => {
+    const repository = repositories.find(
+      (row) =>
+        row.project_id === candidate.project_id &&
+        row.repository_id === candidate.repository_id
+    );
+    return repository === undefined
+      ? []
+      : [
+          {
+            ...repository,
+            ref: candidate.ref,
+            cursor_status: "complete",
+            cursor_updated_at: "1970-01-01T00:00:00.000Z",
+            cursor_version: 1,
+            selected_head_manifest_id: null,
+            selected_head_version: 0,
+            last_sync_at: null
+          }
+        ];
+  });
+}
+
+interface ConfiguredRefFixture {
+  project_id: string;
+  repository_id: string;
+  ref: string;
+}
+
+type ScheduledRefFixture = ReturnType<typeof repositoryRow> & {
+  ref: string;
+  cursor_status: string;
+  cursor_updated_at: string;
+  cursor_version: number;
+  selected_head_manifest_id: string | null;
+  selected_head_version: number;
+  last_sync_at: string | null;
+};
+
 async function runScheduledWorker(
   database: D1Database,
-  fetcher: typeof fetch
+  fetcher: typeof fetch,
+  beforeRequest: GitHubRequestPacer = createGitHubRequestPacer({
+    minimumIntervalMs: 0
+  })
 ): Promise<void> {
   vi.stubGlobal("fetch", fetcher);
   try {
-    await githubSyncWorker.scheduled(
+    await runScheduledGitHubSync(
       { scheduledTime: 1_000 } as ScheduledController,
       {
         MEMORY_DB: database,
@@ -1109,7 +1404,7 @@ async function runScheduledWorker(
         GITHUB_CLASSIC_TOKEN: "synthetic-token",
         GITHUB_CREDENTIAL_VERSION: "credential-current"
       },
-      {} as ExecutionContext
+      { beforeRequest }
     );
   } finally {
     vi.unstubAllGlobals();
@@ -1178,20 +1473,27 @@ function createFullSyncDatabase(
     manifestId: string;
     observedSha: string;
     etag: string | null;
-  } | null = null
+  } | null = null,
+  additionalRepositories: ReturnType<typeof repositoryRow>[] = [],
+  selectedRefKeys?: ReadonlySet<string>
 ): D1Database {
   const repository = repositoryRow("repository-1", 42, repositoryOverrides);
+  const repositories = [repository, ...additionalRepositories];
   const retentionCursors = new Map([
     ["staging", { afterProjectId: "", afterManifestId: "", version: 0 }],
     ["failed", { afterProjectId: "", afterManifestId: "", version: 0 }]
   ]);
   let manifest: Record<string, unknown> | null = null;
   let manifestEntries: CapturedManifestEntry[] = [];
-  const activeHeads = new Map<string, { manifestId: string; observedSha: string }>();
+  const activeHeads = new Map<
+    string,
+    { manifestId: string; observedSha: string; headVersion: number }
+  >();
   if (initialState !== null) {
-    activeHeads.set("refs/heads/main", {
+    activeHeads.set(`${repository.repository_id}:refs/heads/main`, {
       manifestId: initialState.manifestId,
-      observedSha: initialState.observedSha
+      observedSha: initialState.observedSha,
+      headVersion: 1
     });
   }
   const prepare = (sql: string) => {
@@ -1220,16 +1522,27 @@ function createFullSyncDatabase(
             credential_version: "credential-current",
             user_id: 7,
             scopes_json: '["repo"]',
-            repositories_json:
-              '[{"id":42,"permissions":{"pull":true,"push":false,"admin":false}}]'
+            repositories_json: JSON.stringify(
+              repositories.map((configuredRepository) => ({
+                id: configuredRepository.external_id,
+                permissions: { pull: true, push: false, admin: false }
+              }))
+            )
           };
         }
-        if (sql.includes("SELECT head.manifest_id, manifest.observed_sha")) {
-          const activeHead = activeHeads.get(String(statement.bindings[2]));
+        if (
+          sql.includes(
+            "SELECT head.manifest_id, head.head_version, manifest.observed_sha"
+          )
+        ) {
+          const activeHead = activeHeads.get(
+            `${String(statement.bindings[1])}:${String(statement.bindings[2])}`
+          );
           return activeHead === undefined
             ? null
             : {
                 manifest_id: activeHead.manifestId,
+                head_version: activeHead.headVersion,
                 observed_sha: activeHead.observedSha
               };
         }
@@ -1242,16 +1555,24 @@ function createFullSyncDatabase(
             : {
                 repository_authority: manifest.repository_authority,
                 observed_sha: manifest.observed_sha,
-                external_id: 42
+                external_id:
+                  repositories.find(
+                    (configuredRepository) =>
+                      configuredRepository.repository_id === manifest?.repository_id
+                  )?.external_id ?? -1
               };
         }
         if (sql.includes("SELECT observed_sha, etag FROM sync_cursors")) {
-          return initialState === null || statement.bindings[2] !== "refs/heads/main"
+          return initialState === null ||
+            statement.bindings[1] !== repository.repository_id ||
+            statement.bindings[2] !== "refs/heads/main"
             ? null
             : { observed_sha: initialState.observedSha, etag: initialState.etag };
         }
         if (sql.includes("SELECT head.manifest_id, cursor.observed_sha")) {
-          const activeHead = activeHeads.get(String(statement.bindings[2]));
+          const activeHead = activeHeads.get(
+            `${String(statement.bindings[1])}:${String(statement.bindings[2])}`
+          );
           return activeHead === undefined
             ? null
             : {
@@ -1266,15 +1587,48 @@ function createFullSyncDatabase(
         }
         return null;
       }),
-      all: vi.fn().mockImplementation(async () => ({
-        results: sql.includes("FROM repositories")
-          ? [repository]
-          : sql.includes("FROM github_tree_manifest_entries")
-            ? manifestEntries
-            : []
-      })),
+      all: vi.fn().mockImplementation(async () => {
+        if (sql.includes("FROM repositories")) {
+          return { results: repositories };
+        }
+        if (sql.includes("ROW_NUMBER() OVER")) {
+          const selected = selectSyntheticScheduledRefs(
+            sql,
+            statement.bindings,
+            repositories,
+            selectedRefKeys
+          );
+          return {
+            results: selected.map((row) => {
+              const ref = String(row.ref);
+              const activeHead = activeHeads.get(
+                `${row.repository_id}:${ref}`
+              );
+              return {
+                ...row,
+                selected_head_manifest_id: activeHead?.manifestId ?? null,
+                selected_head_version: activeHead?.headVersion ?? 0
+              };
+            })
+          };
+        }
+        if (sql.includes("FROM github_tree_manifest_entries")) {
+          const after = String(statement.bindings[2] ?? "");
+          const limit = Number(statement.bindings[3] ?? 500);
+          return {
+            results: manifestEntries
+              .filter((entry) => entry.path_digest > after)
+              .sort((left, right) =>
+                left.path_digest.localeCompare(right.path_digest)
+              )
+              .slice(0, limit)
+          };
+        }
+        return { results: [] };
+      }),
       run: vi.fn().mockImplementation(async function (this: CapturedStatement) {
         if (sql.includes("INSERT INTO github_tree_manifests")) {
+          manifestEntries = [];
           manifest = {
             manifest_id: this.bindings[0],
             project_id: this.bindings[1],
@@ -1293,7 +1647,9 @@ function createFullSyncDatabase(
             purged_at: null
           };
         } else if (sql.includes("INSERT INTO github_tree_manifest_entries")) {
-          manifestEntries = (JSON.parse(String(this.bindings[2])) as unknown[][]).map(
+          const insertedEntries = (
+            JSON.parse(String(this.bindings[2])) as unknown[][]
+          ).map(
             (entry) => ({
               path_digest: String(entry[0]),
               safe_path: entry[1] === null ? null : String(entry[1]),
@@ -1302,6 +1658,13 @@ function createFullSyncDatabase(
               disposition: String(entry[4])
             })
           );
+          const entriesByPath = new Map(
+            manifestEntries.map((entry) => [entry.path_digest, entry])
+          );
+          for (const entry of insertedEntries) {
+            entriesByPath.set(entry.path_digest, entry);
+          }
+          manifestEntries = [...entriesByPath.values()];
           capturedManifestEntries.splice(
             0,
             capturedManifestEntries.length,
@@ -1323,7 +1686,10 @@ function createFullSyncDatabase(
             entry_count: this.bindings[0],
             entries_checksum: this.bindings[1]
           };
-        } else if (sql.includes("INSERT INTO sync_cursors")) {
+        } else if (
+          sql.includes("INSERT INTO sync_cursors") &&
+          sql.includes("'failed'")
+        ) {
           failures.push(this.bindings);
         }
         return { meta: { changes: 1 } };
@@ -1338,10 +1704,17 @@ function createFullSyncDatabase(
       batches.push(statements);
       return statements.map((statement) => {
         if (statement.sql.includes("INSERT INTO github_tree_ref_heads")) {
-          activeHeads.set(String(statement.bindings[2]), {
-            manifestId: String(statement.bindings[3]),
-            observedSha: String(manifest?.observed_sha ?? OBSERVED_SHA)
-          });
+          activeHeads.set(
+            `${String(statement.bindings[1])}:${String(statement.bindings[2])}`,
+            {
+              manifestId: String(statement.bindings[3]),
+              observedSha: String(manifest?.observed_sha ?? OBSERVED_SHA),
+              headVersion:
+                (activeHeads.get(
+                  `${String(statement.bindings[1])}:${String(statement.bindings[2])}`
+                )?.headVersion ?? 0) + 1
+            }
+          );
         }
         return { meta: { changes: 1 } };
       });
@@ -1354,6 +1727,7 @@ function createFullSyncFetcher(
   options: {
     defaultBranch?: string;
     ref?: string;
+    refStatus?: number;
     untrustedProvenance?: Record<string, string>;
     truncated?: boolean;
   } = {}
@@ -1393,6 +1767,15 @@ function createFullSyncFetcher(
       const requestedRef = `refs/${url.pathname.split("/git/ref/")[1] ?? ""}`;
       if (requestedRef !== ref && requestedRef !== "refs/heads/main") {
         throw new Error(`unexpected GitHub ref request: ${requestedRef}`);
+      }
+      if (options.refStatus !== undefined) {
+        return Response.json(
+          { message: "synthetic rate limit" },
+          {
+            status: options.refStatus,
+            headers: { "retry-after": "2" }
+          }
+        );
       }
       return Response.json({
         ref: requestedRef,
@@ -1440,4 +1823,183 @@ function createFullSyncFetcher(
     }
     throw new Error(`unexpected GitHub request: ${url.pathname}`);
   });
+}
+
+function createRequestBudgetFetcher(
+  blobCount: number,
+  includeSecondRepository = false
+) {
+  const files = Array.from({ length: blobCount }, (_, index) => ({
+    path: `docs/budget-${String(index).padStart(4, "0")}.md`,
+    mode: "100644",
+    type: "blob",
+    sha: SAFE_BLOB_SHA,
+    size: 1
+  }));
+  return vi.fn<typeof fetch>().mockImplementation(async (input) => {
+    const url = new URL((input as Request).url);
+    if (url.pathname === "/user") {
+      return new Response(JSON.stringify({ id: 7, login: "octocat" }), {
+        headers: {
+          "x-oauth-scopes": "repo",
+          "github-authentication-token-expiration": TOKEN_EXPIRATION_HEADER
+        }
+      });
+    }
+    if (url.pathname === "/user/repos") {
+      return Response.json([
+        {
+          id: 42,
+          full_name: "memenow/repository-42",
+          owner: { id: 7 },
+          permissions: { pull: true, push: false, admin: false }
+        },
+        ...(includeSecondRepository
+          ? [
+              {
+                id: 84,
+                full_name: "memenow/repository-84",
+                owner: { id: 7 },
+                permissions: { pull: true, push: false, admin: false }
+              }
+            ]
+          : [])
+      ]);
+    }
+    if (url.pathname === "/repos/memenow/repository-42") {
+      return Response.json({ id: 42, owner: { id: 7 }, default_branch: "main" });
+    }
+    if (url.pathname === "/repos/memenow/repository-84") {
+      return Response.json({ id: 84, owner: { id: 7 }, default_branch: "main" });
+    }
+    if (url.pathname.endsWith("/repos/memenow/repository-84/git/ref/heads/main")) {
+      return Response.json({
+        ref: "refs/heads/main",
+        object: { sha: SECOND_REPOSITORY_SHA, type: "commit" }
+      });
+    }
+    if (url.pathname.endsWith("/git/ref/heads/main")) {
+      return Response.json({
+        ref: "refs/heads/main",
+        object: { sha: OBSERVED_SHA, type: "commit" }
+      });
+    }
+    if (url.pathname.endsWith("/git/ref/heads/release")) {
+      return Response.json({
+        ref: "refs/heads/release",
+        object: { sha: RELEASE_SHA, type: "commit" }
+      });
+    }
+    if (url.pathname.endsWith(`/compare/${PREVIOUS_SHA}...${OBSERVED_SHA}`)) {
+      return Response.json({
+        status: "ahead",
+        ahead_by: 1,
+        behind_by: 0,
+        total_commits: 1,
+        merge_base_commit: { sha: PREVIOUS_SHA }
+      });
+    }
+    if (url.pathname.endsWith(`/commits/${OBSERVED_SHA}`)) {
+      return Response.json({ sha: OBSERVED_SHA, tree: { sha: TREE_SHA } });
+    }
+    if (url.pathname.endsWith(`/commits/${RELEASE_SHA}`)) {
+      return Response.json({ sha: RELEASE_SHA, tree: { sha: RELEASE_TREE_SHA } });
+    }
+    if (url.pathname.endsWith(`/commits/${SECOND_REPOSITORY_SHA}`)) {
+      return Response.json({
+        sha: SECOND_REPOSITORY_SHA,
+        tree: { sha: SECOND_REPOSITORY_TREE_SHA }
+      });
+    }
+    if (url.pathname.endsWith(`/git/trees/${TREE_SHA}`)) {
+      return Response.json({ sha: TREE_SHA, truncated: false, tree: files });
+    }
+    if (url.pathname.endsWith(`/git/trees/${RELEASE_TREE_SHA}`)) {
+      return Response.json({ sha: RELEASE_TREE_SHA, truncated: false, tree: [] });
+    }
+    if (url.pathname.endsWith(`/git/trees/${SECOND_REPOSITORY_TREE_SHA}`)) {
+      return Response.json({
+        sha: SECOND_REPOSITORY_TREE_SHA,
+        truncated: false,
+        tree: []
+      });
+    }
+    if (url.pathname.endsWith(`/git/blobs/${SAFE_BLOB_SHA}`)) {
+      return Response.json({
+        sha: SAFE_BLOB_SHA,
+        size: 1,
+        encoding: "utf-8",
+        content: "x"
+      });
+    }
+    throw new Error(`unexpected GitHub request: ${url.pathname}`);
+  });
+}
+
+function createBaselinePaginationFetcher(pageCount: number) {
+  return vi.fn<typeof fetch>().mockImplementation(async (input) => {
+    const url = new URL((input as Request).url);
+    if (url.pathname === "/user") {
+      return new Response(JSON.stringify({ id: 7, login: "octocat" }), {
+        headers: {
+          "x-oauth-scopes": "repo",
+          "github-authentication-token-expiration": TOKEN_EXPIRATION_HEADER
+        }
+      });
+    }
+    if (url.pathname === "/user/repos") {
+      const page = Number(url.searchParams.get("page"));
+      const headers = new Headers({ "x-oauth-scopes": "repo" });
+      if (page < pageCount) {
+        const next = new URL(url);
+        next.searchParams.set("page", String(page + 1));
+        headers.set("link", `<${next.toString()}>; rel="next"`);
+      }
+      return Response.json(
+        [
+          {
+            id: 42,
+            full_name: "memenow/repository-42",
+            owner: { id: 7 },
+            permissions: { pull: true, push: false, admin: false }
+          }
+        ],
+        { headers }
+      );
+    }
+    if (url.pathname === "/repos/memenow/repository-42") {
+      return Response.json({ id: 42, owner: { id: 7 }, default_branch: "main" });
+    }
+    if (url.pathname.endsWith("/git/ref/heads/main")) {
+      return Response.json({
+        ref: "refs/heads/main",
+        object: { sha: OBSERVED_SHA, type: "commit" }
+      });
+    }
+    if (url.pathname.endsWith(`/commits/${OBSERVED_SHA}`)) {
+      return Response.json({ sha: OBSERVED_SHA, tree: { sha: TREE_SHA } });
+    }
+    if (url.pathname.endsWith(`/git/trees/${TREE_SHA}`)) {
+      return Response.json({ sha: TREE_SHA, truncated: false, tree: [] });
+    }
+    throw new Error(`unexpected GitHub request: ${url.pathname}`);
+  });
+}
+
+function requestCount(
+  fetcher: ReturnType<typeof vi.fn>,
+  pathPart: string
+): number {
+  return fetcher.mock.calls.filter(([input]) =>
+    new URL((input as Request).url).pathname.includes(pathPart)
+  ).length;
+}
+
+function requestExactCount(
+  fetcher: ReturnType<typeof vi.fn>,
+  path: string
+): number {
+  return fetcher.mock.calls.filter(
+    ([input]) => new URL((input as Request).url).pathname === path
+  ).length;
 }

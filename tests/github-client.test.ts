@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  createGitHubRequestPacer,
   GitHubReadOnlyClient,
+  MAX_AUTHENTICATED_REPOSITORIES,
   type GitHubRateLimit
 } from "../src/github/client";
 
@@ -36,7 +38,7 @@ describe("GitHubReadOnlyClient", () => {
     expect(request.url).toBe("https://api.github.com/repos/memenow/edgemneme");
     expect(request.headers.get("accept")).toBe("application/vnd.github+json");
     expect(request.headers.get("authorization")).toBe("Bearer synthetic-token");
-    expect(request.headers.get("user-agent")).toBe("EdgeMneme/0.1");
+    expect(request.headers.get("user-agent")).toBe("EdgeMneme");
     expect(request.headers.get("x-github-api-version")).toBe("2026-03-10");
   });
 
@@ -84,6 +86,209 @@ describe("GitHubReadOnlyClient", () => {
       code: "GITHUB_PARTIAL_SYNC"
     });
     expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it("aborts a slow GitHub fetch at the per-request deadline", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(
+      (input) =>
+        new Promise<Response>((_resolve, reject) => {
+          const request = input as Request;
+          request.signal.addEventListener("abort", () => reject(request.signal.reason), {
+            once: true
+          });
+        })
+    );
+    const client = new GitHubReadOnlyClient({
+      token: "synthetic-token",
+      fetcher,
+      allowedRepositoryIds: new Set([REPOSITORY_ID]),
+      requestTimeoutMs: 5
+    });
+
+    await expect(client.getAuthenticatedUser()).rejects.toMatchObject({
+      code: "GITHUB_PARTIAL_SYNC"
+    });
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it("rejects an exhausted absolute deadline before fetch", async () => {
+    const fetcher = vi.fn<typeof fetch>();
+    const client = new GitHubReadOnlyClient({
+      token: "synthetic-token",
+      fetcher,
+      allowedRepositoryIds: new Set([REPOSITORY_ID]),
+      absoluteDeadlineMs: 1_000,
+      now: () => 1_000
+    });
+
+    await expect(client.getAuthenticatedUser()).rejects.toMatchObject({
+      code: "GITHUB_PARTIAL_SYNC"
+    });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("keeps request budgets isolated between client instances", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async () =>
+      new Response(JSON.stringify({ id: OWNER_ID, login: "octocat" }), {
+        headers: {
+          "github-authentication-token-expiration": TOKEN_EXPIRATION_HEADER
+        }
+      })
+    );
+    const createBudgetedClient = () =>
+      new GitHubReadOnlyClient({
+        token: "synthetic-token",
+        fetcher,
+        allowedRepositoryIds: new Set([REPOSITORY_ID]),
+        maxRequests: 1
+      });
+    const first = createBudgetedClient();
+    const second = createBudgetedClient();
+
+    await expect(first.getAuthenticatedUser()).resolves.toMatchObject({
+      status: "modified"
+    });
+    await expect(first.getAuthenticatedUser()).rejects.toMatchObject({
+      code: "GITHUB_PARTIAL_SYNC"
+    });
+    await expect(second.getAuthenticatedUser()).resolves.toMatchObject({
+      status: "modified"
+    });
+
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it("paces requests from separate clients through one shared serial gate", async () => {
+    let clock = 1_000;
+    const delays: number[] = [];
+    const requestStarts: number[] = [];
+    const pacer = createGitHubRequestPacer({
+      minimumIntervalMs: 80,
+      now: () => clock,
+      sleep: async (delayMs) => {
+        delays.push(delayMs);
+        clock += delayMs;
+      }
+    });
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async () => {
+      requestStarts.push(clock);
+      return new Response(JSON.stringify({ id: OWNER_ID, login: "octocat" }), {
+        headers: {
+          "github-authentication-token-expiration": TOKEN_EXPIRATION_HEADER
+        }
+      });
+    });
+    const createPacedClient = () =>
+      new GitHubReadOnlyClient({
+        token: "synthetic-token",
+        fetcher,
+        allowedRepositoryIds: new Set([REPOSITORY_ID]),
+        beforeRequest: pacer
+      });
+
+    await Promise.all([
+      createPacedClient().getAuthenticatedUser(),
+      createPacedClient().getAuthenticatedUser()
+    ]);
+
+    expect(requestStarts).toEqual([1_000, 1_080]);
+    expect(delays).toEqual([80]);
+  });
+
+  it("does not enter the request pacer after a client budget is exhausted", async () => {
+    const beforeRequest = { wait: vi.fn().mockResolvedValue(undefined) };
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify({ id: OWNER_ID, login: "octocat" }), {
+        headers: {
+          "github-authentication-token-expiration": TOKEN_EXPIRATION_HEADER
+        }
+      })
+    );
+    const client = new GitHubReadOnlyClient({
+      token: "synthetic-token",
+      fetcher,
+      allowedRepositoryIds: new Set([REPOSITORY_ID]),
+      maxRequests: 1,
+      beforeRequest
+    });
+
+    await client.getAuthenticatedUser();
+    await expect(client.getAuthenticatedUser()).rejects.toMatchObject({
+      code: "GITHUB_PARTIAL_SYNC"
+    });
+
+    expect(beforeRequest.wait).toHaveBeenCalledTimes(1);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it("reserves a one-request budget before concurrent callers enter the pacer", async () => {
+    const beforeRequest = { wait: vi.fn().mockResolvedValue(undefined) };
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify({ id: OWNER_ID, login: "octocat" }), {
+        headers: {
+          "github-authentication-token-expiration": TOKEN_EXPIRATION_HEADER
+        }
+      })
+    );
+    const client = new GitHubReadOnlyClient({
+      token: "synthetic-token",
+      fetcher,
+      allowedRepositoryIds: new Set([REPOSITORY_ID]),
+      maxRequests: 1,
+      beforeRequest
+    });
+
+    const results = await Promise.allSettled([
+      client.getAuthenticatedUser(),
+      client.getAuthenticatedUser()
+    ]);
+
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(results.filter((result) => result.status === "rejected")).toEqual([
+      expect.objectContaining({
+        reason: expect.objectContaining({ code: "GITHUB_PARTIAL_SYNC" })
+      })
+    ]);
+    expect(beforeRequest.wait).toHaveBeenCalledTimes(1);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a request budget consumed when the pacer fails closed", async () => {
+    const beforeRequest = {
+      wait: vi.fn().mockRejectedValue(new Error("synthetic pacer failure"))
+    };
+    const fetcher = vi.fn<typeof fetch>();
+    const client = new GitHubReadOnlyClient({
+      token: "synthetic-token",
+      fetcher,
+      allowedRepositoryIds: new Set([REPOSITORY_ID]),
+      maxRequests: 1,
+      beforeRequest
+    });
+
+    await expect(client.getAuthenticatedUser()).rejects.toThrow(
+      "synthetic pacer failure"
+    );
+    await expect(client.getAuthenticatedUser()).rejects.toMatchObject({
+      code: "GITHUB_PARTIAL_SYNC"
+    });
+
+    expect(beforeRequest.wait).toHaveBeenCalledTimes(1);
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("rejects ref access before a client verifies repository identity", async () => {
+    const fetcher = vi.fn<typeof fetch>();
+
+    await expect(
+      createClient(fetcher).getRef(
+        "memenow",
+        "edgemneme",
+        REPOSITORY_ID,
+        "heads/main"
+      )
+    ).rejects.toMatchObject({ code: "GITHUB_REPOSITORY_UNAVAILABLE" });
+    expect(fetcher).not.toHaveBeenCalled();
   });
 
   it("rejects repository identity drift and every redirect without following it", async () => {
@@ -162,6 +367,45 @@ describe("GitHubReadOnlyClient", () => {
     expect(secondRequest.headers.get("if-none-match")).toBe('"identity-etag"');
   });
 
+  it("bounds an oversized 2xx JSON stream without Content-Length and cancels it", async () => {
+    const confidentialMarker = "synthetic-confidential-success-body";
+    const prefix = new TextEncoder().encode(
+      `{"id":${REPOSITORY_ID},"owner":{"id":${OWNER_ID}},"padding":"${confidentialMarker}`
+    );
+    const chunk = new Uint8Array(4 * 1024 * 1024).fill(120);
+    chunk.set(prefix);
+    let pulls = 0;
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulls += 1;
+        controller.enqueue(chunk);
+        if (pulls === 8) {
+          controller.close();
+        }
+      },
+      cancel() {
+        cancelled = true;
+      }
+    });
+    const response = new Response(body, { status: 200 });
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(response);
+
+    const error = await createClient(fetcher)
+      .getRepository("memenow", "edgemneme", REPOSITORY_ID, OWNER_ID)
+      .catch((caught: unknown) => caught);
+
+    expect(response.headers.has("content-length")).toBe(false);
+    expect(error).toMatchObject({
+      code: "GITHUB_PARTIAL_SYNC",
+      retryable: false
+    });
+    expect(String(error)).not.toContain(confidentialMarker);
+    expect(String(error)).not.toContain("synthetic-token");
+    expect(pulls).toBeLessThanOrEqual(6);
+    expect(cancelled).toBe(true);
+  });
+
   it("rejects an unsolicited 304 without a matching conditional request", async () => {
     await expect(
       createClient(
@@ -216,7 +460,9 @@ describe("GitHubReadOnlyClient", () => {
               id: 42,
               full_name: "memenow/edgemneme",
               owner: { id: 7 },
-              permissions: { pull: true, push: false, admin: false }
+              permissions: { pull: true, push: false, admin: false },
+              private: true,
+              untrusted_payload: "must not be retained"
             }
           ]),
           {
@@ -244,14 +490,48 @@ describe("GitHubReadOnlyClient", () => {
 
     await expect(createClient(fetcher).listAuthenticatedRepositories()).resolves.toEqual({
       repositories: [
-        expect.objectContaining({ id: 42 }),
-        expect.objectContaining({ id: 84 })
+        {
+          id: 42,
+          owner: { id: 7 },
+          permissions: { pull: true, push: false, admin: false }
+        },
+        {
+          id: 84,
+          owner: { id: 7 },
+          permissions: { pull: true, push: true, admin: false }
+        }
       ],
       scopes: ["repo"],
       rateLimit: undefined
     });
     expect(fetcher).toHaveBeenCalledTimes(2);
     expect((fetcher.mock.calls[0]?.[0] as Request).url).toContain("per_page=100");
+  });
+
+  it("fails closed before an authenticated repository baseline exceeds its cap", async () => {
+    const repositoriesPerPage = 100;
+    const maximumPages = MAX_AUTHENTICATED_REPOSITORIES / repositoriesPerPage;
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const url = new URL((input as Request).url);
+      const page = Number(url.searchParams.get("page"));
+      const firstId = (page - 1) * repositoriesPerPage + 1;
+      const nextUrl = new URL(url);
+      nextUrl.searchParams.set("page", String(page + 1));
+      return Response.json(
+        Array.from({ length: repositoriesPerPage }, (_, index) => ({
+          id: firstId + index,
+          full_name: `memenow/repository-${firstId + index}`,
+          owner: { id: 7 },
+          permissions: { pull: true, push: false, admin: false }
+        })),
+        { headers: { link: `<${nextUrl.toString()}>; rel="next"` } }
+      );
+    });
+
+    await expect(
+      createClient(fetcher).listAuthenticatedRepositories()
+    ).rejects.toMatchObject({ code: "GITHUB_PARTIAL_SYNC" });
+    expect(fetcher).toHaveBeenCalledTimes(maximumPages);
   });
 
   it("rejects cross-origin and malformed pagination links before a second request", async () => {
@@ -340,6 +620,40 @@ describe("GitHubReadOnlyClient", () => {
       client.getBlob("memenow", "edgemneme", REPOSITORY_ID, SHA)
     ).rejects.toMatchObject({ code: "GITHUB_REPOSITORY_UNAVAILABLE" });
   });
+
+  it.each([
+    ["dot", "heads/./main"],
+    [
+      "dot-dot",
+      "heads/../../../../../../repos/attacker/target/git/ref/heads/main"
+    ]
+  ])(
+    "rejects %s ref components before URL normalization can change the target repository",
+    async (_label, ref) => {
+      const requestedUrls: string[] = [];
+      const fetcher = vi.fn<typeof fetch>().mockImplementation(async (input) => {
+        const request = input as Request;
+        requestedUrls.push(request.url);
+        return Response.json({ id: REPOSITORY_ID, owner: { id: OWNER_ID } });
+      });
+      const client = createClient(fetcher);
+
+      await client.getRepository(
+        "memenow",
+        "edgemneme",
+        REPOSITORY_ID,
+        OWNER_ID
+      );
+      await expect(
+        client.getRef("memenow", "edgemneme", REPOSITORY_ID, ref)
+      ).rejects.toMatchObject({ code: "GITHUB_REPOSITORY_UNAVAILABLE" });
+
+      expect(requestedUrls).toEqual([
+        "https://api.github.com/repos/memenow/edgemneme"
+      ]);
+      expect(fetcher).toHaveBeenCalledTimes(1);
+    }
+  );
 
   it("loads verified refs, commits, comparisons, trees, and blobs", async () => {
     const fetcher = vi.fn<typeof fetch>().mockImplementation(async (input) => {
@@ -441,12 +755,95 @@ describe("GitHubReadOnlyClient", () => {
     });
   });
 
+  it("classifies GitHub's official classic PAT disabled response", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      Response.json(
+        {
+          message:
+            "Personal access token (classic) is disabled for this organization."
+        },
+        { status: 403 }
+      )
+    );
+
+    await expect(
+      createClient(fetcher).getRepository(
+        "memenow",
+        "edgemneme",
+        REPOSITORY_ID,
+        OWNER_ID
+      )
+    ).rejects.toMatchObject({
+      code: "GITHUB_CLASSIC_PAT_BLOCKED",
+      retryable: false
+    });
+  });
+
+  it("classifies a body-only secondary rate limit with a bounded retry delay", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      Response.json(
+        {
+          message:
+            "You have exceeded a secondary rate limit. Please wait a few minutes before you try again."
+        },
+        { status: 403 }
+      )
+    );
+
+    await expect(
+      createClient(fetcher).getRepository(
+        "memenow",
+        "edgemneme",
+        REPOSITORY_ID,
+        OWNER_ID
+      )
+    ).rejects.toMatchObject({
+      code: "GITHUB_RATE_LIMITED",
+      retryable: true,
+      retryAfterMs: 60_000,
+      rateLimit: undefined
+    });
+  });
+
+  it("bounds a streaming 403 body without Content-Length and never exposes it", async () => {
+    const confidentialMarker = "synthetic-confidential-response-body";
+    const chunk = new TextEncoder().encode(
+      confidentialMarker.padEnd(4_096, "x")
+    );
+    let pulls = 0;
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulls += 1;
+        controller.enqueue(chunk);
+      },
+      cancel() {
+        cancelled = true;
+      }
+    });
+    const response = new Response(body, { status: 403 });
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(response);
+
+    const error = await createClient(fetcher)
+      .getRepository("memenow", "edgemneme", REPOSITORY_ID, OWNER_ID)
+      .catch((caught: unknown) => caught);
+
+    expect(response.headers.has("content-length")).toBe(false);
+    expect(error).toMatchObject({
+      code: "GITHUB_PERMISSION_INSUFFICIENT",
+      retryable: false
+    });
+    expect(String(error)).not.toContain(confidentialMarker);
+    expect(pulls).toBeLessThanOrEqual(6);
+    expect(cancelled).toBe(true);
+  });
+
   it.each([
     [401, {}, "GITHUB_AUTHORIZATION_REQUIRED", false, undefined],
     [403, { "x-github-sso": "required" }, "GITHUB_SSO_REQUIRED", false, undefined],
     [403, { "x-ratelimit-remaining": "0", "x-ratelimit-reset": "2000000000" }, "GITHUB_RATE_LIMITED", true, 2_000_000_000_000],
     [429, { "retry-after": "2" }, "GITHUB_RATE_LIMITED", true, 2_000],
-    [500, {}, "GITHUB_REPOSITORY_UNAVAILABLE", false, undefined]
+    [500, {}, "GITHUB_REPOSITORY_UNAVAILABLE", true, 1_000]
   ])(
     "maps GitHub status %i without exposing a response body",
     async (status, headers, code, retryable, retryAfterMs) => {

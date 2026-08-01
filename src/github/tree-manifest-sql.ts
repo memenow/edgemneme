@@ -1,3 +1,5 @@
+import { pendingGitHubSyncActivationGuardSql } from "./sync-activation-fence";
+
 export function addedDeltaSql(): string {
   return `INSERT INTO github_tree_manifest_deltas
     (delta_id, project_id, repository_id, ref, old_manifest_id, new_manifest_id,
@@ -16,7 +18,7 @@ export function addedDeltaSql(): string {
          AND old_entry.path_digest = new_entry.path_digest
      ))
      AND (${coordinateActivationGuardSql()})
-   ON CONFLICT(delta_id) DO NOTHING`;
+   ON CONFLICT(delta_id) DO UPDATE SET delta_id = excluded.delta_id`;
 }
 
 export function changedDeltaSql(): string {
@@ -36,7 +38,7 @@ export function changedDeltaSql(): string {
    WHERE new_entry.project_id = ? AND new_entry.manifest_id = ?
      AND old_entry.blob_sha <> new_entry.blob_sha
      AND (${coordinateActivationGuardSql()})
-   ON CONFLICT(delta_id) DO NOTHING`;
+   ON CONFLICT(delta_id) DO UPDATE SET delta_id = excluded.delta_id`;
 }
 
 export function deletedDeltaSql(): string {
@@ -107,7 +109,7 @@ export function deletedDeltaSql(): string {
    WHERE old_entry.project_id = ? AND old_entry.manifest_id = ?
      AND new_entry.path_digest IS NULL
      AND (${coordinateActivationGuardSql()})
-   ON CONFLICT(delta_id) DO NOTHING`;
+   ON CONFLICT(delta_id) DO UPDATE SET delta_id = excluded.delta_id`;
 }
 
 export function deletionEvidenceSql(): string {
@@ -133,7 +135,19 @@ export function deletionEvidenceSql(): string {
    WHERE delta.project_id = ? AND delta.repository_id = ? AND delta.ref = ?
      AND delta.new_manifest_id = ? AND delta.change_kind = 'deleted'
      AND (${activationGuardSql()})
-   ON CONFLICT(project_id, source_type, locator, excerpt_hash) DO NOTHING`;
+   ON CONFLICT(project_id, source_type, locator, excerpt_hash) DO UPDATE SET
+     sensitivity_status = CASE
+       WHEN evidence.evidence_id IS excluded.evidence_id
+        AND evidence.repository_id IS excluded.repository_id
+        AND evidence.repository_ref IS excluded.repository_ref
+        AND evidence.repository_path IS excluded.repository_path
+        AND evidence.repository_authority IS excluded.repository_authority
+        AND evidence.commit_sha IS excluded.commit_sha
+        AND evidence.object_uri IS excluded.object_uri
+        AND evidence.sensitivity_status IS excluded.sensitivity_status
+       THEN evidence.sensitivity_status
+       ELSE 'github_activation_conflict'
+     END`;
 }
 
 export function deletionObservationSql(): string {
@@ -192,7 +206,31 @@ export function deletionObservationSql(): string {
    WHERE delta.project_id = ? AND delta.repository_id = ? AND delta.ref = ?
      AND delta.new_manifest_id = ? AND delta.change_kind = 'deleted'
      AND (${activationGuardSql()})
-   ON CONFLICT(project_id, observation_id) DO NOTHING`;
+   ON CONFLICT(project_id, observation_id) DO UPDATE SET
+     candidate_version = CASE
+       WHEN observations.session_id IS excluded.session_id
+        AND observations.principal_id IS excluded.principal_id
+        AND observations.candidate_version IS excluded.candidate_version
+        AND observations.status IS excluded.status
+        AND observations.content IS excluded.content
+        AND observations.content_sha256 IS excluded.content_sha256
+        AND observations.evidence_json IS excluded.evidence_json
+        AND observations.kind IS excluded.kind
+        AND observations.memory_class IS excluded.memory_class
+        AND observations.scope IS excluded.scope
+        AND observations.scope_id IS excluded.scope_id
+        AND observations.valid_from IS excluded.valid_from
+        AND observations.valid_until IS excluded.valid_until
+        AND observations.analysis_json IS excluded.analysis_json
+        AND observations.review_reason IS excluded.review_reason
+        AND observations.reviewed_content IS excluded.reviewed_content
+        AND observations.promoted_memory_id IS excluded.promoted_memory_id
+        AND observations.promoted_revision_id IS excluded.promoted_revision_id
+        AND observations.source_consolidation_id IS
+          excluded.source_consolidation_id
+       THEN observations.candidate_version
+       ELSE 0
+     END`;
 }
 
 export function deletionObservationEvidenceSql(): string {
@@ -208,7 +246,8 @@ export function deletionObservationEvidenceSql(): string {
    WHERE delta.project_id = ? AND delta.repository_id = ? AND delta.ref = ?
      AND delta.new_manifest_id = ? AND delta.change_kind = 'deleted'
      AND (${activationGuardSql()})
-   ON CONFLICT(project_id, observation_id, evidence_id) DO NOTHING`;
+   ON CONFLICT(project_id, observation_id, evidence_id) DO UPDATE SET
+     created_at = excluded.created_at`;
 }
 
 export function deletionReviewRequestSql(): string {
@@ -225,25 +264,22 @@ export function deletionReviewRequestSql(): string {
    WHERE delta.project_id = ? AND delta.repository_id = ? AND delta.ref = ?
      AND delta.new_manifest_id = ? AND delta.change_kind = 'deleted'
      AND (${activationGuardSql()})
-   ON CONFLICT(project_id, candidate_id) DO NOTHING`;
+   ON CONFLICT(project_id, candidate_id) DO UPDATE SET
+     status = CASE
+       WHEN review_requests.review_request_id IS excluded.review_request_id
+        AND review_requests.conflict_id IS excluded.conflict_id
+        AND review_requests.status IS excluded.status
+        AND review_requests.required_role IS excluded.required_role
+        AND review_requests.audit_id IS excluded.audit_id
+       THEN review_requests.status
+       ELSE 'github_activation_conflict'
+     END`;
 }
 
 function activationGuardSql(): string {
-  return `EXISTS (
-    SELECT 1 FROM github_tree_ref_heads AS current_head
-    WHERE current_head.project_id = delta.project_id
-      AND current_head.repository_id = delta.repository_id
-      AND current_head.ref = delta.ref
-      AND current_head.manifest_id = ?
-  )`;
+  return pendingGitHubSyncActivationGuardSql();
 }
 
 function coordinateActivationGuardSql(): string {
-  return `EXISTS (
-    SELECT 1 FROM github_tree_ref_heads AS current_head
-    WHERE current_head.project_id = ?
-      AND current_head.repository_id = ?
-      AND current_head.ref = ?
-      AND current_head.manifest_id = ?
-  )`;
+  return pendingGitHubSyncActivationGuardSql();
 }

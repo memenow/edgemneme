@@ -6,6 +6,7 @@ import {
   requireRole
 } from "../security/auth";
 import { EdgeMnemeError } from "../contracts/errors";
+import { isCandidateIdentifier } from "../contracts/candidate-id";
 import {
   inspectMemoryModelInput,
   inspectMemoryModelValue,
@@ -206,6 +207,14 @@ export class GatewayService {
     pageToken?: string;
     sessionId?: string;
   }): Promise<Record<string, unknown>> {
+    const hasScopeFilter = input.filters?.scope !== undefined;
+    const hasScopeIdFilter = input.filters?.scope_id !== undefined;
+    if (hasScopeFilter !== hasScopeIdFilter) {
+      throw new EdgeMnemeError(
+        "VALIDATION_FAILED",
+        "The scope and scope_id filters must be provided together."
+      );
+    }
     await this.assertProjectRef(input.projectRef);
     const hasQuery = input.query !== undefined && input.query.trim() !== "";
     if (
@@ -215,12 +224,6 @@ export class GatewayService {
       throw new EdgeMnemeError(
         "VALIDATION_FAILED",
         "The search query cannot be processed safely."
-      );
-    }
-    if (input.filters?.scope !== undefined && input.filters.scope_id === undefined) {
-      throw new EdgeMnemeError(
-        "VALIDATION_FAILED",
-        "A scope filter requires scope_id."
       );
     }
     const authorizedRepositoryIds = await this.resolveSearchRepositoryAccess(
@@ -835,6 +838,12 @@ export class GatewayService {
     edits?: CandidateReviewEdits;
     idempotencyKey: string;
   }): Promise<Record<string, unknown>> {
+    if (!isCandidateIdentifier(input.candidateId)) {
+      throw new EdgeMnemeError(
+        "VALIDATION_FAILED",
+        "The candidate identifier is invalid."
+      );
+    }
     requireRole(this.principal, "maintainer");
     await requireProjectRole(this.env.MEMORY_DB, this.principal, "maintainer");
     assertSafe(input.reason, 4 * 1024);

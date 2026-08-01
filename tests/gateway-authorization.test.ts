@@ -26,7 +26,7 @@ describe("GatewayService mutation authorization", () => {
       2,
       (service: GatewayService) =>
         service.reviewCandidate({
-          candidateId: "candidate-1",
+          candidateId: "00000000-0000-4000-8000-000000000001",
           expectedCandidateVersion: 1,
           decision: "reject",
           reason: "Not durable.",

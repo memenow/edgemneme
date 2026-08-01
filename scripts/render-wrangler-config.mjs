@@ -20,6 +20,26 @@ const PUBLIC_NAMESPACE_PLACEHOLDERS = new Set(["10001", "10002", "10003"]);
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 const CREDENTIAL_VERSION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u;
 const GITHUB_SYNC_CRON = "0 */6 * * *";
+const GITHUB_SYNC_WORKFLOWS = [
+  {
+    binding: "GITHUB_DISPATCH_WORKFLOW",
+    name: "edgemneme-github-dispatch-workflow",
+    class_name: "GitHubDispatchWorkflow",
+    limits: { steps: 10_000 }
+  },
+  {
+    binding: "GITHUB_REF_SYNC_WORKFLOW",
+    name: "edgemneme-github-ref-sync-workflow",
+    class_name: "GitHubRefSyncWorkflow",
+    limits: { steps: 10_000 }
+  },
+  {
+    binding: "GITHUB_RETENTION_WORKFLOW",
+    name: "edgemneme-github-retention-workflow",
+    class_name: "GitHubRetentionWorkflow",
+    limits: { steps: 10_000 }
+  }
+];
 
 export function generatedConfigPath(rootDirectory, worker) {
   assertSupportedWorker(worker);
@@ -88,6 +108,7 @@ export function renderConfig(worker, sourceConfig, environment) {
   if ("secrets" in rendered) {
     throw new Error("Public github-sync config must not require a credential secret.");
   }
+  validateGitHubSyncWorkflowBindings(rendered);
   const triggers = requireRecord(rendered, "triggers");
   const crons = requireArray(triggers, "crons");
   if (crons.length !== 0) {
@@ -103,6 +124,47 @@ export function renderConfig(worker, sourceConfig, environment) {
     rendered.secrets = { required: ["GITHUB_CLASSIC_TOKEN"] };
   }
   return rendered;
+}
+
+function validateGitHubSyncWorkflowBindings(config) {
+  if ("queues" in config) {
+    throw new Error("GitHub sync must not contain Queue bindings or consumers.");
+  }
+  const workflows = requireArray(config, "workflows");
+  if (workflows.length !== GITHUB_SYNC_WORKFLOWS.length) {
+    throw new Error("GitHub sync must contain exactly three approved Workflow bindings.");
+  }
+
+  const expectedByBinding = new Map(
+    GITHUB_SYNC_WORKFLOWS.map((workflow) => [workflow.binding, workflow])
+  );
+  const observedBindings = new Set();
+  for (const workflow of workflows) {
+    if (workflow === null || typeof workflow !== "object" || Array.isArray(workflow)) {
+      throw new Error("Every GitHub sync Workflow binding must be an object.");
+    }
+    const keys = Object.keys(workflow).sort();
+    if (keys.join(",") !== "binding,class_name,limits,name") {
+      throw new Error(
+        "GitHub sync Workflow bindings must contain only the approved identity and limits."
+      );
+    }
+    const expected = expectedByBinding.get(workflow.binding);
+    if (
+      expected === undefined ||
+      observedBindings.has(workflow.binding) ||
+      workflow.name !== expected.name ||
+      workflow.class_name !== expected.class_name ||
+      workflow.limits === null ||
+      typeof workflow.limits !== "object" ||
+      Array.isArray(workflow.limits) ||
+      Object.keys(workflow.limits).join(",") !== "steps" ||
+      workflow.limits.steps !== expected.limits.steps
+    ) {
+      throw new Error("GitHub sync Workflow bindings do not match the approved contract.");
+    }
+    observedBindings.add(workflow.binding);
+  }
 }
 
 function rebaseRelativePaths(config) {

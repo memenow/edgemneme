@@ -48,8 +48,9 @@ gates. Normal source deployment can then run from the protected GitHub
    and an explicit `ENABLE_GITHUB_SYNC=false` in the `production` environment.
 7. Apply D1 migrations after creating a Time Travel bookmark and private export.
    Use the manual `Apply D1 Migrations` workflow and type `APPLY` exactly.
-8. Deploy `memory-orchestrator`, then `memory-gateway`. Deploy `github-sync`
-   only after its credential and access baseline are separately approved.
+8. Deploy `memory-orchestrator`, then `memory-gateway`. Keep `github-sync`
+   disabled and without a Cron until its three Workflow entrypoints, credential,
+   and repository-access baseline are separately verified.
 9. Insert an approved project, principals, grants, repositories, and GitHub
    access baseline.
 10. Run one isolated `system.synthetic.<uuid>` canary before enabling real
@@ -169,20 +170,63 @@ starting another automated deployment.
 GitHub synchronization has its own captured deployment state. Before an enabled
 release, the workflow records whether `github-sync` is absent, its exact active
 version when present, and whether its Cron Trigger is enabled or disabled. The
-enabled deployment carries a run-specific tag and must finish with exactly one
-`0 */6 * * *` Cron Trigger and no secret binding other than exactly one
-`GITHUB_CLASSIC_TOKEN`. If a
-later release gate fails, rollback first verifies the active run tag. It restores
-an existing Worker's exact prior version and Cron state, or deletes and verifies
-the absence of a Worker that this run created from an absent state.
+enabled deployment carries a run-specific capability tag and must finish with
+exactly three approved Workflow definitions, one `0 */6 * * *` Cron Trigger,
+no Queue binding, and no secret binding other than exactly one
+`GITHUB_CLASSIC_TOKEN`. It locks the tagged 100-percent active version before
+and after the control-plane checks so an external dashboard or API deployment
+cannot be mistaken for this run. If a later release gate fails, rollback first
+quiesces scheduling, drains Workflow and D1 work, and verifies the active run
+tag. It restores an existing Worker's exact Workflow-capable prior version and
+Cron state, or deletes and verifies the absence of a Worker that this run
+created from an absent state. A pre-Workflow direct-Cron version is never a
+valid rollback target after migration `0019`.
 
-Setting `ENABLE_GITHUB_SYNC=false` is a one-way safety reconciliation for that
-run. If `github-sync` is absent, the workflow leaves it absent. If it is present,
-the workflow first deploys a runtime-disabled version with no Cron Triggers,
-then deletes `GITHUB_CLASSIC_TOKEN` from Cloudflare through a JSON-null bulk
-operation. It verifies both the empty schedule list and an empty Worker secret
-list. A deletion or verification failure leaves the inert deployment
-in place, fails the workflow, and never rolls back to an enabled version.
+Setting `ENABLE_GITHUB_SYNC=false` starts a fail-closed five-stage
+reconciliation. If `github-sync` is absent, the workflow leaves it absent. If
+present, it first deploys and locks an exact tagged runtime-disabled version
+with no Cron while retaining the PAT. It then exhaustively paginates all six
+nonterminal states for each of the exact three Workflows. Only after that
+control plane is clear may the protected Action reconcile the GitHub
+synchronization ledgers. It processes, in order, unbound dispatch items, bound
+repository runs and items, unbound repository runs, closable dispatches, and
+credential lanes. It finally requires two all-zero observations and creates and
+verifies the tagged secretless version.
+
+The maintenance helper uses a fixed Cloudflare D1 REST origin, parameterized
+statements, and 1 MiB encoded request and response body limits. Before any
+write, it attests the complete receipt and transition-trigger schema, requires
+every D1 statement result to report primary service, and probes native numeric
+and null parameter semantics. A pass handles at most 20 candidates in each
+phase, uses at most 18 Cloudflare HTTP requests and 288 D1 statements, and
+keeps its largest 60-statement mutation batch below the runtime's 64-statement
+bound. Every
+transition is receipt-first or exact-CAS verified. Because the Action has
+already proved that no GitHub Workflow is active, it may safely terminalize an
+otherwise unexpired matching run or lane. It never reads or writes formal
+memory revisions, heads, project versions, or audit chains; it is a tightly
+scoped operational D1 writer, not another formal-memory authority.
+
+Runtime-disabled state, the empty Cron list, and the exact active version/tag
+are rechecked after every helper result, including `pending`. A mutating pass
+always reports `pending`; only an exact `clear` pass may count toward the two
+consecutive all-zero observations. Observations are 60 seconds apart. The
+helper's 18-request bound and this cadence leave headroom under Cloudflare's
+[1,200 requests per five minutes Client API limit](https://developers.cloudflare.com/fundamentals/api/reference/limits/),
+but they do not reserve that shared capacity. HTTP 429, any other unsuccessful
+response, an unknown status, cursor cycle, version drift, or new work fails the
+gate immediately; the lifecycle code does not silently retry a failed API
+request.
+
+After reserving two clear observations, one workflow run can reconcile at most
+560 candidates per phase during normal disable, 460 during rollback, and 60 in
+the initial migration drain. A larger ledger remains durable and blocks the
+relevant next transition: secret deletion, the pre-migration backup, or
+migration apply. Rerun the reviewed workflow to resume from the immutable
+receipts; never raise the limit or claim an early clear. The initial migration
+drain may perform this maintenance before backup. The final
+post-backup migration gate is read-only so the captured backup continues to
+describe the exact state being migrated.
 
 The cleanup plan derives the complete deterministic snapshot key set from D1 in
 addition to reading the manifest. This permits exact-prefix cleanup if a
@@ -254,6 +298,18 @@ uses `workers.dev`, while an empty origin list accepts non-browser MCP clients
 but no browser origin. The deploy workflow masks resource identifiers, renders
 only ignored files, performs a dry run, and removes temporary config and secret
 files even after failure.
+
+The gateway accepts at most 2,097,152 request-body bytes visible to the Worker in
+one authenticated `POST /mcp` body. For requests that reach the Worker, it counts
+the delivered stream even when `Content-Length` is absent or inconsistent and
+accepts only an absent or identity `Content-Encoding`. Worker-level malformed
+length, unsupported encoding, and oversized-body rejections use HTTP 400, 415,
+and 413 respectively as non-cacheable JSON-RPC transport errors. Cloudflare may
+reject malformed framing or headers earlier with a platform 4xx response. A
+Worker-generated 413 has no `Retry-After`; reduce or split the request instead of
+retrying the same payload. Include live-ingress exact-limit and over-limit
+requests in gateway validation after changing the Worker runtime or MCP
+transport dependency; direct `Request` unit tests do not validate edge framing.
 
 The protected environment secrets are:
 
@@ -392,11 +448,143 @@ Apply the remaining authority migrations in this exact order:
    covers candidate submission and review, session consolidation, GitHub sync,
    and ordinary memory projection events, while explicitly excluding projection
    rebuilds. Apply it before deploying the ordinary Workflow reconciler.
+9. `0015_github_sync_default_branch.sql` fails closed when an enabled GitHub
+   repository lacks a runtime-valid default branch. It rejects null, empty,
+   malformed, whitespace-padded, or control-character-containing values and
+   installs equivalent insert and update guards. Reconcile the reviewed default
+   branch before enabling synchronization or deploying the scheduled connector.
+10. `0016_consolidation_lease.sql` adds exclusive owner and expiration fields for
+    session-consolidation leases, an operation-witness field, a
+    safe-integer lease epoch, and an index for running lease expiration. This is
+    a pure expand migration: it does not backfill rows or install lease-state
+    contract triggers. Apply it before deploying the compatible orchestrator.
+11. `0017_github_sync_activation_receipts.sql` preflights active-head versions,
+    adds monotonic repository-configuration and cursor versions, snapshots the
+    selected ref, head, configuration, and cursor in new synchronization-run
+    claims, and adds immutable activation witnesses and receipts. Its guards
+    preserve legacy run rows under claim contract `0`, require complete claims
+    for new contract `1` runs, and prevent production cursor, run, witness, or
+    receipt deletion. Apply it before deploying the receipt-aware GitHub sync
+    Worker.
+12. `0018_consolidation_batch_receipts.sql` is the delayed consolidation
+    contract migration. It refuses cutover while any legacy consolidation is
+    running or retains lease state, adds the Workflow-generated claim ID,
+    installs the lease-state contract guards, and creates immutable per-batch
+    receipts. Apply it only after every pre-`0018` consolidation Workflow has
+    drained and before deploying the receipt-aware orchestrator.
+13. `0019_github_sync_workflows.sql` establishes the Workflow execution
+    contract. It freezes every due ref in a dispatch item, persists dispatcher
+    and per-ref GitHub request counts, adds immutable materialization receipts,
+    adds the credential lane and immutable release receipts, and adds immutable
+    no-run rejection and claimed-run finish receipts. Its final
+    synthetic cleanup guard preserves every earlier child table. This is a
+    prelaunch contract cutover, not a dual-write migration: quiesce the old
+    connector, drain every Workflow and D1 run, apply the migration, and deploy
+    the exact three-Workflow runtime before installing the Cron.
 
-Apply `0006` through `0014` before deploying the multi-repository Workers. If
+Apply `0006` through `0019` before deploying the multi-repository Workers. If
 any preflight fails, stop and reconcile the authoritative rows with a reviewed
 forward migration before retrying; later migrations must not be applied out of
 order or used to bypass an earlier failure.
+
+Migration `0016` is intentionally migration-first and compatible with the
+earlier schema contract. Before deploying the lease-aware orchestrator, stop old
+writers from starting consolidations and drain their running Workflows. A legacy
+row left in `running` with a null owner or expiration fails closed under the new
+worker and cannot be reclaimed as an expired lease. Reconcile any such row with
+a reviewed forward operation; do not invent an owner, epoch, or expiration. The
+compatible runtime claims queued, failed, or expired lease-bearing rows with an
+owner-and-epoch fence. Migration `0018` completes this contract after all old
+Workflows and legacy rows have been drained or reconciled; do not deploy the
+receipt-aware runtime between its code and schema halves.
+
+The receipt-aware consolidation Workflow creates its claim ID in a durable
+Workflow step and claims a 20-minute owner, claim, and epoch lease. It derives
+batch indexes from the frozen raw `input_order` values in groups of 50. Each
+batch has its own 15-minute Workflow step and renews the 20-minute lease before
+it checks or reuses a historical receipt and before any unfinished model work.
+Renewal is an exact old-expiration-to-new-expiration CAS; ambiguous recovery
+accepts only the exact new absolute expiration. A single D1 batch acquires a
+fresh operation witness, writes at most ten exact output slots and their
+evidence and review rows, inserts one immutable receipt, and releases the
+witness. Even a batch with no eligible input or no accepted model output writes
+a zero-output receipt.
+
+The application admits at most 9,000 distinct consolidation batches. Both the
+authoritative list callback and the value returned by the durable Workflow step
+validate the same sorted, unique boundary, so a cached step result cannot bypass
+the guard. The orchestrator Wrangler contract pins
+`workflows[0].limits.steps` to 10,000 and keeps the remaining steps as
+control-plane and failure-handling reserve. A
+9,001st batch fails with `WORKFLOW_FAILED` before any batch AI call; it is never
+truncated. A batch step returns no model payload after persisting its receipt,
+and the serialized 9,000-entry batch-index array remains below the 1 MiB
+Workflow step-result limit. See the Cloudflare
+[Workflows limits](https://developers.cloudflare.com/workflows/reference/limits/).
+
+Before a compact consolidation input reaches AI, the shared memory-model gate
+checks both every source value and the aggregate structured value. Prompt roles
+or raw-log lines split across otherwise safe frozen inputs therefore produce a
+zero-output receipt without a model call. The canonical aggregate remains
+subject to the 16 KiB model-input boundary.
+
+The requested GLM completion allowance continues to use the largest safe token
+remainder of the model context window. Response handling applies a separate,
+non-streaming 1 MiB function-argument transport limit before parsing. After
+schema parsing, serialized UTF-8 JSON is explicitly limited to 256 KiB for
+candidate analysis and 1 MiB for consolidation suggestions. The function
+contract advertises these byte limits, and the implementation measures encoded
+bytes so multibyte content cannot consume an ASCII-derived allowance.
+
+Each receipt binds the raw input digest, model-result digest, canonical output
+manifest, and manifest digest to the committed candidate IDs, content hashes,
+and evidence IDs. A response-loss retry may skip the model only after a
+`first-primary` read verifies that exact receipt and post-state. A later repair
+claim may reuse an exact historical receipt, so completion validates the exact
+batch-index set without requiring every receipt to carry the current claim.
+Receipt insertion validates its complete canonical manifest and exact candidate,
+maintainer-review, and clear-evidence post-state while the batch is bounded to
+ten outputs. After insertion, indexed D1 guards freeze the consolidation input
+set and digest plus the candidate content, hash, analysis, taxonomy, scope,
+output slot, evidence-link set, and review
+identity and required role. Candidate and review status, candidate version,
+review audit ID, and `updated_at` remain mutable for normal maintainer review.
+A later evidence sensitivity change is allowed for security response but
+permanently invalidates the nonterminal consolidation receipt post-state.
+
+Completion never reloads or expands receipt manifest bodies. One scalar D1
+query checks exact expected and actual batch coordinates with anti-joins, basic
+receipt digest, UUID, and timestamp validity, distinct receipt count, output
+count, summed suggestion count, and the post-state validity marker. This keeps
+the 9,000-batch boundary memory-bounded and remains below D1's per-invocation
+query limit instead of issuing one query per batch or output. The terminal-status
+trigger repeats the same compact checks in the status update, closing the race
+between application verification and lease release. It still fences that update
+with the current live owner, claim, epoch, and an empty operation witness. A
+missing, invalidated, or divergent receipt fails closed; never substitute another
+same-content candidate, infer success from partial rows, or use newest-wins
+recovery. See the Cloudflare
+[D1 limits](https://developers.cloudflare.com/d1/platform/limits/).
+
+Production consolidation receipts are immutable and cannot be deleted. The
+bounded synthetic janitor is the sole deletion path: it must delete
+`consolidation_batch_receipts` before consolidation outputs, inputs, lease rows,
+and the synthetic cleanup registration. If the `0018` preflight finds a running
+or lease-bearing legacy row, keep the new runtime undeployed, inspect the old
+Workflow, and reconcile through a reviewed forward operation. Do not clear or
+fabricate a claim, lease, operation, or receipt to force cutover.
+
+Migration `0017` is also expand-compatible at the schema level: existing runs
+retain null claim fields and claim contract `0`, while repository and cursor
+versions start at `1`. Do not run legacy and receipt-aware GitHub writers
+concurrently. Pause the Cron, drain or reconcile every legacy running claim,
+apply the migration, deploy the new Worker, and verify that newly selected runs
+use claim contract `1` before restoring the schedule. The new activation batch
+inserts its pre-state witness first and its final-state receipt last. The receipt
+binds the request digest and activation token to the exact head, cursor,
+repository configuration, run, manifest, and outbox state. An exact retry after
+response loss reads that receipt; any divergent collision or stale version
+requires reconciliation instead of replaying side effects.
 
 Migration `migrations/search/0004_repository_partition.sql` adds the Search D1
 partition column and requires it on new or updated projection heads. Existing
@@ -674,28 +862,44 @@ permissions. Those checks belong to the isolated synthetic project.
    beyond the accepted baseline. EdgeMneme requires GitHub's successful `/user`
    response to include `GitHub-Authentication-Token-Expiration` in the exact
    `YYYY-MM-DD HH:mm:ss UTC` format.
-2. Store it temporarily as `GITHUB_CLASSIC_TOKEN_NEXT`.
-3. Run `/user`, full `/user/repos` pagination, numeric repository-ID, numeric
-   owner-ID, expiration-header, and read-only metadata checks without ingesting
-   content.
-4. Pause synchronization if subject, scope, permission, or repository access
-   expands.
-5. Replace the active secret, update the credential version, and run one
-   scheduled canary.
-6. Revoke the old token immediately.
+2. Keep the replacement in an operator-controlled secret manager. If the label
+   `GITHUB_CLASSIC_TOKEN_NEXT` is used there, it is only an out-of-band staging
+   label; no Worker, renderer, or deployment workflow consumes that name.
+3. Inject the staged token as `GH_TOKEN` only in an isolated operator shell and
+   use `gh api --method GET` for `/user`, full `/user/repos` pagination, numeric
+   repository-ID, numeric owner-ID, expiration-header, and read-only metadata
+   checks. Do not ingest content, persist the token, or allow redirects.
+4. Stop if subject, scope, permission, or repository access differs from the
+   reviewed baseline.
+5. Set `ENABLE_GITHUB_SYNC=false`, run the protected deployment, and confirm the
+   exact disabled-version, Workflow-drain, D1-zero, Cron-empty, and Worker-secret
+   gates completed. This creates a fail-closed rotation window.
+6. While synchronization remains disabled and no production deployment is
+   running, replace the protected `GITHUB_CLASSIC_TOKEN` secret and set
+   `SYNC_CREDENTIAL_VERSION` to a new unique value. These two settings are one
+   credential identity and must never be promoted independently.
+7. Set `ENABLE_GITHUB_SYNC=true`, run the protected deployment, and verify its
+   exact version, secret binding, six-hour Cron, three Workflow definitions,
+   credential identity, access baseline, and isolated canary before accepting
+   repository synchronization.
+8. Revoke the old token immediately after the new deployment succeeds. If the
+   new deployment fails, keep synchronization disabled; do not restore a mixed
+   token/version pair.
 
 To retire GitHub synchronization instead of rotating it, set
 `ENABLE_GITHUB_SYNC=false` and complete a deployment. Confirm that the workflow
-verified an empty Cron schedule and no Cloudflare `GITHUB_CLASSIC_TOKEN`
-binding. Then delete the protected GitHub environment secret and revoke the PAT
-in GitHub. Do not remove or revoke the credential before the disabled-state
-reconciliation has completed unless emergency revocation takes priority over a
-clean control-plane transition.
+locked the tagged disabled version, exhaustively found no nonterminal instance
+for any of the exact three Workflows, observed D1 dispatch/item/run/lane zero
+twice, and only then created and verified a tagged secretless version with an
+empty Cron schedule. Then delete the protected GitHub environment secret and
+revoke the PAT in GitHub. Do not remove or revoke the credential before this
+disabled-state reconciliation has completed unless emergency revocation takes
+priority over a clean control-plane transition.
 
 The active credential version emits each 14-, 7-, and 1-day warning once. At or
 after expiration, synchronization stops before repository enumeration. Missing
 or malformed expiration headers also fail closed. Rotation must use a new
-credential version; `GITHUB_CLASSIC_TOKEN_NEXT` does not change the read-only
+credential version. An out-of-band staging label does not change the read-only
 endpoint allowlist or authorize broader scopes.
 
 ## Partial sync
@@ -705,10 +909,65 @@ tree is truncated, a blob or run limit is exceeded, rate limiting prevents a
 complete pass, or repository identity changes. Resolve the condition, perform a
 full tree reconciliation, and only then mark the cursor complete.
 
-The GitHub client has a shared hard budget of 900 REST requests per scheduled
-invocation and checks that budget before each network request. A tree may contain
-at most 2,000 inspected text candidates and at most 16 MiB of retrieved content
-per ref; generated and binary entries are recorded without blob retrieval.
+Successful GitHub JSON responses are read as bounded streams with
+endpoint-specific limits. A missing `Content-Length` does not bypass the bound:
+an oversized body is canceled and becomes `GITHUB_PARTIAL_SYNC`, with no cursor
+or selected-head advance. Response bodies are never included in the error or
+audit record.
+
+The dispatch Workflow has a persistent 900-request access-baseline budget.
+Each `/user/repos` page is immediately reduced to numeric repository and owner
+IDs plus the three permission booleans; raw repository objects are not retained
+between pages. Enumeration supports at most 10,000 distinct accessible
+repositories and 100 pages. A next page beyond that bound becomes
+`GITHUB_PARTIAL_SYNC` before another request, fails every selected ref closed,
+and requires operator review rather than truncating the authorization-risk
+baseline.
+Every ref Workflow has its own persistent 2,005-request budget and re-runs
+repository ID, owner ID, and default-branch verification before reading that
+ref. The counter is incremented in D1 before each fetch, so a Workflow retry or
+response-loss recovery cannot reset it. The ref budget covers the fixed
+metadata, ref, compare, commit, and tree path plus at most 2,000 eligible text
+blob reads and 16 MiB of retrieved content. Generated and binary entries are
+represented without blob retrieval.
+
+There is no fixed aggregate request ceiling per Cron. The Cron performs no
+GitHub fetches; it only creates stable Workflow instances. Dispatcher and ref
+instances acquire the same D1 credential lane before using the PAT. The lane
+fences holder identity, claim ID, epoch, and lease expiration, carries the
+cross-isolate request-start interval, and writes an immutable release receipt.
+Contention uses deterministic jitter and durable Workflow sleep. A lost release
+response is accepted only when an exact receipt verifies the lane CAS. The
+deployed Worker permits 10,000 Cloudflare subrequests per invocation, but that
+limit is not a reservation of GitHub capacity for the Workflow fleet.
+
+Prior-state reconciliation shares one fail-closed budget across pending items,
+unbound runs, running items, and closable dispatches: at most 64 list pages and
+7,200 conservatively accounted D1 subrequests. Each list attempt reserves all
+three configured tries, and each row reserves its worst-case exact-recovery
+cost before any write. Running settlement reads at most 40 rows per callback;
+its maximum 21 D1 statements per row is 840, below the Paid-plan limit of
+[1,000 queries per Worker invocation](https://developers.cloudflare.com/d1/platform/limits/).
+Each GitHub Workflow explicitly pins 10,000 steps, while the reconciliation
+budget leaves at least 2,800 of the Worker's 10,000 subrequests for access
+baseline, materialization, and fan-out work. Exhaustion preserves durable state
+for a later Workflow or the disabled maintenance drain and never advances a
+repository ref.
+
+The internal budgets do not promise that all requests will be available. A
+personal classic PAT normally has a 5,000-request-per-hour primary REST limit
+shared with the authenticated user, and GitHub also applies a 900-point-per-minute
+secondary limit. GitHub response headers and errors remain authoritative. The
+scheduled Worker is also bounded by the deployed Cloudflare plan's subrequest
+and execution-time limits. See GitHub's
+[REST rate-limit documentation](https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api)
+and [Cloudflare Workers limits](https://developers.cloudflare.com/workers/platform/limits/).
+Every due ref is durably scheduled, but large multi-ref or multi-repository
+backlogs can still wait under an external limit. EdgeMneme does not promise that
+an arbitrary number of maximum-cost refs will complete in the same six-hour
+slot, does not claim unbounded progress, and does not introduce a mid-ref
+checkpoint.
+
 Manifest entries are written with at most 500 rows and 256 KiB per JSON batch. Candidate evidence,
 observations, links, and outbox events use at most 100 rows and 256 KiB per JSON
 batch, avoiding per-file D1 statements. Budget exhaustion is explicit
@@ -754,21 +1013,71 @@ larger than 64 KiB is rejected before blob retrieval. Size failures never create
 tombstones. Bodyless tombstones are reserved for secret, PII, prompt-transcript,
 raw-log, or sensitive-path findings that pass the size boundary.
 
-The poller provides eventual repository snapshot consistency. With no webhook or
-clone, worst-case freshness is six hours plus processing time, and a commit
-created and made unreachable between polls may never be observed.
-Every poll includes the verified configured default branch plus every explicit
-tracked branch or tag; tracked refs never replace the default branch. If GitHub
-reports a default branch different from `repositories.default_branch`, the
-connector stops with `GITHUB_RECONCILIATION_REQUIRED`. A maintainer must review
-the authority change, reconcile memories supported by the old default ref, and
-update the configured branch before synchronization resumes.
-Every 00:00 UTC invocation bypasses the ref ETag/SHA fast path and reconciles the
-complete current tree. Force-pushes and ancestry gaps do the same immediately
-and retain `history_gap_possible = 1`. Other six-hour polls may use conditional
-requests. A repository lease rejects overlapping scheduled executions, including
-different scheduled times; an abandoned lease becomes retryable after one hour
-and its stale run is retained as failed audit state.
+The connector provides eventual repository snapshot consistency. Configured
+refs are materialized as durable `sync_cursors`; each dispatch excludes paused
+and not-yet-due cursors and freezes every remaining ref as an identity-bound D1
+item. Stable Workflow IDs include the project, numeric repository, ref,
+scheduled slot, and reconciliation mode. Repeated Cron delivery or child
+creation therefore recovers the same ledger entry instead of creating another
+attempt. A ref rejected before claiming a run receives an immutable rejection
+receipt; a claimed run receives an immutable finish receipt. Neither can
+prevent another ref from being dispatched.
+
+Fleet throughput is limited by the PAT's shared primary and secondary limits,
+the D1 credential lane, and each ref's absolute deadline. Monitor oldest due
+time, dispatch backlog, rate remaining/reset, retry time, and deadline misses;
+do not increase concurrency to bypass GitHub limits. With no webhook or clone,
+a commit created and made unreachable between successful snapshots may never be
+observed.
+
+The configured set always contains the verified default branch plus every
+explicit tracked branch or tag; tracked refs never replace the default branch.
+An enabled GitHub repository must have a `repositories.default_branch` accepted
+by the connector's tracked-ref parser. Empty values, characters outside the
+ASCII ref grammar, double-dot or double-slash segments, and leading or trailing
+slashes are invalid; this also rejects every whitespace or control character.
+D1 migration `0015` rejects an existing row that needs reconciliation and guards
+subsequent inserts and updates. Configure and review the branch before setting
+`sync_enabled = 1`.
+If GitHub reports a default branch different from
+`repositories.default_branch`, the connector stops with
+`GITHUB_RECONCILIATION_REQUIRED`. A maintainer must review the authority change,
+reconcile memories supported by the old default ref, and update the configured
+branch before synchronization resumes. The first due dispatch item for each ref
+after a UTC day boundary freezes a full reconciliation and bypasses the ref
+ETag/SHA fast path. If the midnight Cron is missed, the next successful
+dispatcher backfills that daily requirement; the child may start later without
+changing its frozen mode. Force-pushes and ancestry gaps also force a complete
+tree comparison and retain `history_gap_possible = 1`. Later same-day items may
+use conditional requests. The D1 per-ref run identity rejects overlapping work
+for the same scheduled slot. An expired running claim is retained as failed
+audit state before a later attempt proceeds.
+
+A newly claimed run records the selected ref, the current active manifest and
+head version, the repository configuration version, and the exact cursor
+version. Activation is one D1 batch. Its first statement inserts an immutable
+pre-state witness under an activation token and request digest. Every manifest
+delta, deletion-review artifact, safe candidate statement, outbox event, head
+advance, cursor update, and run completion is guarded by that witness and the
+same claim. The last statement inserts an immutable receipt whose trigger checks
+the complete final state, including the incremented head and cursor versions.
+If the client loses the successful response, only an exact matching receipt can
+complete the retry. A changed configuration, paused or advanced cursor, moved
+head, expired lease, or nonmatching token or digest fails with
+`GITHUB_RECONCILIATION_REQUIRED`; never repair it by moving the head or cursor
+manually.
+
+Migration `0019` makes the old direct-Cron GitHub writer incompatible. After it
+is applied, recovery is roll-forward only to a build that exports
+`GitHubDispatchWorkflow`, `GitHubRefSyncWorkflow`, and
+`GitHubRetentionWorkflow`. The scheduled handler itself performs no GitHub or
+retention work; it only creates or recovers stable dispatch and retention
+instances. Dispatcher and ref retries consume the persisted request counters,
+so a Workflow retry cannot reset the 900-request access-discovery budget or the
+2,005-request ref budget. A lane release commits the lane CAS and immutable
+release receipt in one D1 batch, and response-loss recovery accepts only that
+exact receipt. Never restore a pre-`0019` version, manually clear a lane, or
+rewrite a dispatch, activation, release, or finish receipt.
 
 On a successful reconciliation, inspect `github_tree_manifest_deltas` for the
 new manifest. Every deleted path has deterministic `repository_path_absent`
@@ -838,6 +1147,54 @@ logs or external error text.
   partial index used to recover dispatched ordinary events whose Queue delivery
   or Workflow execution did not converge. Projection rebuild events remain on
   their specialized indexes and recovery protocol.
+- Migration `0015_github_sync_default_branch.sql` fails closed when an enabled
+  GitHub repository has no runtime-valid default branch and then guards the same
+  invariant. Verify the branch from GitHub repository metadata, update the
+  authoritative row through a reviewed change, and retry the migration. Never
+  bypass the preflight or enable synchronization with a padded, control-bearing,
+  or malformed ref name.
+- Migration `0016_consolidation_lease.sql` is a pure expand step. It adds nullable
+  owner, expiration, and operation-witness fields plus a safe-integer epoch and
+  running-expiry index; it neither backfills legacy rows nor installs contract
+  triggers. Drain old running Workflows before cutover. A legacy `running` row
+  with null lease fields fails closed and requires reviewed forward
+  reconciliation. Let a valid live owner finish or let its lease expire for
+  ordinary fenced takeover; never clear, transfer, or synthesize lease fields.
+  Defer stricter constraints to a separate contract migration after every
+  legacy row and old Workflow has been drained or reconciled.
+- Migration `0017_github_sync_activation_receipts.sql` adds the versioned run
+  claim, immutable pre-state witness, and immutable final-state receipt used by
+  atomic GitHub manifest activation. Pause scheduling, drain or reconcile claim
+  contract `0` runs, apply the migration, deploy the receipt-aware Worker, and
+  verify new claims use contract `1` before restoring the Cron. Never delete or
+  rewrite production cursors, runs, witnesses, or receipts to recover a stale
+  activation. Reconcile the current tree through a new claim; only the bounded
+  synthetic cleanup path may remove those rows.
+- Migration `0018_consolidation_batch_receipts.sql` is a contract cutover and
+  rejects every legacy `running` or lease-bearing consolidation row. Drain old
+  Workflows before applying it. The compatible runtime then uses a durable
+  claim ID, 20-minute renewable lease, raw 50-input batch coordinates, and one
+  immutable receipt for every batch, including zero-output batches. On retry,
+  reuse only an exact receipt whose input digest and complete post-state verify.
+  Its guards require canonical ISO timestamps, exact manifest keys and types,
+  stable v5-a candidate IDs, distinct ordered evidence IDs, pending maintainer
+  review at receipt creation, and clear evidence. Receipt-bound stable fields and
+  relations are then immutable, while legal review status transitions remain
+  available. A terminal-status guard rechecks compact coordinate, count, digest,
+  and post-state-validity invariants atomically without expanding manifests. A
+  repair claim may finish with verified historical receipts. Never delete or
+  rewrite a production receipt, attach a different same-hash candidate, or
+  manually mark a partially persisted batch complete. Only child-first synthetic
+  cleanup may delete receipt rows.
+- Migration `0019_github_sync_workflows.sql` is the prelaunch cutover from a
+  direct-Cron writer to the exact three-Workflow runtime. Quiesce the connector
+  and drain both the Workflow control plane and authoritative D1 before
+  applying it. Dispatch materialization, credential-lane release, manifest
+  activation, and per-ref finish each have immutable receipts; dispatcher and
+  ref request counters persist across retries. After this migration, automatic
+  rollback may target only a tagged version with the exact Workflow bindings,
+  no Queue, and compatible runtime/credential settings. Recovery to an older
+  writer is forbidden; retain the disabled version and roll forward instead.
 - Search migration `0005_memory_fts_chunk_ledger.sql` fails closed while legacy
   FTS or projection-head rows remain. Clear only the rebuildable search
   projection through a controlled, exact-vector cleanup; never delete
