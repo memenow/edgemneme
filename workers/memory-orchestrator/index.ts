@@ -25,6 +25,7 @@ import {
   MEMORY_MODEL_INPUT_MAX_BYTES
 } from "../../src/quality/sensitive-content";
 import {
+  CONSOLIDATION_BATCH_STEP_ATTEMPTS,
   CONSOLIDATION_STEP_TIMEOUT,
   claimConsolidationLease,
   consolidateSessionBatch,
@@ -1319,7 +1320,11 @@ export class MemoryWorkflow extends WorkflowEntrypoint<Env, WorkflowPayload> {
             await step.do(
               `consolidate batch ${batchIndex}`,
               {
-                retries: { limit: 2, delay: "2 seconds", backoff: "exponential" },
+                retries: {
+                  limit: CONSOLIDATION_BATCH_STEP_ATTEMPTS,
+                  delay: "2 seconds",
+                  backoff: "exponential"
+                },
                 timeout: CONSOLIDATION_STEP_TIMEOUT
               },
               async () => {

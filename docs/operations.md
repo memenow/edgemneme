@@ -481,8 +481,12 @@ Apply the remaining authority migrations in this exact order:
     prelaunch contract cutover, not a dual-write migration: quiesce the old
     connector, drain every Workflow and D1 run, apply the migration, and deploy
     the exact three-Workflow runtime before installing the Cron.
+14. `0020_consolidation_input_shape.sql` preflights every frozen consolidation
+    input and requires at most one summary per consolidation. It installs the
+    equivalent D1 insert guard and partial unique index. Apply it before relying
+    on the bounded consolidation subrequest calculation.
 
-Apply `0006` through `0019` before deploying the multi-repository Workers. If
+Apply `0006` through `0020` before deploying the multi-repository Workers. If
 any preflight fails, stop and reconcile the authoritative rows with a reviewed
 forward migration before retrying; later migrations must not be applied out of
 order or used to bypass an earlier failure.
@@ -521,6 +525,22 @@ truncated. A batch step returns no model payload after persisting its receipt,
 and the serialized 9,000-entry batch-index array remains below the 1 MiB
 Workflow step-result limit. See the Cloudflare
 [Workflows limits](https://developers.cloudflare.com/workflows/reference/limits/).
+
+The frozen input contract permits at most one summary per consolidation; the
+gateway writes it at `input_order = 0` when present. The loader revalidates at
+most one summary per model batch before model or persistence work, and migration
+`0020` enforces the stronger consolidation-wide invariant in D1. A maximally
+expensive callback reserves 23 fixed requests, ten summary
+lookups, and 31 ambiguous-commit recovery requests. Two total step attempts
+therefore reserve 128 subrequests per batch. The complete boundary reserves
+`9,000 * 128 + 68 = 1,152,068` subrequests, including fixed Workflow and failure
+handling. `wrangler/memory-orchestrator.jsonc` pins 1,500,000 subrequests, which
+stays below Cloudflare's configurable 10,000,000 maximum and leaves explicit
+operational headroom. The same maximum callback accounts for 123 D1 queries,
+including every transaction statement and ambiguous-receipt verification, below
+the Paid-plan 1,000-query invocation limit. Any change to batch size, output
+count, model attempts, step attempts, or receipt recovery must update the
+exported budget constants and the config-parsing contract test before deployment.
 
 Before a compact consolidation input reaches AI, the shared memory-model gate
 checks both every source value and the aggregate structured value. Prompt roles
@@ -1195,6 +1215,11 @@ logs or external error text.
   rollback may target only a tagged version with the exact Workflow bindings,
   no Queue, and compatible runtime/credential settings. Recovery to an older
   writer is forbidden; retain the disabled version and roll forward instead.
+- Migration `0020_consolidation_input_shape.sql` is the fail-closed contract for
+  the consolidation budget. It refuses legacy rows with duplicate summaries,
+  then installs an insert guard and partial unique index. Reconcile invalid
+  authority data through a reviewed forward migration; never delete or reorder
+  frozen inputs to satisfy the preflight.
 - Search migration `0005_memory_fts_chunk_ledger.sql` fails closed while legacy
   FTS or projection-head rows remain. Clear only the rebuildable search
   projection through a controlled, exact-vector cleanup; never delete

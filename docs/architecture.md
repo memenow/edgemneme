@@ -175,6 +175,10 @@ Session consolidation claims one row with an owner, unique claim ID, monotonic
 lease epoch, and operation witness. The Workflow freezes the input buckets and
 runs every bucket in a separately named, deterministic step. Before each batch
 it renews a 20-minute lease; the batch itself has a 15-minute execution timeout.
+The frozen set contains at most one summary; the gateway writes it at input
+order zero when present. D1 enforces the consolidation-wide limit, and the
+runtime loader revalidates the per-batch limit before model work so the
+conservative 128-subrequest per-batch bound remains authoritative.
 
 A model batch is applied through one fenced D1 transaction. The transaction
 validates the current owner, claim, epoch, and operation; rejects an active

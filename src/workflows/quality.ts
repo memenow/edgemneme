@@ -119,7 +119,46 @@ const ANALYSIS_MODEL = "@cf/zai-org/glm-5.2" as const;
 const MODEL_ANALYSIS_MAX_ATTEMPTS = 3;
 const CONSOLIDATION_BATCH_SIZE = 50;
 const CONSOLIDATION_OUTPUTS_PER_BATCH = 10;
+const CONSOLIDATION_MAX_SUMMARIES = 1;
+const CONSOLIDATION_BATCH_ATTEMPT_FIXED_SUBREQUESTS =
+  1 + // Workflow admission.
+  1 + // Frozen batch input load.
+  3 + // Lease renewal plus ambiguous-response verification.
+  1 + // Existing receipt lookup.
+  1 + // Session lookup.
+  1 + // Registered repository lookup.
+  1 + // Batch-local provenance lookup.
+  MODEL_ANALYSIS_MAX_ATTEMPTS +
+  CONSOLIDATION_OUTPUTS_PER_BATCH + // Worst-case duplicate checks.
+  1; // Atomic persistence batch.
+const CONSOLIDATION_AMBIGUOUS_COMMIT_RECOVERY_SUBREQUESTS =
+  1 + 3 * CONSOLIDATION_OUTPUTS_PER_BATCH;
+const CONSOLIDATION_BATCH_D1_PREPERSIST_QUERY_BUDGET =
+  9 + // Admission, input, lease, receipt, session, repository, and provenance reads.
+  CONSOLIDATION_OUTPUTS_PER_BATCH + // Duplicate checks.
+  CONSOLIDATION_OUTPUTS_PER_BATCH * CONSOLIDATION_MAX_SUMMARIES;
+const CONSOLIDATION_BATCH_D1_TRANSACTION_QUERY_BUDGET =
+  3 + // Operation acquisition, receipt insertion, and operation release.
+  CONSOLIDATION_OUTPUTS_PER_BATCH *
+    (5 + CONSOLIDATION_MAX_SUMMARIES);
+const CONSOLIDATION_FIXED_WORKFLOW_SUBREQUEST_RESERVE = 68;
+export const CONSOLIDATION_BATCH_STEP_ATTEMPTS = 2;
 export const MAX_CONSOLIDATION_WORKFLOW_BATCHES = 9_000;
+export const CONSOLIDATION_BATCH_SUBREQUEST_BUDGET =
+  CONSOLIDATION_BATCH_STEP_ATTEMPTS *
+    (CONSOLIDATION_BATCH_ATTEMPT_FIXED_SUBREQUESTS +
+      CONSOLIDATION_OUTPUTS_PER_BATCH * CONSOLIDATION_MAX_SUMMARIES +
+      CONSOLIDATION_AMBIGUOUS_COMMIT_RECOVERY_SUBREQUESTS);
+export const CONSOLIDATION_MINIMUM_WORKFLOW_SUBREQUEST_BUDGET =
+  MAX_CONSOLIDATION_WORKFLOW_BATCHES *
+    CONSOLIDATION_BATCH_SUBREQUEST_BUDGET +
+  CONSOLIDATION_FIXED_WORKFLOW_SUBREQUEST_RESERVE;
+export const CONSOLIDATION_MINIMUM_WORKFLOW_STEP_BUDGET =
+  MAX_CONSOLIDATION_WORKFLOW_BATCHES + 9;
+export const CONSOLIDATION_MAX_BATCH_D1_QUERY_BUDGET =
+  CONSOLIDATION_BATCH_D1_PREPERSIST_QUERY_BUDGET +
+  CONSOLIDATION_BATCH_D1_TRANSACTION_QUERY_BUDGET +
+  CONSOLIDATION_AMBIGUOUS_COMMIT_RECOVERY_SUBREQUESTS;
 export const CONSOLIDATION_STEP_TIMEOUT = "15 minutes" as const;
 const CONSOLIDATION_LEASE_DURATION_MILLISECONDS = 20 * 60 * 1_000;
 const CONSOLIDATION_LEASE_DURATION_SQL = "+20 minutes";
@@ -711,6 +750,7 @@ async function loadConsolidationBatchInputs(
     );
   }
   const inputs = result.results;
+  validateConsolidationBatchInputShape(batchIndex, inputs);
   const batchInputDigest = await sha256(
     canonicalJson(
       inputs.map((input) => ({
@@ -728,6 +768,32 @@ async function loadConsolidationBatchInputs(
     firstInputOrder,
     lastInputOrder
   };
+}
+
+export function validateConsolidationBatchInputShape(
+  batchIndex: number,
+  inputs: readonly Pick<ConsolidationInputRow, "input_order" | "input_kind">[]
+): void {
+  assertConsolidationBatchIndex(batchIndex);
+  let summaryCount = 0;
+  for (const input of inputs) {
+    if (input.input_kind === "summary") {
+      summaryCount += 1;
+    } else if (input.input_kind === "candidate") {
+      continue;
+    } else {
+      throw new EdgeMnemeError(
+        "WORKFLOW_FAILED",
+        "The frozen consolidation input kind is invalid."
+      );
+    }
+  }
+  if (summaryCount > CONSOLIDATION_MAX_SUMMARIES) {
+    throw new EdgeMnemeError(
+      "WORKFLOW_FAILED",
+      "A consolidation batch may contain only one summary input."
+    );
+  }
 }
 
 export async function claimConsolidationLease(

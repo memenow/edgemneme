@@ -1,12 +1,74 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import {
+  CONSOLIDATION_BATCH_SUBREQUEST_BUDGET,
+  CONSOLIDATION_MAX_BATCH_D1_QUERY_BUDGET,
+  CONSOLIDATION_MINIMUM_WORKFLOW_STEP_BUDGET,
+  CONSOLIDATION_MINIMUM_WORKFLOW_SUBREQUEST_BUDGET,
   finishConsolidation,
   listConsolidationBatchIndexes,
   MAX_CONSOLIDATION_WORKFLOW_BATCHES,
+  validateConsolidationBatchInputShape,
   validateConsolidationWorkflowBatchIndexes
 } from "../src/workflows/quality";
 
 describe("consolidation Workflow batch limits", () => {
+  it("reserves a retry-aware platform budget for every admitted batch", () => {
+    const config = JSON.parse(
+      readFileSync("wrangler/memory-orchestrator.jsonc", "utf8")
+    ) as {
+      limits: { subrequests: number };
+      workflows: Array<{ class_name: string; limits: { steps: number } }>;
+    };
+    const workflow = config.workflows.find(
+      (candidate) => candidate.class_name === "MemoryWorkflow"
+    );
+
+    expect(CONSOLIDATION_BATCH_SUBREQUEST_BUDGET).toBe(128);
+    expect(CONSOLIDATION_MINIMUM_WORKFLOW_SUBREQUEST_BUDGET).toBe(1_152_068);
+    expect(CONSOLIDATION_MINIMUM_WORKFLOW_STEP_BUDGET).toBe(9_009);
+    expect(CONSOLIDATION_MAX_BATCH_D1_QUERY_BUDGET).toBe(123);
+    expect(CONSOLIDATION_MAX_BATCH_D1_QUERY_BUDGET).toBeLessThanOrEqual(1_000);
+    expect(config.limits.subrequests).toBeGreaterThanOrEqual(
+      CONSOLIDATION_MINIMUM_WORKFLOW_SUBREQUEST_BUDGET
+    );
+    expect(config.limits.subrequests).toBeLessThanOrEqual(10_000_000);
+    expect(workflow?.limits.steps).toBeGreaterThanOrEqual(
+      CONSOLIDATION_MINIMUM_WORKFLOW_STEP_BUDGET
+    );
+  });
+
+  it("accepts at most one summary in a frozen batch", () => {
+    expect(() =>
+      validateConsolidationBatchInputShape(0, [
+        { input_order: 0, input_kind: "summary" },
+        { input_order: 1, input_kind: "candidate" }
+      ])
+    ).not.toThrow();
+    expect(() =>
+      validateConsolidationBatchInputShape(0, [
+        { input_order: 0, input_kind: "candidate" }
+      ])
+    ).not.toThrow();
+    expect(() =>
+      validateConsolidationBatchInputShape(0, [
+        { input_order: 1, input_kind: "candidate" }
+      ])
+    ).not.toThrow();
+    expect(() =>
+      validateConsolidationBatchInputShape(1, [
+        { input_order: 50, input_kind: "candidate" }
+      ])
+    ).not.toThrow();
+
+    expect(() =>
+      validateConsolidationBatchInputShape(0, [
+        { input_order: 0, input_kind: "summary" },
+        { input_order: 1, input_kind: "summary" }
+      ])
+    ).toThrow(/only one summary/iu);
+  });
+
   it("accepts the reserved 9,000-batch boundary", () => {
     const batchIndexes = Array.from(
       { length: MAX_CONSOLIDATION_WORKFLOW_BATCHES },

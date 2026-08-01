@@ -79,6 +79,10 @@ of the default deployment path.
   validated from a compact D1 summary. A 9,000-batch application cap reserves
   space below the pinned
   10,000-step Workflow limit and fails closed before AI without truncation.
+  Frozen inputs permit at most one summary per consolidation, and the gateway
+  writes it at order zero when present. The orchestrator reserves 1,500,000
+  subrequests against a retry-aware minimum of 1,152,068 for the full admitted
+  boundary.
 - `claude-runner` is present as a disabled boundary only. It is not part of the
   default deployment path.
 
@@ -138,7 +142,8 @@ physical deployment per repository or project.
 - pnpm 10
 - A Cloudflare Workers Paid account with D1, R2, Queues, Workflows, Vectorize,
   and Workers AI. The production contract requires Paid-plan GLM-5.2 access,
-  10,000 Workflow steps, and the configured subrequest and CPU limits.
+  10,000 Workflow steps, 1,500,000 orchestrator subrequests, and the configured
+  CPU limit.
 - A separately approved, expiring GitHub PAT (classic) if private-repository
   sync is enabled
 

@@ -188,6 +188,12 @@ indexed D1 guards then freeze the stable input, candidate, output, evidence-link
 and review identity it proved. Completion reads only compact receipt coordinates and
 metadata, so the 9,000-batch boundary cannot materialize manifest bodies in a
 Worker isolate.
+The same frozen-input boundary permits at most one summary per consolidation;
+the gateway writes it at order zero when present. The loader rejects an
+overfull batch before model work, while migration `0020` enforces the stronger
+global limit in D1. The orchestrator reserves 1,500,000 subrequests against the
+conservative 1,152,068 full-boundary requirement, including two total batch
+attempts and ambiguous-commit recovery.
 
 A PAT (classic) with `repo` scope is not truly read-only. If stolen, it can
 exercise the full scope outside EdgeMneme. The accepted design therefore

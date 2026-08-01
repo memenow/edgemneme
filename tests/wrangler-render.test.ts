@@ -321,7 +321,7 @@ describe("Wrangler deployment config renderer", () => {
 
     expect(rendered.limits).toEqual({
       cpu_ms: 300_000,
-      subrequests: 50_000
+      subrequests: 1_500_000
     });
     expect(rendered.workflows).toEqual([
       expect.objectContaining({ limits: { steps: 10_000 } })
