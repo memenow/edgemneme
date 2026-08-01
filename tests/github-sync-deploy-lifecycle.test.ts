@@ -125,7 +125,7 @@ describe("GitHub sync deployment lifecycle", () => {
     const disabled = workflowStep("Reconcile disabled GitHub sync");
 
     expect(disabled).toContain(
-      "steps.capture_core_versions.outputs.github_sync_state == 'present'"
+      "needs.capture_production_state.outputs.github_sync_previous_state == 'present'"
     );
     expect(disabled).toContain("wrangler deploy --strict");
     expect(disabled).toContain("wait_for_github_sync_drain");

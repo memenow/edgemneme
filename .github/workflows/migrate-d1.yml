@@ -13,6 +13,7 @@ permissions:
 
 concurrency:
   group: production-cloudflare
+  queue: max
   cancel-in-progress: false
 
 jobs:
@@ -67,6 +68,12 @@ jobs:
           node-version: 24
           cache: pnpm
           cache-dependency-path: pnpm-lock.yaml
+
+      - name: Verify current main migration head
+        timeout-minutes: 2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/verify-github-main-head.mjs
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile --ignore-scripts
@@ -1418,6 +1425,12 @@ jobs:
           done
           echo "GitHub sync changed after backup; migration apply is blocked." >&2
           exit 1
+
+      - name: Revalidate current main migration admission
+        timeout-minutes: 2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/verify-github-main-head.mjs
 
       - name: Apply memory database migrations
         env:

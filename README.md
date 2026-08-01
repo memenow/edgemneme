@@ -207,6 +207,18 @@ Configure these environment variables for deployment:
 - `MEMORY_GATEWAY_CUSTOM_DOMAIN` (optional route only; an empty value uses `workers.dev`)
 - `SYNC_CREDENTIAL_VERSION` (required only when GitHub sync is enabled)
 
+Create a separate `production-rollback` environment for unattended recovery.
+Restrict it to `main`, configure no required reviewers or wait timer, copy the
+five `CF_*` identifiers plus `ENABLE_GITHUB_SYNC`, the conditional
+`SYNC_CREDENTIAL_VERSION`, and both optional gateway routing values exactly.
+Set `CF_ROLLBACK_ACCOUNT_ID` to the production account and
+`UNATTENDED_ROLLBACK_ENABLED=true`. Store a separately issued,
+account-scoped `CLOUDFLARE_ROLLBACK_API_TOKEN` as an environment-level secret;
+do not inherit the normal deployment token into this environment. Production
+capture emits only a SHA-256 configuration fingerprint. The rollback preflight
+must match that fingerprint and read the captured Worker state with the
+dedicated credential before deployment can continue.
+
 The public URL and expected host must identify the same endpoint. The expected
 host remains required when `MEMORY_GATEWAY_CUSTOM_DOMAIN` is empty and the
 gateway uses its `workers.dev` hostname. It is passed only to deployment
@@ -248,6 +260,20 @@ deleting the Worker secret. This operational writer cannot change formal memory.
 Unknown, malformed, rate-limited, or drifting control-plane state fails closed.
 Production D1 migrations use the separate manual workflow and require the exact
 confirmation value `APPLY`.
+
+The deployment and migration workflows share the workflow-level
+`production-cloudflare` concurrency group with `queue: max`, so queued
+production changes are retained up to the platform queue limit and run
+serially. Queue order is not an ordering guarantee, so both workflows reject a
+run whose source is no longer the current `main` commit before any production
+mutation. Deployment first captures Worker state in an independent read-only
+job, then revalidates that baseline immediately before each Worker lifecycle
+mutation. The deploy job has a 240-minute ceiling with explicit bounds on its
+long-running steps. An ordinary deployment failure or cancellation starts
+rollback from the independent capture through the unattended
+`production-rollback` environment. A GitHub force-cancel can bypass `always()`
+rollback jobs; follow the manual roll-forward or recovery procedure in the
+operations runbook in that case.
 
 Each device or agent receives a separate random project token. Store only its
 HMAC digest in `principals.token_digest`; the plaintext token is shown once to

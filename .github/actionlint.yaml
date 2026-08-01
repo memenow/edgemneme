@@ -1,0 +1,9 @@
+# actionlint 1.7.12 predates GitHub's queue: max concurrency contract. Remove
+# these scoped ignores after a stable actionlint release supports that field.
+paths:
+  .github/workflows/deploy.yml:
+    ignore:
+      - '^unexpected key "queue" for "concurrency" section\. expected one of "cancel-in-progress", "group"$'
+  .github/workflows/migrate-d1.yml:
+    ignore:
+      - '^unexpected key "queue" for "concurrency" section\. expected one of "cancel-in-progress", "group"$'

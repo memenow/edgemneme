@@ -84,6 +84,61 @@ D1. Verify the rebuild before allowing filtered queries. See
 
 ## Deployment and rollback
 
+The deployment and manual migration workflows share the workflow-level
+`production-cloudflare` concurrency group with `queue: max` and
+`cancel-in-progress: false`. This retains up to 100 pending production runs
+instead of replacing a single pending run and serializes their execution. It
+does not guarantee queue order and does not exclude changes made directly
+through the Cloudflare dashboard or API. Each workflow therefore verifies that
+its immutable source is still the current `main` commit before production work.
+Deployment repeats that check with the captured Worker state immediately before
+each Worker lifecycle mutation. Migration repeats it immediately before the
+paired D1 apply sequence; after the first database apply begins, the compatible
+two-database sequence finishes as one logical operation.
+
+Deployment captures the current core and GitHub synchronization Worker state
+in an independent, read-only job before the deploy job starts. The deploy job
+observes the same state again and rejects drift before changing Worker lifecycle
+state. The independent capture remains available to the rollback job if the
+deploy job fails or is ordinarily canceled. The deploy job has a 240-minute
+ceiling; long-running gates have explicit per-step limits whose compatible path
+fits within that ceiling with job-level margin.
+
+The rollback job uses `always()` and runs for ordinary `failure` and
+`cancelled` deploy results when state capture succeeded. GitHub force-cancel may
+bypass `always()` jobs. After a force-cancel, stop further production changes,
+inspect the captured and active Worker versions, and use the existing reviewed
+manual roll-forward or recovery procedure below; never assume automatic
+rollback ran.
+
+Configure a separate `production-rollback` GitHub environment before enabling
+deployment. It must:
+
+- allow only the `main` branch;
+- have no required reviewers, wait timer, or other interactive deployment gate;
+- define the same five `CF_*` resource identifiers, `ENABLE_GITHUB_SYNC`, and
+  conditional `SYNC_CREDENTIAL_VERSION` as `production`;
+- copy `MEMORY_GATEWAY_ALLOWED_ORIGINS` and `MEMORY_GATEWAY_CUSTOM_DOMAIN`
+  exactly, including an intentional empty value;
+- define `CF_ROLLBACK_ACCOUNT_ID` with the same account identifier used by
+  `production`;
+- set `UNATTENDED_ROLLBACK_ENABLED=true`; and
+- expose a separately issued, account-scoped `CLOUDFLARE_ROLLBACK_API_TOKEN` as
+  an environment-level secret. Do not reuse or inherit the ordinary deployment
+  token in this environment.
+
+Production state capture generates a SHA-256 fingerprint over the account,
+resource identifiers, routing values, desired synchronization state, and
+credential version; it never emits their plaintext values. Before deployment,
+the rollback job must reproduce that fingerprint and use the dedicated token
+to read the exact captured Worker version, schedule, and secret-binding
+metadata. The actual rollback recomputes the fingerprint before mutation, so a
+later environment drift also fails closed. Keep required-reviewer protection on
+`production`; do not add it to `production-rollback`, because a recovery job
+that waits for a second approval is not unattended. Verify environment-level
+secret placement, main-only branch policy, and the absence of reviewer and wait
+rules through the GitHub API or UI after every policy change.
+
 The deploy workflow runs `scripts/run-synthetic-canary.mjs`. The runner creates
 an exact `system.synthetic.<uuid>` project and one-time principal, invokes
 `scripts/synthetic-canary-client.mjs`, and removes the registered synthetic
@@ -285,6 +340,14 @@ MEMORY_GATEWAY_EXPECTED_HOST
 MEMORY_GATEWAY_PUBLIC_URL
 SYNC_CREDENTIAL_VERSION
 ```
+
+The `production-rollback` environment duplicates the five `CF_*` identifiers,
+`ENABLE_GITHUB_SYNC`, conditional `SYNC_CREDENTIAL_VERSION`, and both optional
+gateway routing values. It adds the account variable
+`CF_ROLLBACK_ACCOUNT_ID` plus the non-secret attestation
+`UNATTENDED_ROLLBACK_ENABLED=true`. It stores the dedicated environment secret
+`CLOUDFLARE_ROLLBACK_API_TOKEN`. Gateway URL, host, and browser routing
+variables are not required for version rollback.
 
 `MEMORY_GATEWAY_PUBLIC_URL` and the hostname-only
 `MEMORY_GATEWAY_EXPECTED_HOST` are required for the isolated production canary

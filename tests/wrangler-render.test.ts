@@ -343,11 +343,18 @@ describe("production workflow secret isolation", () => {
 
   it("exposes production secrets only to their minimum deployment steps", () => {
     const allowedDeploySteps = [
+      "Validate unattended rollback channel",
+      "Capture production Worker state",
+      "Verify captured production configuration",
       "Require fully migrated remote D1 databases",
       "Ensure semantic Vectorize metadata indexes",
       "Check projection rebuild deployment budget",
       "Capture pre-deployment Worker versions",
+      "Revalidate disabled GitHub sync reconciliation state",
       "Rebuild and verify projections",
+      "Revalidate orchestrator deployment state",
+      "Revalidate gateway deployment state",
+      "Revalidate GitHub sync deployment state",
       "Create ephemeral gateway secret file",
       "Create ephemeral GitHub sync secret file",
       "Deploy memory orchestrator",
@@ -514,7 +521,7 @@ describe("production workflow secret isolation", () => {
     expect(githubSyncDeploy).toContain("/workers/scripts/edgemneme-github-sync/schedules");
     expect(githubSyncDeploy).toContain('schedules.length !== 1');
     expect(disabledSync).toContain(
-      "if: vars.ENABLE_GITHUB_SYNC == 'false' && steps.capture_core_versions.outputs.github_sync_state == 'present'"
+      "if: vars.ENABLE_GITHUB_SYNC == 'false' && needs.capture_production_state.outputs.github_sync_previous_state == 'present'"
     );
     expect(disabledSync).toContain(
       'quiesce_tag="edgemneme-github-workflows-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-disabled"'
@@ -529,29 +536,33 @@ describe("production workflow secret isolation", () => {
     expect(disabledSync).toContain("wait_for_github_sync_drain");
     expect(disabledSync).not.toContain("secrets.GITHUB_CLASSIC_TOKEN");
     expect(deploy).toContain("  rollback_workers:\n");
-    expect(deploy).toContain("    needs: deploy\n");
+    expect(deploy).toContain("    needs: [capture_production_state, deploy]\n");
     expect(deploy).toContain(
-      "    if: ${{ always() && needs.deploy.result == 'failure' && needs.deploy.outputs.bootstrap_mode != '' }}\n"
+      "    if: ${{ always() && needs.capture_production_state.result == 'success' && (needs.deploy.result == 'failure' || needs.deploy.result == 'cancelled') && needs.capture_production_state.outputs.bootstrap_mode != '' }}\n"
     );
-    expect(deploy).toContain("    timeout-minutes: 120\n");
+    expect(deploy).toContain("    timeout-minutes: 240\n");
     expect(deploy).toContain(
-      "orchestrator_previous_version: ${{ steps.capture_core_versions.outputs.orchestrator_version }}"
-    );
-    expect(deploy).toContain(
-      "gateway_previous_version: ${{ steps.capture_core_versions.outputs.gateway_version }}"
+      "orchestrator_previous_version: ${{ steps.capture_state.outputs.orchestrator_version }}"
     );
     expect(deploy).toContain(
-      "github_sync_previous_version: ${{ steps.capture_core_versions.outputs.github_sync_version }}"
+      "gateway_previous_version: ${{ steps.capture_state.outputs.gateway_version }}"
     );
     expect(deploy).toContain(
-      "github_sync_previous_state: ${{ steps.capture_core_versions.outputs.github_sync_state }}"
+      "github_sync_previous_version: ${{ steps.capture_state.outputs.github_sync_version }}"
     );
     expect(deploy).toContain(
-      "github_sync_previous_secret_state: ${{ steps.capture_core_versions.outputs.github_sync_secret_state }}"
+      "github_sync_previous_state: ${{ steps.capture_state.outputs.github_sync_state }}"
     );
     expect(deploy).toContain(
-      "bootstrap_mode: ${{ steps.capture_core_versions.outputs.bootstrap_mode }}"
+      "github_sync_previous_secret_state: ${{ steps.capture_state.outputs.github_sync_secret_state }}"
     );
+    expect(deploy).toContain(
+      "bootstrap_mode: ${{ steps.capture_state.outputs.bootstrap_mode }}"
+    );
+    expect(deploy).toContain(
+      "EDGEMNEME_ORCHESTRATOR_PREVIOUS_VERSION: ${{ needs.capture_production_state.outputs.orchestrator_previous_version }}"
+    );
+    expect(deploy).not.toContain("needs.deploy.outputs");
     expect(rollback).not.toContain("wrangler versions list");
     expect(rollback).toContain('wrangler versions view "$version_id"');
     expect(rollback.match(/wrangler versions view/gu)).toHaveLength(3);
@@ -889,13 +900,28 @@ tagged_current_version package.json "\${VERSION_ID}" "\${EXPECTED_TAG}"
     expect(gatewaySecret).toBeGreaterThan(-1);
     expect(orchestratorDeploy).toBeLessThan(gatewaySecret);
     expect(gatewaySecret).toBeLessThan(gatewayDeploy);
-    expect(deploy.slice(gatewaySecret, gatewayDeploy)).not.toContain("\n      - name: ");
+    expect(
+      [...deploy.slice(gatewaySecret, gatewayDeploy).matchAll(/^      - name: (.+)$/gmu)]
+        .map((match) => match[1])
+    ).toEqual([
+      "Create ephemeral gateway secret file",
+      "Revalidate gateway deployment main",
+      "Revalidate gateway deployment state"
+    ]);
     expect(gatewayDeploy).toBeLessThan(gatewaySecretRemoval);
     expect(gatewaySecretRemoval).toBeLessThan(canary);
     expect(workflowStep(deploy, "Remove gateway secret file")).toContain("if: always()");
 
     expect(recovery).toBeLessThan(githubSecret);
     expect(githubSecret).toBeLessThan(githubDeploy);
+    expect(
+      [...deploy.slice(githubSecret, githubDeploy).matchAll(/^      - name: (.+)$/gmu)]
+        .map((match) => match[1])
+    ).toEqual([
+      "Create ephemeral GitHub sync secret file",
+      "Revalidate GitHub sync deployment main",
+      "Revalidate GitHub sync deployment state"
+    ]);
     expect(githubDeploy).toBeLessThan(githubSecretRemoval);
     expect(workflowStep(deploy, "Remove GitHub sync secret file")).toContain("always()");
   });

@@ -16,22 +16,133 @@ permissions:
 
 concurrency:
   group: production-cloudflare
+  queue: max
   cancel-in-progress: false
 
 jobs:
-  deploy:
+  capture_production_state:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 20
     environment: production
     outputs:
-      orchestrator_previous_version: ${{ steps.capture_core_versions.outputs.orchestrator_version }}
-      gateway_previous_version: ${{ steps.capture_core_versions.outputs.gateway_version }}
-      github_sync_previous_version: ${{ steps.capture_core_versions.outputs.github_sync_version }}
-      github_sync_previous_state: ${{ steps.capture_core_versions.outputs.github_sync_state }}
-      github_sync_previous_schedule_state: ${{ steps.capture_core_versions.outputs.github_sync_schedule_state }}
-      github_sync_previous_secret_state: ${{ steps.capture_core_versions.outputs.github_sync_secret_state }}
-      bootstrap_mode: ${{ steps.capture_core_versions.outputs.bootstrap_mode }}
+      orchestrator_previous_version: ${{ steps.capture_state.outputs.orchestrator_version }}
+      gateway_previous_version: ${{ steps.capture_state.outputs.gateway_version }}
+      github_sync_previous_version: ${{ steps.capture_state.outputs.github_sync_version }}
+      github_sync_previous_state: ${{ steps.capture_state.outputs.github_sync_state }}
+      github_sync_previous_schedule_state: ${{ steps.capture_state.outputs.github_sync_schedule_state }}
+      github_sync_previous_secret_state: ${{ steps.capture_state.outputs.github_sync_secret_state }}
+      bootstrap_mode: ${{ steps.capture_state.outputs.bootstrap_mode }}
+      configuration_fingerprint: ${{ steps.capture_state.outputs.configuration_fingerprint }}
+    steps:
+      - name: Check out deployment source for state capture
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Verify immutable state capture source
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "Production state capture is allowed only from refs/heads/main." >&2
+            exit 1
+          fi
+          if [[ "$(git rev-parse HEAD)" != "$GITHUB_SHA" ]]; then
+            echo "Checked-out state capture source does not match GITHUB_SHA." >&2
+            exit 1
+          fi
+
+      - name: Set up Node.js for state capture
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+
+      - name: Verify current main state capture head
+        timeout-minutes: 2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/verify-github-main-head.mjs
+
+      - name: Capture production Worker state
+        id: capture_state
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CF_D1_MEMORY_DATABASE_ID: ${{ vars.CF_D1_MEMORY_DATABASE_ID }}
+          CF_D1_SEARCH_DATABASE_ID: ${{ vars.CF_D1_SEARCH_DATABASE_ID }}
+          CF_RATE_LIMIT_NAMESPACE_EDGE: ${{ vars.CF_RATE_LIMIT_NAMESPACE_EDGE }}
+          CF_RATE_LIMIT_NAMESPACE_CLIENT: ${{ vars.CF_RATE_LIMIT_NAMESPACE_CLIENT }}
+          CF_RATE_LIMIT_NAMESPACE_PRINCIPAL: ${{ vars.CF_RATE_LIMIT_NAMESPACE_PRINCIPAL }}
+          EDGEMNEME_BOOTSTRAP_EXPECTED_EMPTY: ${{ inputs.bootstrap_expected_empty }}
+          ENABLE_GITHUB_SYNC: ${{ vars.ENABLE_GITHUB_SYNC }}
+          GITHUB_CREDENTIAL_VERSION: ${{ vars.SYNC_CREDENTIAL_VERSION }}
+          MEMORY_GATEWAY_ALLOWED_ORIGINS: ${{ vars.MEMORY_GATEWAY_ALLOWED_ORIGINS }}
+          MEMORY_GATEWAY_CUSTOM_DOMAIN: ${{ vars.MEMORY_GATEWAY_CUSTOM_DOMAIN }}
+        run: node scripts/capture-deployment-state.mjs
+
+  validate_rollback_channel:
+    if: github.ref == 'refs/heads/main'
+    needs: capture_production_state
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: production-rollback
+    steps:
+      - name: Check out rollback validation source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Set up Node.js for rollback validation
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+
+      - name: Validate unattended rollback channel
+        env:
+          CF_D1_MEMORY_DATABASE_ID: ${{ vars.CF_D1_MEMORY_DATABASE_ID }}
+          CF_D1_SEARCH_DATABASE_ID: ${{ vars.CF_D1_SEARCH_DATABASE_ID }}
+          CF_RATE_LIMIT_NAMESPACE_EDGE: ${{ vars.CF_RATE_LIMIT_NAMESPACE_EDGE }}
+          CF_RATE_LIMIT_NAMESPACE_CLIENT: ${{ vars.CF_RATE_LIMIT_NAMESPACE_CLIENT }}
+          CF_RATE_LIMIT_NAMESPACE_PRINCIPAL: ${{ vars.CF_RATE_LIMIT_NAMESPACE_PRINCIPAL }}
+          ENABLE_GITHUB_SYNC: ${{ vars.ENABLE_GITHUB_SYNC }}
+          GITHUB_CREDENTIAL_VERSION: ${{ vars.SYNC_CREDENTIAL_VERSION }}
+          MEMORY_GATEWAY_ALLOWED_ORIGINS: ${{ vars.MEMORY_GATEWAY_ALLOWED_ORIGINS }}
+          MEMORY_GATEWAY_CUSTOM_DOMAIN: ${{ vars.MEMORY_GATEWAY_CUSTOM_DOMAIN }}
+          UNATTENDED_ROLLBACK_ENABLED: ${{ vars.UNATTENDED_ROLLBACK_ENABLED }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_ROLLBACK_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CF_ROLLBACK_ACCOUNT_ID }}
+          EXPECTED_CONFIGURATION_FINGERPRINT: ${{ needs.capture_production_state.outputs.configuration_fingerprint }}
+          EXPECTED_ORCHESTRATOR_VERSION: ${{ needs.capture_production_state.outputs.orchestrator_previous_version }}
+          EXPECTED_GATEWAY_VERSION: ${{ needs.capture_production_state.outputs.gateway_previous_version }}
+          EXPECTED_GITHUB_SYNC_VERSION: ${{ needs.capture_production_state.outputs.github_sync_previous_version }}
+          EXPECTED_GITHUB_SYNC_STATE: ${{ needs.capture_production_state.outputs.github_sync_previous_state }}
+          EXPECTED_GITHUB_SYNC_SCHEDULE_STATE: ${{ needs.capture_production_state.outputs.github_sync_previous_schedule_state }}
+          EXPECTED_GITHUB_SYNC_SECRET_STATE: ${{ needs.capture_production_state.outputs.github_sync_previous_secret_state }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$UNATTENDED_ROLLBACK_ENABLED" != "true" ]]; then
+            echo "The rollback environment is not attested for unattended recovery." >&2
+            exit 1
+          fi
+          node scripts/capture-deployment-state.mjs verify-configuration
+          node scripts/capture-deployment-state.mjs verify \
+            orchestrator_version \
+            gateway_version \
+            github_sync_version \
+            github_sync_state \
+            github_sync_schedule_state \
+            github_sync_secret_state
+
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    needs: [capture_production_state, validate_rollback_channel]
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    environment: production
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -64,6 +175,12 @@ jobs:
           node-version: 24
           cache: pnpm
           cache-dependency-path: pnpm-lock.yaml
+
+      - name: Verify current main deployment head
+        timeout-minutes: 2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/verify-github-main-head.mjs
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile --ignore-scripts
@@ -125,6 +242,22 @@ jobs:
       - name: Validate source and public Wrangler templates
         run: pnpm check
 
+      - name: Verify captured production configuration
+        timeout-minutes: 2
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CF_D1_MEMORY_DATABASE_ID: ${{ vars.CF_D1_MEMORY_DATABASE_ID }}
+          CF_D1_SEARCH_DATABASE_ID: ${{ vars.CF_D1_SEARCH_DATABASE_ID }}
+          CF_RATE_LIMIT_NAMESPACE_EDGE: ${{ vars.CF_RATE_LIMIT_NAMESPACE_EDGE }}
+          CF_RATE_LIMIT_NAMESPACE_CLIENT: ${{ vars.CF_RATE_LIMIT_NAMESPACE_CLIENT }}
+          CF_RATE_LIMIT_NAMESPACE_PRINCIPAL: ${{ vars.CF_RATE_LIMIT_NAMESPACE_PRINCIPAL }}
+          ENABLE_GITHUB_SYNC: ${{ vars.ENABLE_GITHUB_SYNC }}
+          GITHUB_CREDENTIAL_VERSION: ${{ vars.SYNC_CREDENTIAL_VERSION }}
+          MEMORY_GATEWAY_ALLOWED_ORIGINS: ${{ vars.MEMORY_GATEWAY_ALLOWED_ORIGINS }}
+          MEMORY_GATEWAY_CUSTOM_DOMAIN: ${{ vars.MEMORY_GATEWAY_CUSTOM_DOMAIN }}
+          EXPECTED_CONFIGURATION_FINGERPRINT: ${{ needs.capture_production_state.outputs.configuration_fingerprint }}
+        run: node scripts/capture-deployment-state.mjs verify-configuration
+
       - name: Render private deployment configs
         env:
           CF_D1_MEMORY_DATABASE_ID: ${{ vars.CF_D1_MEMORY_DATABASE_ID }}
@@ -180,6 +313,12 @@ jobs:
           pnpm exec wrangler deploy --dry-run --config wrangler/.wrangler/memory-orchestrator.generated.jsonc
           pnpm exec wrangler deploy --dry-run --config wrangler/.wrangler/memory-gateway.generated.jsonc
           pnpm exec wrangler deploy --dry-run --config wrangler/.wrangler/github-sync.generated.jsonc
+
+      - name: Revalidate Vectorize metadata admission
+        timeout-minutes: 2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/verify-github-main-head.mjs
 
       - name: Ensure semantic Vectorize metadata indexes
         timeout-minutes: 5
@@ -483,7 +622,7 @@ jobs:
           github_sync_version=""
           github_sync_schedule_state="absent"
           github_sync_secret_state="absent"
-          if [[ "$ENABLE_GITHUB_SYNC" == "true" && "$github_sync_state" == "present" ]]; then
+          if [[ "$github_sync_state" == "present" ]]; then
             github_sync_version="$(worker_state edgemneme-github-sync)"
             github_sync_schedule_state="$(read_github_sync_schedule_state)"
             github_sync_secrets="$(
@@ -553,8 +692,74 @@ jobs:
             echo "bootstrap_mode=$bootstrap"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Reject deployment state drift
+        timeout-minutes: 2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          CAPTURED_ORCHESTRATOR_VERSION: ${{ needs.capture_production_state.outputs.orchestrator_previous_version }}
+          CAPTURED_GATEWAY_VERSION: ${{ needs.capture_production_state.outputs.gateway_previous_version }}
+          CAPTURED_GITHUB_SYNC_VERSION: ${{ needs.capture_production_state.outputs.github_sync_previous_version }}
+          CAPTURED_GITHUB_SYNC_STATE: ${{ needs.capture_production_state.outputs.github_sync_previous_state }}
+          CAPTURED_GITHUB_SYNC_SCHEDULE_STATE: ${{ needs.capture_production_state.outputs.github_sync_previous_schedule_state }}
+          CAPTURED_GITHUB_SYNC_SECRET_STATE: ${{ needs.capture_production_state.outputs.github_sync_previous_secret_state }}
+          CAPTURED_BOOTSTRAP_MODE: ${{ needs.capture_production_state.outputs.bootstrap_mode }}
+          OBSERVED_ORCHESTRATOR_VERSION: ${{ steps.capture_core_versions.outputs.orchestrator_version }}
+          OBSERVED_GATEWAY_VERSION: ${{ steps.capture_core_versions.outputs.gateway_version }}
+          OBSERVED_GITHUB_SYNC_VERSION: ${{ steps.capture_core_versions.outputs.github_sync_version }}
+          OBSERVED_GITHUB_SYNC_STATE: ${{ steps.capture_core_versions.outputs.github_sync_state }}
+          OBSERVED_GITHUB_SYNC_SCHEDULE_STATE: ${{ steps.capture_core_versions.outputs.github_sync_schedule_state }}
+          OBSERVED_GITHUB_SYNC_SECRET_STATE: ${{ steps.capture_core_versions.outputs.github_sync_secret_state }}
+          OBSERVED_BOOTSTRAP_MODE: ${{ steps.capture_core_versions.outputs.bootstrap_mode }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/verify-github-main-head.mjs
+          fields=(
+            ORCHESTRATOR_VERSION
+            GATEWAY_VERSION
+            GITHUB_SYNC_VERSION
+            GITHUB_SYNC_STATE
+            GITHUB_SYNC_SCHEDULE_STATE
+            GITHUB_SYNC_SECRET_STATE
+            BOOTSTRAP_MODE
+          )
+          for field in "${fields[@]}"; do
+            captured_name="CAPTURED_${field}"
+            observed_name="OBSERVED_${field}"
+            if [[ "${!captured_name}" != "${!observed_name}" ]]; then
+              echo "Production deployment state changed after the rollback snapshot; refusing deployment." >&2
+              exit 1
+            fi
+          done
+
+      - name: Revalidate disabled GitHub sync reconciliation main
+        if: vars.ENABLE_GITHUB_SYNC == 'false' && needs.capture_production_state.outputs.github_sync_previous_state == 'present'
+        timeout-minutes: 2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/verify-github-main-head.mjs
+
+      - name: Revalidate disabled GitHub sync reconciliation state
+        if: vars.ENABLE_GITHUB_SYNC == 'false' && needs.capture_production_state.outputs.github_sync_previous_state == 'present'
+        timeout-minutes: 2
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          EXPECTED_GITHUB_SYNC_VERSION: ${{ needs.capture_production_state.outputs.github_sync_previous_version }}
+          EXPECTED_GITHUB_SYNC_STATE: ${{ needs.capture_production_state.outputs.github_sync_previous_state }}
+          EXPECTED_GITHUB_SYNC_SCHEDULE_STATE: ${{ needs.capture_production_state.outputs.github_sync_previous_schedule_state }}
+          EXPECTED_GITHUB_SYNC_SECRET_STATE: ${{ needs.capture_production_state.outputs.github_sync_previous_secret_state }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/capture-deployment-state.mjs verify \
+            github_sync_version \
+            github_sync_state \
+            github_sync_schedule_state \
+            github_sync_secret_state
+
       - name: Reconcile disabled GitHub sync
-        if: vars.ENABLE_GITHUB_SYNC == 'false' && steps.capture_core_versions.outputs.github_sync_state == 'present'
+        if: vars.ENABLE_GITHUB_SYNC == 'false' && needs.capture_production_state.outputs.github_sync_previous_state == 'present'
         timeout-minutes: 35
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -1322,6 +1527,20 @@ jobs:
           NODE
           assert_disabled_version "$secretless_version" "$secretless_tag" "absent"
 
+      - name: Revalidate orchestrator deployment main
+        timeout-minutes: 2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/verify-github-main-head.mjs
+
+      - name: Revalidate orchestrator deployment state
+        timeout-minutes: 2
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          EXPECTED_ORCHESTRATOR_VERSION: ${{ needs.capture_production_state.outputs.orchestrator_previous_version }}
+        run: node scripts/capture-deployment-state.mjs verify orchestrator_version
+
       - name: Deploy memory orchestrator
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -1367,6 +1586,20 @@ jobs:
             { mode: 0o600 }
           );
           NODE
+
+      - name: Revalidate gateway deployment main
+        timeout-minutes: 2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/verify-github-main-head.mjs
+
+      - name: Revalidate gateway deployment state
+        timeout-minutes: 2
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          EXPECTED_GATEWAY_VERSION: ${{ needs.capture_production_state.outputs.gateway_previous_version }}
+        run: node scripts/capture-deployment-state.mjs verify gateway_version
 
       - name: Deploy memory gateway
         env:
@@ -1433,8 +1666,35 @@ jobs:
           );
           NODE
 
+      - name: Revalidate GitHub sync deployment main
+        if: vars.ENABLE_GITHUB_SYNC == 'true'
+        timeout-minutes: 2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/verify-github-main-head.mjs
+
+      - name: Revalidate GitHub sync deployment state
+        if: vars.ENABLE_GITHUB_SYNC == 'true'
+        timeout-minutes: 2
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          EXPECTED_GITHUB_SYNC_VERSION: ${{ needs.capture_production_state.outputs.github_sync_previous_version }}
+          EXPECTED_GITHUB_SYNC_STATE: ${{ needs.capture_production_state.outputs.github_sync_previous_state }}
+          EXPECTED_GITHUB_SYNC_SCHEDULE_STATE: ${{ needs.capture_production_state.outputs.github_sync_previous_schedule_state }}
+          EXPECTED_GITHUB_SYNC_SECRET_STATE: ${{ needs.capture_production_state.outputs.github_sync_previous_secret_state }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/capture-deployment-state.mjs verify \
+            github_sync_version \
+            github_sync_state \
+            github_sync_schedule_state \
+            github_sync_secret_state
+
       - name: Deploy GitHub sync
         if: vars.ENABLE_GITHUB_SYNC == 'true'
+        timeout-minutes: 35
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -1894,11 +2154,11 @@ jobs:
 
   rollback_workers:
     name: Roll back failed Worker deployment
-    needs: deploy
-    if: ${{ always() && needs.deploy.result == 'failure' && needs.deploy.outputs.bootstrap_mode != '' }}
+    needs: [capture_production_state, deploy]
+    if: ${{ always() && needs.capture_production_state.result == 'success' && (needs.deploy.result == 'failure' || needs.deploy.result == 'cancelled') && needs.capture_production_state.outputs.bootstrap_mode != '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    environment: production
+    environment: production-rollback
     steps:
       - name: Check out failed deployment source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1918,6 +2178,29 @@ jobs:
           node-version: 24
           cache: pnpm
           cache-dependency-path: pnpm-lock.yaml
+
+      - name: Verify rollback configuration parity
+        env:
+          CF_D1_MEMORY_DATABASE_ID: ${{ vars.CF_D1_MEMORY_DATABASE_ID }}
+          CF_D1_SEARCH_DATABASE_ID: ${{ vars.CF_D1_SEARCH_DATABASE_ID }}
+          CF_RATE_LIMIT_NAMESPACE_EDGE: ${{ vars.CF_RATE_LIMIT_NAMESPACE_EDGE }}
+          CF_RATE_LIMIT_NAMESPACE_CLIENT: ${{ vars.CF_RATE_LIMIT_NAMESPACE_CLIENT }}
+          CF_RATE_LIMIT_NAMESPACE_PRINCIPAL: ${{ vars.CF_RATE_LIMIT_NAMESPACE_PRINCIPAL }}
+          ENABLE_GITHUB_SYNC: ${{ vars.ENABLE_GITHUB_SYNC }}
+          GITHUB_CREDENTIAL_VERSION: ${{ vars.SYNC_CREDENTIAL_VERSION }}
+          MEMORY_GATEWAY_ALLOWED_ORIGINS: ${{ vars.MEMORY_GATEWAY_ALLOWED_ORIGINS }}
+          MEMORY_GATEWAY_CUSTOM_DOMAIN: ${{ vars.MEMORY_GATEWAY_CUSTOM_DOMAIN }}
+          UNATTENDED_ROLLBACK_ENABLED: ${{ vars.UNATTENDED_ROLLBACK_ENABLED }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CF_ROLLBACK_ACCOUNT_ID }}
+          EXPECTED_CONFIGURATION_FINGERPRINT: ${{ needs.capture_production_state.outputs.configuration_fingerprint }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$UNATTENDED_ROLLBACK_ENABLED" != "true" ]]; then
+            echo "The rollback environment is no longer attested for unattended recovery." >&2
+            exit 1
+          fi
+          node scripts/capture-deployment-state.mjs verify-configuration
 
       - name: Install rollback dependencies
         run: pnpm install --frozen-lockfile --ignore-scripts
@@ -1945,17 +2228,17 @@ jobs:
 
       - name: Rollback failed Worker deployment
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          EDGEMNEME_ORCHESTRATOR_PREVIOUS_VERSION: ${{ needs.deploy.outputs.orchestrator_previous_version }}
-          EDGEMNEME_GATEWAY_PREVIOUS_VERSION: ${{ needs.deploy.outputs.gateway_previous_version }}
-          EDGEMNEME_GITHUB_SYNC_PREVIOUS_VERSION: ${{ needs.deploy.outputs.github_sync_previous_version }}
-          EDGEMNEME_GITHUB_SYNC_PREVIOUS_STATE: ${{ needs.deploy.outputs.github_sync_previous_state }}
-          EDGEMNEME_GITHUB_SYNC_PREVIOUS_SCHEDULE_STATE: ${{ needs.deploy.outputs.github_sync_previous_schedule_state }}
-          EDGEMNEME_GITHUB_SYNC_PREVIOUS_SECRET_STATE: ${{ needs.deploy.outputs.github_sync_previous_secret_state }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_ROLLBACK_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CF_ROLLBACK_ACCOUNT_ID }}
+          EDGEMNEME_ORCHESTRATOR_PREVIOUS_VERSION: ${{ needs.capture_production_state.outputs.orchestrator_previous_version }}
+          EDGEMNEME_GATEWAY_PREVIOUS_VERSION: ${{ needs.capture_production_state.outputs.gateway_previous_version }}
+          EDGEMNEME_GITHUB_SYNC_PREVIOUS_VERSION: ${{ needs.capture_production_state.outputs.github_sync_previous_version }}
+          EDGEMNEME_GITHUB_SYNC_PREVIOUS_STATE: ${{ needs.capture_production_state.outputs.github_sync_previous_state }}
+          EDGEMNEME_GITHUB_SYNC_PREVIOUS_SCHEDULE_STATE: ${{ needs.capture_production_state.outputs.github_sync_previous_schedule_state }}
+          EDGEMNEME_GITHUB_SYNC_PREVIOUS_SECRET_STATE: ${{ needs.capture_production_state.outputs.github_sync_previous_secret_state }}
           EDGEMNEME_GITHUB_SYNC_ENABLED: ${{ vars.ENABLE_GITHUB_SYNC }}
           GITHUB_CREDENTIAL_VERSION: ${{ vars.SYNC_CREDENTIAL_VERSION }}
-          EDGEMNEME_BOOTSTRAP_MODE: ${{ needs.deploy.outputs.bootstrap_mode }}
+          EDGEMNEME_BOOTSTRAP_MODE: ${{ needs.capture_production_state.outputs.bootstrap_mode }}
         shell: bash
         run: |
           set -euo pipefail
