@@ -88,6 +88,7 @@ function zones(count: number): Zone[] {
 describe("gateway trigger pagination", () => {
   it("honors the documented single-page domain metadata semantics", () => {
     const result = [{ id: "domain-one" }];
+    const emptyResult: unknown[] = [];
     expect(
       validateSinglePageList(
         {
@@ -103,11 +104,41 @@ describe("gateway trigger pagination", () => {
         "Cloudflare custom domain list"
       )
     ).toBe(result);
+    expect(
+      validateSinglePageList(
+        {
+          result: emptyResult,
+          result_info: {
+            count: 0,
+            page: 1,
+            per_page: 0,
+            total_count: 0,
+            total_pages: 0
+          }
+        },
+        "Cloudflare custom domain list"
+      )
+    ).toBe(emptyResult);
     expect(() =>
       validateSinglePageList(
         {
           result,
           result_info: { count: 2 }
+        },
+        "Cloudflare custom domain list"
+      )
+    ).toThrow("single-page metadata is inconsistent");
+    expect(() =>
+      validateSinglePageList(
+        {
+          result: emptyResult,
+          result_info: {
+            count: 0,
+            page: 1,
+            per_page: 0,
+            total_count: 1,
+            total_pages: 1
+          }
         },
         "Cloudflare custom domain list"
       )

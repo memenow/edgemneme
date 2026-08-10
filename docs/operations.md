@@ -385,8 +385,9 @@ zone. Cloudflare documents both Worker domain and route lists as single-page
 endpoints with no page parameters. Their result arrays are therefore treated as
 the complete endpoint response, while optional domain `result_info` fields are
 validated according to their documented filtered-count and unfiltered-total
-semantics. Duplicate domain IDs or hostnames and duplicate route IDs or patterns
-within a zone fail closed.
+semantics. An empty single-page response may report `per_page: 0` only when the
+result and every supplied count or total are also zero. Duplicate domain IDs or
+hostnames and duplicate route IDs or patterns within a zone fail closed.
 
 A failed bootstrap has no prior core version to restore. When the newly created
 gateway is still exactly this run's tagged version, the rollback job first uses
