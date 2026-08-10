@@ -75,7 +75,11 @@ export function validatePaginatedListPage(
   };
 }
 
-export function validateSinglePageList(envelope, label) {
+export function validateSinglePageList(
+  envelope,
+  label,
+  { allowZeroPerPageWithUnfilteredTotals = false } = {}
+) {
   if (!Array.isArray(envelope?.result)) {
     throw new Error(`${label} result is invalid.`);
   }
@@ -115,9 +119,8 @@ export function validateSinglePageList(envelope, label) {
     (totalCount !== undefined && totalCount < envelope.result.length) ||
     (
       perPage === 0 &&
+      !allowZeroPerPageWithUnfilteredTotals &&
       (
-        envelope.result.length !== 0 ||
-        (count !== undefined && count !== 0) ||
         (totalCount !== undefined && totalCount !== 0) ||
         (totalPages !== undefined && totalPages !== 0)
       )
@@ -126,6 +129,7 @@ export function validateSinglePageList(envelope, label) {
       totalPages !== undefined &&
       totalCount !== undefined &&
       perPage !== undefined &&
+      perPage > 0 &&
       totalPages !== (totalCount === 0 ? 0 : Math.ceil(totalCount / perPage))
     )
   ) {

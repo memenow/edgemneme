@@ -101,7 +101,8 @@ describe("gateway trigger pagination", () => {
             total_pages: 100
           }
         },
-        "Cloudflare custom domain list"
+        "Cloudflare custom domain list",
+        { allowZeroPerPageWithUnfilteredTotals: true }
       )
     ).toBe(result);
     expect(
@@ -112,11 +113,12 @@ describe("gateway trigger pagination", () => {
             count: 0,
             page: 1,
             per_page: 0,
-            total_count: 0,
-            total_pages: 0
+            total_count: 2_000,
+            total_pages: 100
           }
         },
-        "Cloudflare custom domain list"
+        "Cloudflare custom domain list",
+        { allowZeroPerPageWithUnfilteredTotals: true }
       )
     ).toBe(emptyResult);
     expect(() =>
@@ -125,7 +127,24 @@ describe("gateway trigger pagination", () => {
           result,
           result_info: { count: 2 }
         },
-        "Cloudflare custom domain list"
+        "Cloudflare custom domain list",
+        { allowZeroPerPageWithUnfilteredTotals: true }
+      )
+    ).toThrow("single-page metadata is inconsistent");
+    expect(() =>
+      validateSinglePageList(
+        {
+          result,
+          result_info: {
+            count: 1,
+            page: 1,
+            per_page: 0,
+            total_count: 2_000,
+            total_pages: 100
+          }
+        },
+        "Cloudflare custom domain list",
+        { allowZeroPerPageWithUnfilteredTotals: true }
       )
     ).toThrow("single-page metadata is inconsistent");
     expect(() =>
@@ -140,7 +159,7 @@ describe("gateway trigger pagination", () => {
             total_pages: 1
           }
         },
-        "Cloudflare custom domain list"
+        "Cloudflare Worker route list"
       )
     ).toThrow("single-page metadata is inconsistent");
   });

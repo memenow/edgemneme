@@ -134,8 +134,8 @@ function cloudflareFetch(options: {
           count: 0,
           page: 1,
           per_page: 0,
-          total_count: 0,
-          total_pages: 0
+          total_count: 2_000,
+          total_pages: 100
         }
       });
     }

@@ -386,8 +386,12 @@ endpoints with no page parameters. Their result arrays are therefore treated as
 the complete endpoint response, while optional domain `result_info` fields are
 validated according to their documented filtered-count and unfiltered-total
 semantics. An empty single-page response may report `per_page: 0` only when the
-result and every supplied count or total are also zero. Duplicate domain IDs or
-hostnames and duplicate route IDs or patterns within a zone fail closed.
+result and supplied filtered `count` are also zero. Supplied totals remain
+non-negative integers but may be nonzero because they describe the unfiltered
+account-wide inventory. This exception applies only to the filtered domain
+queries; route metadata retains the strict zero-total requirement for an empty
+zero-page-size response. Duplicate domain IDs or hostnames and duplicate route
+IDs or patterns within a zone fail closed.
 
 A failed bootstrap has no prior core version to restore. When the newly created
 gateway is still exactly this run's tagged version, the rollback job first uses
