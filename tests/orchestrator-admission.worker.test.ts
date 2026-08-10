@@ -1109,6 +1109,36 @@ describe("ordinary Workflow outbox reconciliation", () => {
     });
   });
 
+  it("carries the exact GitHub manifest identity into a recovered Workflow", async () => {
+    const row = ordinaryReconciliationRow("github.sync.requested", null);
+    const database = new FakeDatabase({
+      admissions: [1],
+      ordinaryReconciliationRows: [row]
+    });
+    const workflowCreate = vi.fn();
+    const workflowGet = vi.fn(() => ({
+      status: vi.fn(async () => ({ status: "running" }))
+    }));
+
+    await orchestrator.scheduled(
+      {} as ScheduledController,
+      environment(database, workflowCreate, vi.fn(), workflowGet) as never
+    );
+
+    expect(workflowCreate).toHaveBeenCalledWith({
+      id: row.event_id,
+      params: {
+        eventId: row.event_id,
+        projectId: PROJECT_ID,
+        type: "github.sync.requested",
+        subjectId: "repository-1",
+        observedSha: "b".repeat(40),
+        ref: "refs/heads/main",
+        manifestId: "a".repeat(64)
+      }
+    });
+  });
+
   it.each(["errored", "terminated"])(
     "starts one deterministic repair after a D1 failure and control-plane %s status",
     async (terminalStatus) => {
@@ -1414,11 +1444,16 @@ function reconciliationRow(
 }
 
 function ordinaryReconciliationRow(
-  eventType: "candidate.submitted" | "memory.changed",
+  eventType: "candidate.submitted" | "memory.changed" | "github.sync.requested",
   latestWorkflowStatus: string | null,
   overrides: Record<string, unknown> = {}
 ) {
-  const eventId = eventType === "memory.changed" ? "memory-event" : "candidate-event";
+  const eventId =
+    eventType === "memory.changed"
+      ? "memory-event"
+      : eventType === "github.sync.requested"
+        ? "github-event"
+        : "candidate-event";
   const payload =
     eventType === "memory.changed"
       ? {
@@ -1428,7 +1463,19 @@ function ordinaryReconciliationRow(
           memoryId: "memory-1",
           projectVersion: 1
         }
-      : {
+      : eventType === "github.sync.requested"
+        ? {
+            type: eventType,
+            eventId,
+            projectId: PROJECT_ID,
+            repositoryId: "repository-1",
+            externalRepositoryId: 42,
+            ref: "refs/heads/main",
+            observedSha: "b".repeat(40),
+            manifestId: "a".repeat(64),
+            idempotencyKey: "github-idempotency"
+          }
+        : {
           type: eventType,
           eventId,
           projectId: PROJECT_ID,

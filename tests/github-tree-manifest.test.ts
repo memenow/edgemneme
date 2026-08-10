@@ -10,6 +10,7 @@ import {
 } from "../src/github/candidate-persistence";
 import type { PersistableGitHubCandidate } from "../src/github/candidate-persistence";
 import type { PendingGitHubSyncActivationFence } from "../src/github/sync-activation-fence";
+import { markGitHubSyncPendingReview } from "../src/github/sync-review-cursor";
 import {
   activateGitHubTreeManifest,
   beginGitHubTreeManifest,
@@ -196,6 +197,154 @@ describe("GitHub tree manifest reconciliation", () => {
     ).rejects.toMatchObject({ code: "GITHUB_RECONCILIATION_REQUIRED" });
   });
 
+  it("rejects deltas that do not exactly match manifest entry provenance", async () => {
+    const fixture = createFixture();
+    const changedPath = "docs/changed.md";
+    const deletedPath = "docs/deleted.md";
+    const withdrawnPath = "docs/withdrawn.md";
+    const addedPath = "docs/added-sensitive.md";
+    const changedPathDigest = await sha256(changedPath);
+    const deletedPathDigest = await sha256(deletedPath);
+    const withdrawnPathDigest = await sha256(withdrawnPath);
+    const addedPathDigest = await sha256(addedPath);
+    const oldEntries = await entries([
+      [changedPath, SHA.changedOld, "text"],
+      [deletedPath, SHA.deleted, "text"],
+      [withdrawnPath, SHA.keep, "text"]
+    ]);
+    const oldManifest = await descriptor("2026-07-26T00:00:00.000Z");
+    await storeAndActivate(fixture.d1, oldManifest, oldEntries, null);
+    const newEntries = await entries([
+      [changedPath, SHA.changedNew, "text"],
+      [withdrawnPath, SHA.sensitive, "sensitive_tombstone"],
+      [addedPath, SHA.added, "sensitive_tombstone"]
+    ]);
+    const newManifest = await descriptor("2026-07-27T00:00:00.000Z");
+    await beginGitHubTreeManifest(fixture.d1, newManifest);
+    await persistGitHubTreeManifestEntries(fixture.d1, newManifest, newEntries);
+    await completeGitHubTreeManifest(fixture.d1, newManifest, newEntries, NOW);
+    const insertInvalidDelta = (input: {
+      id: string;
+      pathDigest: string;
+      safePath: string;
+      changeKind: "added" | "changed" | "deleted" | "withdrawn";
+      oldBlobSha: string | null;
+      newBlobSha: string | null;
+      oldDisposition: string | null;
+      newDisposition: string | null;
+    }): void => {
+      fixture.database
+        .prepare(
+          `INSERT INTO github_tree_manifest_deltas
+           (delta_id, project_id, repository_id, ref, old_manifest_id,
+            new_manifest_id, path_digest, safe_path, change_kind,
+            old_blob_sha, new_blob_sha, old_disposition, new_disposition,
+            affected_memory_ids_json, idempotency_key, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, ?)`
+        )
+        .run(
+          input.id,
+          PROJECT_ID,
+          REPOSITORY_ID,
+          REF,
+          oldManifest.manifestId,
+          newManifest.manifestId,
+          input.pathDigest,
+          input.safePath,
+          input.changeKind,
+          input.oldBlobSha,
+          input.newBlobSha,
+          input.oldDisposition,
+          input.newDisposition,
+          `${input.id}-idempotency`,
+          NOW
+        );
+    };
+
+    expect(() =>
+      insertInvalidDelta({
+        id: "invalid-added-provenance",
+        pathDigest: addedPathDigest,
+        safePath: "wrong/added.md",
+        changeKind: "added",
+        oldBlobSha: null,
+        newBlobSha: SHA.added,
+        oldDisposition: null,
+        newDisposition: "sensitive_tombstone"
+      })
+    ).toThrow(/delta provenance is invalid/iu);
+    expect(() =>
+      insertInvalidDelta({
+        id: "invalid-changed-provenance",
+        pathDigest: changedPathDigest,
+        safePath: "wrong/changed.md",
+        changeKind: "changed",
+        oldBlobSha: SHA.changedOld,
+        newBlobSha: SHA.changedNew,
+        oldDisposition: "text",
+        newDisposition: "text"
+      })
+    ).toThrow(/delta provenance is invalid/iu);
+    expect(() =>
+      insertInvalidDelta({
+        id: "invalid-deleted-provenance",
+        pathDigest: deletedPathDigest,
+        safePath: "wrong/deleted.md",
+        changeKind: "deleted",
+        oldBlobSha: SHA.deleted,
+        newBlobSha: null,
+        oldDisposition: "text",
+        newDisposition: null
+      })
+    ).toThrow(/delta provenance is invalid/iu);
+    expect(() =>
+      insertInvalidDelta({
+        id: "invalid-withdrawn-provenance",
+        pathDigest: withdrawnPathDigest,
+        safePath: "leaked/withdrawn.md",
+        changeKind: "withdrawn",
+        oldBlobSha: SHA.keep,
+        newBlobSha: SHA.sensitive,
+        oldDisposition: "text",
+        newDisposition: "sensitive_tombstone"
+      })
+    ).toThrow(/delta provenance is invalid/iu);
+  });
+
+  it("preserves a clear identity when the same source becomes a tombstone", async () => {
+    const fixture = createFixture();
+    const path = "docs/text-to-tombstone.md";
+    const { clear, tombstone } = await buildPolicyCandidatePair(path);
+    const clearManifest = await descriptor("2026-07-28T00:00:00.000Z");
+    await storeAndActivate(
+      fixture.d1,
+      clearManifest,
+      await entries([[path, SHA.keep, "text"]]),
+      null,
+      [clear]
+    );
+    const clearEvidenceBefore = readEvidence(fixture.database, clear.evidenceId);
+
+    const tombstoneManifest = await descriptor("2026-07-29T00:00:00.000Z");
+    await storeAndActivate(
+      fixture.d1,
+      tombstoneManifest,
+      await entries([[path, SHA.keep, "sensitive_tombstone"]]),
+      await readActiveGitHubTreeHead(fixture.d1, PROJECT_ID, REPOSITORY_ID, REF),
+      [tombstone]
+    );
+
+    expect(tombstone.evidenceId).not.toBe(clear.evidenceId);
+    expect(readEvidence(fixture.database, clear.evidenceId)).toEqual(
+      clearEvidenceBefore
+    );
+    expect(readEvidence(fixture.database, tombstone.evidenceId)).toMatchObject({
+      evidence_id: tombstone.evidenceId,
+      repository_path: null,
+      sensitivity_status: "tombstone"
+    });
+  });
+
   it("replays the same ref and SHA across manifests without resetting durable artifacts", async () => {
     const fixture = createFixture();
     const firstManifest = await descriptor("2026-07-28T00:00:00.000Z");
@@ -278,13 +427,14 @@ describe("GitHub tree manifest reconciliation", () => {
       [candidate]
     );
 
-    expect(
-      readCandidateReplayState(
-        fixture.database,
-        observationId,
-        candidate.evidenceId
-      )
-    ).toEqual(durableBefore);
+    const durableAfter = readCandidateReplayState(
+      fixture.database,
+      observationId,
+      candidate.evidenceId
+    );
+    expect(durableAfter.observation).toEqual(durableBefore.observation);
+    expect(durableAfter.evidence).toEqual(durableBefore.evidence);
+    expect(durableAfter.link).toEqual(durableBefore.link);
     expect(durableBefore.observation).toMatchObject({
       candidate_version: 2,
       status: "request_changes",
@@ -305,6 +455,46 @@ describe("GitHub tree manifest reconciliation", () => {
           attempt: 3
         })
       ])
+    );
+    const secondSyncEvent = await buildStableSyncEvent({
+      projectId: PROJECT_ID,
+      repositoryId: REPOSITORY_ID,
+      externalRepositoryId: 42,
+      ref: REF,
+      observedSha: SHA.commit,
+      manifestId: secondManifest.manifestId
+    });
+    const secondSyncPayload = JSON.stringify(secondSyncEvent);
+    expect(
+      durableAfter.outbox.filter(
+        (event) => event.event_id !== secondSyncEvent.eventId
+      )
+    ).toEqual(durableBefore.outbox);
+    const secondSyncRows = durableAfter.outbox.filter(
+      (event) => event.event_id === secondSyncEvent.eventId
+    );
+    expect(secondSyncRows).toHaveLength(1);
+    const secondSyncRow = secondSyncRows[0];
+    if (secondSyncRow === undefined) {
+      throw new Error("The second manifest must enqueue its own sync event.");
+    }
+    const { created_at: secondSyncCreatedAt, ...secondSyncDurableState } =
+      secondSyncRow;
+    expect(secondSyncDurableState).toEqual({
+      event_id: secondSyncEvent.eventId,
+      project_id: PROJECT_ID,
+      project_version: 7,
+      event_type: "github.sync.requested",
+      payload_digest: await sha256(secondSyncPayload),
+      payload_json: secondSyncPayload,
+      dispatched_at: null,
+      failed_at: null,
+      next_attempt_at: null,
+      last_error_code: null,
+      attempt: 0
+    });
+    expect(new Date(String(secondSyncCreatedAt)).toISOString()).toBe(
+      secondSyncCreatedAt
     );
     expect(
       await readActiveGitHubTreeHead(
@@ -335,6 +525,226 @@ describe("GitHub tree manifest reconciliation", () => {
       cursor_version: 3,
       receipts: 2
     });
+  });
+
+  it("keeps clear and tombstone evidence immutable across a same-SHA policy cycle", async () => {
+    const fixture = createFixture();
+    const path = "docs/policy-source.md";
+    const clearCandidate = await buildGitHubBlobCandidate({
+      projectId: PROJECT_ID,
+      repositoryId: REPOSITORY_ID,
+      externalRepositoryId: 42,
+      defaultBranch: "main",
+      ref: REF,
+      observedSha: SHA.commit,
+      path,
+      blobSha: SHA.keep,
+      content: "Durable project context."
+    });
+    const tombstoneCandidate = await buildGitHubBlobCandidate({
+      projectId: PROJECT_ID,
+      repositoryId: REPOSITORY_ID,
+      externalRepositoryId: 42,
+      defaultBranch: "main",
+      ref: REF,
+      observedSha: SHA.commit,
+      path,
+      blobSha: SHA.keep,
+      content: "api_key = 'synthetic-sensitive-value'"
+    });
+    expect(clearCandidate.sensitivityStatus).toBe("clear");
+    expect(tombstoneCandidate.sensitivityStatus).toBe("tombstone");
+    expect(tombstoneCandidate.evidenceId).not.toBe(clearCandidate.evidenceId);
+
+    const clearManifest = await descriptor("2026-07-28T00:00:00.000Z");
+    await storeAndActivate(
+      fixture.d1,
+      clearManifest,
+      await entries([[path, SHA.keep, "text"]]),
+      null,
+      [clearCandidate]
+    );
+    const clearEvidenceBefore = fixture.database
+      .prepare(`SELECT * FROM evidence WHERE project_id = ? AND evidence_id = ?`)
+      .get(PROJECT_ID, clearCandidate.evidenceId);
+
+    const sensitiveManifest = await descriptor("2026-07-29T00:00:00.000Z");
+    await storeAndActivate(
+      fixture.d1,
+      sensitiveManifest,
+      await entries([[path, SHA.keep, "sensitive_tombstone"]]),
+      await readActiveGitHubTreeHead(fixture.d1, PROJECT_ID, REPOSITORY_ID, REF),
+      [tombstoneCandidate]
+    );
+    const tombstoneEvidenceBefore = fixture.database
+      .prepare(`SELECT * FROM evidence WHERE project_id = ? AND evidence_id = ?`)
+      .get(PROJECT_ID, tombstoneCandidate.evidenceId);
+
+    const restoredCandidate = await buildGitHubBlobCandidate({
+      projectId: PROJECT_ID,
+      repositoryId: REPOSITORY_ID,
+      externalRepositoryId: 42,
+      defaultBranch: "main",
+      ref: REF,
+      observedSha: SHA.commit,
+      path,
+      blobSha: SHA.keep,
+      content: "Durable project context."
+    });
+    expect(restoredCandidate.evidenceId).toBe(clearCandidate.evidenceId);
+    const restoredManifest = await descriptor("2026-07-30T00:00:00.000Z");
+    await storeAndActivate(
+      fixture.d1,
+      restoredManifest,
+      await entries([[path, SHA.keep, "text"]]),
+      await readActiveGitHubTreeHead(fixture.d1, PROJECT_ID, REPOSITORY_ID, REF),
+      [restoredCandidate]
+    );
+
+    expect(
+      await readActiveGitHubTreeHead(fixture.d1, PROJECT_ID, REPOSITORY_ID, REF)
+    ).toEqual({
+      manifestId: restoredManifest.manifestId,
+      observedSha: SHA.commit,
+      headVersion: 3
+    });
+    expect(
+      fixture.database
+        .prepare(`SELECT * FROM evidence WHERE project_id = ? AND evidence_id = ?`)
+        .get(PROJECT_ID, clearCandidate.evidenceId)
+    ).toEqual(clearEvidenceBefore);
+    expect(
+      fixture.database
+        .prepare(`SELECT * FROM evidence WHERE project_id = ? AND evidence_id = ?`)
+        .get(PROJECT_ID, tombstoneCandidate.evidenceId)
+    ).toEqual(tombstoneEvidenceBefore);
+    expect(
+      fixture.database
+        .prepare(
+          `SELECT sensitivity_status, COUNT(*) AS count
+           FROM evidence
+           WHERE project_id = ? AND source_type = 'github_blob'
+           GROUP BY sensitivity_status ORDER BY sensitivity_status`
+        )
+        .all(PROJECT_ID)
+    ).toEqual([
+      { sensitivity_status: "clear", count: 1 },
+      { sensitivity_status: "tombstone", count: 1 }
+    ]);
+    const syncPayloadRows = fixture.database
+      .prepare(
+        `SELECT payload_json FROM outbox_events
+         WHERE project_id = ? AND event_type = 'github.sync.requested'
+         ORDER BY created_at, event_id`
+      )
+      .all(PROJECT_ID) as Array<{ payload_json: string }>;
+    const syncPayloads = syncPayloadRows.map(
+      (row) => JSON.parse(row.payload_json) as { manifestId: string }
+    );
+    expect(new Set(syncPayloads.map((payload) => payload.manifestId))).toEqual(
+      new Set([
+        clearManifest.manifestId,
+        sensitiveManifest.manifestId,
+        restoredManifest.manifestId
+      ])
+    );
+  });
+
+  it("keeps delayed same-SHA review events from resuming a paused cursor", async () => {
+    const fixture = createFixture();
+    const firstManifest = await descriptor("2026-07-28T00:00:00.000Z");
+    await storeAndActivate(fixture.d1, firstManifest, [], null);
+    const secondManifest = await descriptor("2026-07-29T00:00:00.000Z");
+    await storeAndActivate(
+      fixture.d1,
+      secondManifest,
+      [],
+      await readActiveGitHubTreeHead(fixture.d1, PROJECT_ID, REPOSITORY_ID, REF)
+    );
+    const cursorBeforeStaleEvent = fixture.database
+      .prepare(
+        `SELECT status, updated_at, cursor_version FROM sync_cursors
+         WHERE project_id = ? AND repository_id = ? AND ref = ?`
+      )
+      .get(PROJECT_ID, REPOSITORY_ID, REF);
+
+    await markGitHubSyncPendingReview(fixture.d1, {
+      projectId: PROJECT_ID,
+      repositoryId: REPOSITORY_ID,
+      ref: REF,
+      observedSha: SHA.commit,
+      manifestId: firstManifest.manifestId,
+      updatedAt: "2026-07-29T02:00:00.000Z"
+    });
+    expect(
+      fixture.database
+        .prepare(
+          `SELECT status, updated_at, cursor_version FROM sync_cursors
+           WHERE project_id = ? AND repository_id = ? AND ref = ?`
+        )
+        .get(PROJECT_ID, REPOSITORY_ID, REF)
+    ).toEqual(cursorBeforeStaleEvent);
+
+    fixture.database
+      .prepare(
+        `UPDATE sync_cursors SET status = 'paused', updated_at = ?
+         WHERE project_id = ? AND repository_id = ? AND ref = ?`
+      )
+      .run("2026-07-29T02:30:00.000Z", PROJECT_ID, REPOSITORY_ID, REF);
+    const pausedCursor = fixture.database
+      .prepare(
+        `SELECT status, updated_at, cursor_version FROM sync_cursors
+         WHERE project_id = ? AND repository_id = ? AND ref = ?`
+      )
+      .get(PROJECT_ID, REPOSITORY_ID, REF);
+
+    await markGitHubSyncPendingReview(fixture.d1, {
+      projectId: PROJECT_ID,
+      repositoryId: REPOSITORY_ID,
+      ref: REF,
+      observedSha: SHA.commit,
+      manifestId: secondManifest.manifestId,
+      updatedAt: "2026-07-29T03:00:00.000Z"
+    });
+    expect(
+      fixture.database
+        .prepare(
+          `SELECT status, updated_at, cursor_version FROM sync_cursors
+           WHERE project_id = ? AND repository_id = ? AND ref = ?`
+        )
+        .get(PROJECT_ID, REPOSITORY_ID, REF)
+    ).toEqual(pausedCursor);
+
+    fixture.database
+      .prepare(
+        `UPDATE sync_cursors SET status = 'complete', updated_at = ?
+         WHERE project_id = ? AND repository_id = ? AND ref = ?`
+      )
+      .run("2026-07-29T03:30:00.000Z", PROJECT_ID, REPOSITORY_ID, REF);
+    const driftedCursor = fixture.database
+      .prepare(
+        `SELECT status, updated_at, cursor_version FROM sync_cursors
+         WHERE project_id = ? AND repository_id = ? AND ref = ?`
+      )
+      .get(PROJECT_ID, REPOSITORY_ID, REF);
+    await expect(
+      markGitHubSyncPendingReview(fixture.d1, {
+        projectId: PROJECT_ID,
+        repositoryId: REPOSITORY_ID,
+        ref: REF,
+        observedSha: SHA.commit,
+        manifestId: secondManifest.manifestId,
+        updatedAt: "2026-07-29T04:00:00.000Z"
+      })
+    ).rejects.toMatchObject({ code: "GITHUB_RECONCILIATION_REQUIRED" });
+    expect(
+      fixture.database
+        .prepare(
+          `SELECT status, updated_at, cursor_version FROM sync_cursors
+           WHERE project_id = ? AND repository_id = ? AND ref = ?`
+        )
+        .get(PROJECT_ID, REPOSITORY_ID, REF)
+    ).toEqual(driftedCursor);
   });
 
   it("keeps pending candidate statements inert until the activation witness exists", async () => {
@@ -613,7 +1023,8 @@ describe("GitHub tree manifest reconciliation", () => {
           repositoryId: REPOSITORY_ID,
           externalRepositoryId: 42,
           ref: REF,
-          observedSha: SHA.commit
+          observedSha: SHA.commit,
+          manifestId: manifest.manifestId
         });
         fixture.database
           .prepare(
@@ -688,9 +1099,10 @@ describe("GitHub tree manifest reconciliation", () => {
         `INSERT INTO github_tree_manifest_deltas
          (delta_id, project_id, repository_id, ref, old_manifest_id,
           new_manifest_id, path_digest, safe_path, change_kind, old_blob_sha,
-          new_blob_sha, affected_memory_ids_json, idempotency_key, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'docs/conflicting.md', 'added', NULL,
-                 ?, '[]', 'conflicting-idempotency-key', ?)`
+          new_blob_sha, old_disposition, new_disposition,
+          affected_memory_ids_json, idempotency_key, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'docs/new.md', 'added', NULL,
+                 ?, NULL, 'text', '[]', 'conflicting-idempotency-key', ?)`
       )
       .run(
         deltaId,
@@ -1213,6 +1625,325 @@ describe("GitHub tree manifest reconciliation", () => {
           PROJECT_ID
         )
     ).toEqual({ deltas: 4, observations: 2, reviews: 2 });
+  });
+
+  it.each([
+    ["sensitive", "sensitive_tombstone"],
+    ["binary", "binary_excluded"],
+    ["generated", "generated_excluded"]
+  ] as const)(
+    "withdraws an affected text source reclassified as %s without leaking its body or path",
+    async (_label, newDisposition) => {
+      const fixture = createFixture();
+      const sourcePath = `private/${newDisposition}-source.fixture`;
+      const oldEntries = await entries([[sourcePath, SHA.keep, "text"]]);
+      const oldEntry = oldEntries[0] as GitHubTreeManifestEntry;
+      const oldManifest = await descriptor("2026-07-27T00:00:00.000Z");
+      await storeAndActivate(fixture.d1, oldManifest, oldEntries, null);
+      seedAffectedMemory(fixture.database, oldEntry);
+      const oldEvidenceBefore = fixture.database
+        .prepare(`SELECT * FROM evidence WHERE evidence_id = 'evidence-a'`)
+        .get();
+
+      const newEntries = await entries([
+        [sourcePath, SHA.keep, newDisposition]
+      ]);
+      const newManifest = await descriptor("2026-07-28T00:00:00.000Z");
+      const expectedHead = await readActiveGitHubTreeHead(
+        fixture.d1,
+        PROJECT_ID,
+        REPOSITORY_ID,
+        REF
+      );
+      const committed = await storeAndActivate(
+        fixture.d1,
+        newManifest,
+        newEntries,
+        expectedHead
+      );
+
+      const delta = fixture.database
+        .prepare(
+          `SELECT change_kind, safe_path, old_blob_sha, new_blob_sha,
+                  old_disposition, new_disposition, affected_memory_ids_json
+           FROM github_tree_manifest_deltas
+           WHERE project_id = ? AND new_manifest_id = ?`
+        )
+        .get(PROJECT_ID, newManifest.manifestId) as {
+        change_kind: string;
+        safe_path: string | null;
+        old_blob_sha: string;
+        new_blob_sha: string;
+        old_disposition: string;
+        new_disposition: string;
+        affected_memory_ids_json: string;
+      };
+      expect(delta).toMatchObject({
+        change_kind: "withdrawn",
+        safe_path: null,
+        old_blob_sha: SHA.keep,
+        new_blob_sha: SHA.keep,
+        old_disposition: "text",
+        new_disposition: newDisposition
+      });
+      expect(JSON.parse(delta.affected_memory_ids_json)).toEqual([
+        "memory-affected"
+      ]);
+
+      const withdrawalEvidence = fixture.database
+        .prepare(
+          `SELECT evidence_id, source_type, locator, repository_path,
+                  sensitivity_status, commit_sha, excerpt_hash
+           FROM evidence
+           WHERE project_id = ? AND source_type = 'repository_source_withdrawn'`
+        )
+        .get(PROJECT_ID) as Record<string, unknown>;
+      expect(withdrawalEvidence).toMatchObject({
+        evidence_id:
+          `github-source-withdrawn-evidence:${oldManifest.manifestId}:` +
+          `${newManifest.manifestId}:${oldEntry.pathDigest}`,
+        source_type: "repository_source_withdrawn",
+        repository_path: null,
+        sensitivity_status: "tombstone",
+        commit_sha: SHA.commit,
+        excerpt_hash: oldEntry.pathDigest
+      });
+      expect(String(withdrawalEvidence.locator)).toContain(
+        `/manifest-sha256/${newManifest.manifestId}/source-withdrawn/` +
+          `path-sha256/${oldEntry.pathDigest}`
+      );
+
+      const observation = fixture.database
+        .prepare(
+          `SELECT observation_id, content, content_sha256, status, analysis_json,
+                  evidence_json
+           FROM observations
+           WHERE project_id = ?
+             AND json_extract(analysis_json, '$.schema') =
+               'github.repository_source_withdrawn'`
+        )
+        .get(PROJECT_ID) as {
+        observation_id: string;
+        content: string | null;
+        content_sha256: string | null;
+        status: string;
+        analysis_json: string;
+        evidence_json: string;
+      };
+      expect(observation).toMatchObject({
+        content: null,
+        content_sha256: null,
+        status: "pending_review"
+      });
+      const analysis = JSON.parse(observation.analysis_json) as Record<
+        string,
+        unknown
+      >;
+      expect(analysis).toMatchObject({
+        schema: "github.repository_source_withdrawn",
+        repository_id: REPOSITORY_ID,
+        repository_ref: REF,
+        old_manifest_id: oldManifest.manifestId,
+        new_manifest_id: newManifest.manifestId,
+        path_digest: oldEntry.pathDigest,
+        old_blob_sha: SHA.keep,
+        new_blob_sha: SHA.keep,
+        old_disposition: "text",
+        new_disposition: newDisposition,
+        affected_memory_ids: ["memory-affected"],
+        suggested_operation: "invalidate"
+      });
+      expect(analysis).not.toHaveProperty("safe_path");
+      expect(analysis).not.toHaveProperty("content");
+      expect(
+        fixture.database
+          .prepare(
+            `SELECT status FROM memories
+             WHERE project_id = ? AND memory_id = 'memory-affected'`
+          )
+          .get(PROJECT_ID)
+      ).toEqual({ status: "active" });
+      expect(
+        fixture.database
+          .prepare(
+            `SELECT status, required_role FROM review_requests
+             WHERE project_id = ? AND candidate_id = ?`
+          )
+          .get(PROJECT_ID, observation.observation_id)
+      ).toEqual({ status: "pending", required_role: "maintainer" });
+
+      const withdrawalArtifacts = JSON.stringify({
+        delta,
+        withdrawalEvidence,
+        observation,
+        review: fixture.database
+          .prepare(
+            `SELECT * FROM review_requests
+             WHERE project_id = ? AND candidate_id = ?`
+          )
+          .get(PROJECT_ID, observation.observation_id)
+      });
+      expect(withdrawalArtifacts).not.toContain(sourcePath);
+      expect(withdrawalArtifacts).not.toContain("The deleted path exists.");
+      expect(
+        fixture.database
+          .prepare(`SELECT * FROM evidence WHERE evidence_id = 'evidence-a'`)
+          .get()
+      ).toEqual(oldEvidenceBefore);
+
+      const syncPayloadRows = fixture.database
+        .prepare(
+          `SELECT payload_json FROM outbox_events
+           WHERE project_id = ? AND event_type = 'github.sync.requested'
+           ORDER BY event_id`
+        )
+        .all(PROJECT_ID) as Array<{ payload_json: string }>;
+      const syncPayloads = syncPayloadRows.map(
+        (row) => JSON.parse(row.payload_json) as { manifestId: string }
+      );
+      expect(syncPayloads).toHaveLength(2);
+      expect(new Set(syncPayloads.map((payload) => payload.manifestId))).toEqual(
+        new Set([oldManifest.manifestId, newManifest.manifestId])
+      );
+
+      const countsBeforeReplay = fixture.database
+        .prepare(
+          `SELECT
+             (SELECT COUNT(*) FROM github_tree_manifest_deltas) AS deltas,
+             (SELECT COUNT(*) FROM evidence
+              WHERE source_type = 'repository_source_withdrawn') AS evidence,
+             (SELECT COUNT(*) FROM observations
+              WHERE json_extract(analysis_json, '$.schema') =
+                'github.repository_source_withdrawn') AS observations,
+             (SELECT COUNT(*) FROM review_requests) AS reviews,
+             (SELECT COUNT(*) FROM outbox_events
+              WHERE event_type = 'github.sync.requested') AS outbox`
+        )
+        .get();
+      await activate(
+        fixture.d1,
+        newManifest,
+        expectedHead,
+        committed.candidateStatements,
+        expectedHead?.observedSha ?? null,
+        committed.activationClaim
+      );
+      expect(
+        fixture.database
+          .prepare(
+            `SELECT
+               (SELECT COUNT(*) FROM github_tree_manifest_deltas) AS deltas,
+               (SELECT COUNT(*) FROM evidence
+                WHERE source_type = 'repository_source_withdrawn') AS evidence,
+               (SELECT COUNT(*) FROM observations
+                WHERE json_extract(analysis_json, '$.schema') =
+                  'github.repository_source_withdrawn') AS observations,
+               (SELECT COUNT(*) FROM review_requests) AS reviews,
+               (SELECT COUNT(*) FROM outbox_events
+                WHERE event_type = 'github.sync.requested') AS outbox`
+          )
+          .get()
+      ).toEqual(countsBeforeReplay);
+    }
+  );
+
+  it("records a bodyless withdrawal tombstone without opening an empty review", async () => {
+    const fixture = createFixture();
+    const sourcePath = "private/unreferenced-source.fixture";
+    const oldEntries = await entries([[sourcePath, SHA.keep, "text"]]);
+    const oldManifest = await descriptor("2026-07-27T00:00:00.000Z");
+    await storeAndActivate(fixture.d1, oldManifest, oldEntries, null);
+    const newEntries = await entries([
+      [sourcePath, SHA.keep, "sensitive_tombstone"]
+    ]);
+    const newManifest = await descriptor("2026-07-28T00:00:00.000Z");
+    await storeAndActivate(
+      fixture.d1,
+      newManifest,
+      newEntries,
+      await readActiveGitHubTreeHead(fixture.d1, PROJECT_ID, REPOSITORY_ID, REF)
+    );
+
+    expect(
+      fixture.database
+        .prepare(
+          `SELECT change_kind, safe_path, affected_memory_ids_json
+           FROM github_tree_manifest_deltas
+           WHERE project_id = ? AND new_manifest_id = ?`
+        )
+        .get(PROJECT_ID, newManifest.manifestId)
+    ).toEqual({
+      change_kind: "withdrawn",
+      safe_path: null,
+      affected_memory_ids_json: "[]"
+    });
+    const artifact = fixture.database
+      .prepare(
+        `SELECT locator, repository_path, sensitivity_status
+         FROM evidence
+         WHERE project_id = ? AND source_type = 'repository_source_withdrawn'`
+      )
+      .get(PROJECT_ID);
+    expect(artifact).toMatchObject({
+      repository_path: null,
+      sensitivity_status: "tombstone"
+    });
+    expect(JSON.stringify(artifact)).not.toContain(sourcePath);
+    expect(
+      fixture.database
+        .prepare(
+          `SELECT
+             (SELECT COUNT(*) FROM observations
+              WHERE json_extract(analysis_json, '$.schema') =
+                'github.repository_source_withdrawn') AS observations,
+             (SELECT COUNT(*) FROM review_requests) AS reviews`
+        )
+        .get()
+    ).toEqual({ observations: 0, reviews: 0 });
+  });
+
+  it("classifies a same-SHA non-text disposition change without a withdrawal review", async () => {
+    const fixture = createFixture();
+    const path = "assets/generated.bin";
+    const oldManifest = await descriptor("2026-07-27T00:00:00.000Z");
+    await storeAndActivate(
+      fixture.d1,
+      oldManifest,
+      await entries([[path, SHA.keep, "binary_excluded"]]),
+      null
+    );
+    const newManifest = await descriptor("2026-07-28T00:00:00.000Z");
+    await storeAndActivate(
+      fixture.d1,
+      newManifest,
+      await entries([[path, SHA.keep, "generated_excluded"]]),
+      await readActiveGitHubTreeHead(fixture.d1, PROJECT_ID, REPOSITORY_ID, REF)
+    );
+
+    expect(
+      fixture.database
+        .prepare(
+          `SELECT change_kind, old_blob_sha, new_blob_sha,
+                  old_disposition, new_disposition
+           FROM github_tree_manifest_deltas
+           WHERE project_id = ? AND new_manifest_id = ?`
+        )
+        .get(PROJECT_ID, newManifest.manifestId)
+    ).toEqual({
+      change_kind: "changed",
+      old_blob_sha: SHA.keep,
+      new_blob_sha: SHA.keep,
+      old_disposition: "binary_excluded",
+      new_disposition: "generated_excluded"
+    });
+    expect(
+      fixture.database
+        .prepare(
+          `SELECT COUNT(*) AS count FROM evidence
+           WHERE source_type = 'repository_source_withdrawn'`
+        )
+        .get()
+    ).toEqual({ count: 0 });
   });
 
   it("isolates deletion evidence when tracked refs converge on the same commit", async () => {
@@ -1804,6 +2535,52 @@ async function descriptor(collectionKey: string): Promise<GitHubTreeManifestDesc
   });
 }
 
+async function buildPolicyCandidatePair(path: string): Promise<{
+  clear: PersistableGitHubCandidate;
+  tombstone: PersistableGitHubCandidate;
+}> {
+  const clear = await buildGitHubBlobCandidate({
+    projectId: PROJECT_ID,
+    repositoryId: REPOSITORY_ID,
+    externalRepositoryId: 42,
+    defaultBranch: "main",
+    ref: REF,
+    observedSha: SHA.commit,
+    path,
+    blobSha: SHA.keep,
+    content: "Durable project context."
+  });
+  const tombstone = await buildGitHubBlobCandidate({
+    projectId: PROJECT_ID,
+    repositoryId: REPOSITORY_ID,
+    externalRepositoryId: 42,
+    defaultBranch: "main",
+    ref: REF,
+    observedSha: SHA.commit,
+    path,
+    blobSha: SHA.keep,
+    content: "api_key = 'synthetic-sensitive-value'"
+  });
+  if (
+    clear.sensitivityStatus !== "clear" ||
+    tombstone.sensitivityStatus !== "tombstone"
+  ) {
+    throw new Error("The policy candidate fixture has an unexpected disposition.");
+  }
+  return { clear, tombstone };
+}
+
+function readEvidence(
+  database: DatabaseSync,
+  evidenceId: string
+): Record<string, unknown> | undefined {
+  return database
+    .prepare(
+      `SELECT * FROM evidence WHERE project_id = ? AND evidence_id = ?`
+    )
+    .get(PROJECT_ID, evidenceId) as Record<string, unknown> | undefined;
+}
+
 async function entries(
   rows: ReadonlyArray<
     readonly [string, string, GitHubTreeManifestEntry["disposition"]]
@@ -1939,7 +2716,8 @@ async function activate(
     repositoryId: manifest.repositoryId,
     externalRepositoryId: activationClaim.expectedExternalId,
     ref: manifest.ref,
-    observedSha: manifest.observedSha
+    observedSha: manifest.observedSha,
+    manifestId: manifest.manifestId
   });
   const payloadJson = JSON.stringify(syncEvent);
   await activateGitHubTreeManifest({

@@ -111,6 +111,7 @@ function createDatabase(): DatabaseSync {
       current_revision_id TEXT,
       scope TEXT NOT NULL DEFAULT 'project',
       scope_id TEXT NOT NULL DEFAULT 'project:alpha',
+      status TEXT NOT NULL DEFAULT 'active',
       UNIQUE (project_id, memory_id)
     );
     CREATE TABLE memory_repository_contexts (
@@ -155,15 +156,21 @@ function createDatabase(): DatabaseSync {
     INSERT INTO projects (project_id, project_ref, project_version)
     VALUES ('project:alpha', 'project.alpha', 17);
     INSERT INTO memories
-      (memory_id, project_id, current_revision_id, scope, scope_id)
-    VALUES ('memory-alpha', 'project:alpha', 'revision-alpha', 'project', 'project:alpha'),
+      (memory_id, project_id, current_revision_id, scope, scope_id, status)
+    VALUES ('memory-alpha', 'project:alpha', 'revision-alpha', 'project', 'project:alpha',
+            'active'),
            ('memory-beta', 'project:alpha', 'revision-beta',
-            'repository', 'repository-beta');
+            'repository', 'repository-beta', 'active'),
+           ('memory-invalidated', 'project:alpha', 'revision-invalidated',
+            'project', 'project:alpha', 'invalidated');
     INSERT INTO memory_repository_contexts (project_id, memory_id, repository_id)
     VALUES ('project:alpha', 'memory-beta', 'repository-beta');
     INSERT INTO memory_versions (revision_id, project_id, memory_id, content)
     VALUES ('revision-alpha', 'project:alpha', 'memory-alpha', 'alpha'),
-           ('revision-beta', 'project:alpha', 'memory-beta', 'beta');
+           ('revision-beta', 'project:alpha', 'memory-beta', 'beta'),
+           ('revision-invalidated-old', 'project:alpha', 'memory-invalidated', 'old'),
+           ('revision-invalidated', 'project:alpha', 'memory-invalidated',
+            'Memory invalidated.');
   `);
   return database;
 }
@@ -360,16 +367,17 @@ describe("projection rebuild fanout support", () => {
     const sql = buildProjectionRebuildSql(events, { createdAt });
     expect(sql).toContain("p.project_version = 17");
     expect(sql).toContain("COUNT(*) FROM memories");
-    expect(sql).toContain("COUNT(*) FROM memory_versions");
+    expect(sql).toContain("FROM memory_versions v");
     expect(sql).toContain("COUNT(DISTINCT m.scope_id)");
     expect(sql).toContain("SUM(length(CAST(v.content AS BLOB)))");
+    expect(sql).toContain("m.status IN ('active', 'contested')");
     expect(sql).toContain("m.current_revision_id = 'revision-alpha'");
     expect(sql).toContain("NOT EXISTS");
     expect(sql).toContain("ON CONFLICT(event_id) DO NOTHING");
     expect(sql).not.toContain("DO UPDATE");
   });
 
-  it("does not enqueue stale, mismatched, or cleanup-fenced work", () => {
+  it("ignores immutable history but does not enqueue stale, mismatched, or fenced work", () => {
     const createdAt = "2026-07-27T21:00:00.000Z";
     const descriptors = projectionRebuildDescriptors(target);
 
@@ -390,7 +398,7 @@ describe("projection rebuild fanout support", () => {
       projectionRebuildEvent(descriptors[0], 0)
     ], { createdAt }));
     expect(capacityDrift.prepare("SELECT COUNT(*) AS count FROM outbox_events").get())
-      .toEqual({ count: 0 });
+      .toEqual({ count: 1 });
 
     const staleSearch = createDatabase();
     staleSearch.prepare(
@@ -562,7 +570,8 @@ describe("projection rebuild fanout support", () => {
     expect(projectQuery).toContain("p.project_id = 'project:o''hare'");
     expect(projectQuery).toContain("p.project_id > 'project:alpha'");
     expect(projectQuery).toContain("registry.cleanup_fenced_at IS NULL");
-    expect(projectQuery).not.toContain("JOIN memories");
+    expect(projectQuery).toContain("JOIN memories m");
+    expect(projectQuery).toContain("m.status IN ('active', 'contested')");
     expect(projectQuery).toContain("AS memory_count");
     expect(projectQuery).toContain("AS revision_count");
     expect(projectQuery).toContain("COUNT(DISTINCT m.scope_id)");
@@ -590,7 +599,17 @@ describe("projection rebuild fanout support", () => {
     expect(headQuery).toContain("m.memory_id > 'memory-zulu'");
     expect(headQuery).toContain("ORDER BY m.project_id ASC, m.memory_id ASC");
     expect(headQuery).toContain("registry.cleanup_fenced_at IS NULL");
+    expect(headQuery).toContain("m.status IN ('active', 'contested')");
     expect(headQuery).toContain("LIMIT 10");
+    expect(
+      createDatabase()
+        .prepare(projectionRebuildHeadQuery({
+          projectId: target.project_id,
+          limit: PROJECTION_REBUILD_PAGE_SIZE
+        }))
+        .all()
+        .map((row) => (row as { memory_id: string }).memory_id)
+    ).toEqual(["memory-alpha", "memory-beta"]);
 
     const searchQuery = projectionRebuildSearchHeadQuery({
       projectId: "project:o'hare",

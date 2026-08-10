@@ -5,6 +5,8 @@ import { describe, expect, it } from "vitest";
 
 // @ts-expect-error The JavaScript CLI has no separate declaration file.
 import * as deploymentStateModule from "../scripts/capture-deployment-state.mjs";
+// @ts-expect-error The JavaScript CLI has no separate declaration file.
+import * as gatewayTriggerModule from "../scripts/gateway-trigger-state.mjs";
 
 const {
   captureDeploymentState,
@@ -12,10 +14,27 @@ const {
   verifyDeploymentState,
   writeGitHubOutputs
 } = deploymentStateModule;
+const { encodeGatewayTriggerState, gatewayTriggerFingerprint } = gatewayTriggerModule;
 
 const ORCHESTRATOR_VERSION = "11111111-1111-4111-8111-111111111111";
 const GATEWAY_VERSION = "22222222-2222-4222-8222-222222222222";
 const GITHUB_SYNC_VERSION = "33333333-3333-4333-8333-333333333333";
+const PRESENT_GATEWAY_TRIGGER = {
+  schema: 1,
+  script: "edgemneme-memory-gateway",
+  worker_present: true,
+  workers_dev: { enabled: true, previews_enabled: false },
+  custom_domains: [],
+  routes: []
+};
+const ABSENT_GATEWAY_TRIGGER = {
+  schema: 1,
+  script: "edgemneme-memory-gateway",
+  worker_present: false,
+  workers_dev: null,
+  custom_domains: [],
+  routes: []
+};
 
 function environment(overrides: Record<string, string> = {}): Record<string, string> {
   return {
@@ -92,6 +111,36 @@ function cloudflareFetch(options: {
         ]
       });
     }
+    if (url.pathname === "/client/v4/zones") {
+      expect(url.searchParams.get("account.id")).toBe("synthetic-account");
+      return Response.json({
+        success: true,
+        result: [],
+        result_info: {
+          page: 1,
+          per_page: 50,
+          count: 0,
+          total_count: 0,
+          total_pages: 0
+        }
+      });
+    }
+    if (url.pathname.endsWith("/workers/domains")) {
+      expect(url.searchParams.get("service")).toBe("edgemneme-memory-gateway");
+      return Response.json({ success: true, result: [], result_info: { total_count: 0 } });
+    }
+    if (url.pathname.endsWith("/workers/scripts/edgemneme-memory-gateway/subdomain")) {
+      if (options.absentWorkers?.has("edgemneme-memory-gateway") === true) {
+        return new Response(null, { status: 404 });
+      }
+      return Response.json({
+        success: true,
+        result: { enabled: true, previews_enabled: false }
+      });
+    }
+    if (url.pathname.endsWith("/workers/subdomain")) {
+      return Response.json({ success: true, result: { subdomain: "synthetic-account" } });
+    }
     throw new Error(`Unexpected synthetic Cloudflare request ${url.pathname}.`);
   }) as typeof fetch;
 }
@@ -123,6 +172,8 @@ describe("deployment state capture", () => {
     expect(state).toEqual({
       orchestrator_version: ORCHESTRATOR_VERSION,
       gateway_version: GATEWAY_VERSION,
+      gateway_trigger_state: encodeGatewayTriggerState(PRESENT_GATEWAY_TRIGGER),
+      gateway_trigger_fingerprint: gatewayTriggerFingerprint(PRESENT_GATEWAY_TRIGGER),
       github_sync_version: GITHUB_SYNC_VERSION,
       github_sync_state: "present",
       github_sync_schedule_state: "enabled",
@@ -180,6 +231,9 @@ describe("deployment state capture", () => {
 
     expect(state.orchestrator_version).toBe("");
     expect(state.gateway_version).toBe("");
+    expect(state.gateway_trigger_state).toBe(
+      encodeGatewayTriggerState(ABSENT_GATEWAY_TRIGGER)
+    );
     expect(state.github_sync_state).toBe("absent");
     expect(state.bootstrap_mode).toBe("true");
   });

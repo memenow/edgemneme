@@ -43,7 +43,27 @@ const FORMATTED_LOCAL_PHONE_PATTERNS: readonly RegExp[] = [
   /(?:^|[^0-9A-Za-z])(?:02[0-9][ .-][0-9]{4}[ .-][0-9]{4}|01[0-9]{2}[ .-][0-9]{3}[ .-][0-9]{4}|01[0-9]{3}[ .-][0-9]{6}|07[0-9]{3}[ .-][0-9]{6})(?=$|[^0-9A-Za-z])/u
 ];
 
+const CONTIGUOUS_PHONE_CANDIDATE_PATTERN =
+  /(?:^|[^0-9A-Za-z])([0-9]{10,11})(?=$|[^0-9A-Za-z])/gu;
+
+const TECHNICAL_NUMERIC_CONTEXT_PATTERN =
+  /(?:^|[^a-z0-9])(?:build(?:[_ -]?(?:id|number))?|checksum|commit(?:[_ -]?(?:id|sha))?|count|counter|digest|epoch(?:[_ -]?(?:seconds|milliseconds|nanoseconds|timestamp))?|event[_ -]?id|hash|issue[_ -]?(?:id|number)|job[_ -]?id|project[_ -]?id|record[_ -]?id|repository[_ -]?id|request[_ -]?id|revision[_ -]?id|run[_ -]?(?:id|number)|sequence(?:[_ -]?number)?|span[_ -]?id|timestamp|trace[_ -]?id|version(?:[_ -]?(?:id|number))?)["']?\s*(?:(?:is|was)\s*)?(?:[:=#]\s*)?$/u;
+
 export function inspectCandidateContent(
+  content: string,
+  options: { maxBytes: number }
+): CandidateInspection {
+  const originalInspection = inspectCandidateContentRepresentation(content, options);
+  if (!originalInspection.accepted) {
+    return originalInspection;
+  }
+  const normalized = content.normalize("NFKC");
+  return normalized === content
+    ? originalInspection
+    : inspectCandidateContentRepresentation(normalized, options);
+}
+
+function inspectCandidateContentRepresentation(
   content: string,
   options: { maxBytes: number }
 ): CandidateInspection {
@@ -106,7 +126,8 @@ export function inspectModelInput(
   if (!contentInspection.accepted) {
     return contentInspection;
   }
-  if (looksLikePromptTranscript(content)) {
+  const normalized = content.normalize("NFKC");
+  if (looksLikePromptTranscript(content) || looksLikePromptTranscript(normalized)) {
     return {
       accepted: false,
       disposition: "tombstone",
@@ -114,7 +135,7 @@ export function inspectModelInput(
       detector: "prompt-transcript"
     };
   }
-  if (looksLikeRawLog(content)) {
+  if (looksLikeRawLog(content) || looksLikeRawLog(normalized)) {
     return {
       accepted: false,
       disposition: "tombstone",
@@ -331,7 +352,39 @@ function containsPhoneNumber(content: string): boolean {
       return true;
     }
   }
+  for (const candidate of content.matchAll(CONTIGUOUS_PHONE_CANDIDATE_PATTERN)) {
+    const digits = candidate[1] ?? "";
+    const candidateOffset =
+      (candidate.index ?? 0) + Math.max(0, candidate[0].lastIndexOf(digits));
+    if (
+      !hasTechnicalNumericContext(content, candidateOffset) &&
+      (isChineseMobileNumber(digits) || isNorthAmericanPhoneNumber(digits))
+    ) {
+      return true;
+    }
+  }
   return false;
+}
+
+function hasTechnicalNumericContext(content: string, candidateOffset: number): boolean {
+  const prefix = content
+    .slice(Math.max(0, candidateOffset - 80), candidateOffset)
+    .replace(/([a-z0-9])([A-Z])/gu, "$1_$2")
+    .toLowerCase();
+  return TECHNICAL_NUMERIC_CONTEXT_PATTERN.test(prefix);
+}
+
+function isChineseMobileNumber(digits: string): boolean {
+  return /^1[3-9][0-9]{9}$/u.test(digits);
+}
+
+function isNorthAmericanPhoneNumber(digits: string): boolean {
+  const nationalNumber =
+    digits.length === 11 && digits.startsWith("1") ? digits.slice(1) : digits;
+  if (!/^[2-9][0-9]{2}[2-9][0-9]{6}$/u.test(nationalNumber)) {
+    return false;
+  }
+  return nationalNumber.slice(1, 3) !== "11" && nationalNumber.slice(4, 6) !== "11";
 }
 
 function containsChineseResidentId(content: string): boolean {

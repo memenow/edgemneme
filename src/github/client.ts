@@ -1,3 +1,8 @@
+import {
+  parseNextPageLink,
+  parsePositiveSafeInteger
+} from "./link-pagination";
+
 const API_ORIGIN = "https://api.github.com";
 const API_VERSION = "2026-03-10";
 const GITHUB_SUCCESS_JSON_MAX_BYTES = {
@@ -5,6 +10,7 @@ const GITHUB_SUCCESS_JSON_MAX_BYTES = {
   repositoryPage: 4 * 1024 * 1024,
   repository: 512 * 1024,
   ref: 256 * 1024,
+  tag: 1024 * 1024,
   commit: 4 * 1024 * 1024,
   compare: 8 * 1024 * 1024,
   tree: 8 * 1024 * 1024,
@@ -12,6 +18,7 @@ const GITHUB_SUCCESS_JSON_MAX_BYTES = {
 } as const;
 const AUTHENTICATED_REPOSITORIES_PER_PAGE = 100;
 export const MAX_AUTHENTICATED_REPOSITORIES = 10_000;
+export const MAX_GITHUB_ANNOTATED_TAG_PEEL_REQUESTS = 8;
 const MAX_AUTHENTICATED_REPOSITORY_PAGES =
   MAX_AUTHENTICATED_REPOSITORIES / AUTHENTICATED_REPOSITORIES_PER_PAGE;
 const SEGMENT = "[A-Za-z0-9_.-]+";
@@ -21,6 +28,7 @@ const ALLOWED_PATHS = [
   /^\/user\/repos$/u,
   new RegExp(`^/repos/${SEGMENT}/${SEGMENT}$`, "u"),
   new RegExp(`^/repos/${SEGMENT}/${SEGMENT}/git/ref/${SEGMENT}(?:/${SEGMENT})*$`, "u"),
+  new RegExp(`^/repos/${SEGMENT}/${SEGMENT}/git/tags/${SHA}$`, "u"),
   new RegExp(`^/repos/${SEGMENT}/${SEGMENT}/commits/${SHA}$`, "u"),
   new RegExp(`^/repos/${SEGMENT}/${SEGMENT}/compare/${SHA}\\.\\.\\.${SHA}$`, "u"),
   new RegExp(`^/repos/${SEGMENT}/${SEGMENT}/git/trees/${SHA}$`, "u"),
@@ -71,6 +79,11 @@ export interface RepositoryAccess {
 
 export interface GitReference {
   ref: string;
+  object: { sha: string; type: string };
+}
+
+export interface GitTag {
+  sha: string;
   object: { sha: string; type: string };
 }
 
@@ -302,7 +315,7 @@ export class GitHubReadOnlyClient {
         scopes.add(scope);
       }
       rateLimit = parseRateLimit(response.headers) ?? rateLimit;
-      nextUrl = readNextPage(response.headers.get("link"));
+      nextUrl = readNextPage(response.headers.get("link"), nextUrl);
     }
     return {
       repositories: [...repositories.values()].sort(
@@ -374,6 +387,72 @@ export class GitHubReadOnlyClient {
       ),
       ifNoneMatch
     );
+  }
+
+  async peelReferenceToCommit(
+    owner: string,
+    repository: string,
+    expectedRepositoryId: number,
+    expectedRef: string,
+    reference: GitReference
+  ): Promise<string> {
+    this.assertVerified(owner, repository, expectedRepositoryId);
+    const rawReference: unknown = reference;
+    if (typeof rawReference !== "object" || rawReference === null) {
+      throw repositoryUnavailable();
+    }
+    const candidate = rawReference as { ref?: unknown; object?: unknown };
+    if (candidate.ref !== expectedRef) {
+      throw repositoryUnavailable();
+    }
+    let object = parseGitObject(candidate.object);
+    if (object === null) {
+      throw repositoryUnavailable();
+    }
+    if (expectedRef.startsWith("refs/heads/")) {
+      if (object.type !== "commit") {
+        throw repositoryUnavailable();
+      }
+      return object.sha;
+    }
+    if (!expectedRef.startsWith("refs/tags/")) {
+      throw repositoryUnavailable();
+    }
+    if (object.type === "commit") {
+      return object.sha;
+    }
+    if (object.type !== "tag") {
+      throw repositoryUnavailable();
+    }
+
+    const visitedTagShas = new Set<string>();
+    for (
+      let requestCount = 0;
+      requestCount < MAX_GITHUB_ANNOTATED_TAG_PEEL_REQUESTS;
+      requestCount += 1
+    ) {
+      if (visitedTagShas.has(object.sha)) {
+        throw repositoryUnavailable();
+      }
+      visitedTagShas.add(object.sha);
+      const requestedTagSha = object.sha;
+      const tag = parseGitTag(
+        await this.getJson<unknown>(
+          `/repos/${encodeSegment(owner)}/${encodeSegment(repository)}/git/tags/${requestedTagSha}`
+        )
+      );
+      if (tag === null || tag.sha !== requestedTagSha) {
+        throw repositoryUnavailable();
+      }
+      object = tag.object;
+      if (object.type === "commit") {
+        return object.sha;
+      }
+      if (object.type !== "tag") {
+        throw repositoryUnavailable();
+      }
+    }
+    throw new GitHubSyncError("GITHUB_PARTIAL_SYNC");
   }
 
   async getCommit(
@@ -657,7 +736,7 @@ function assertAllowedQuery(url: URL): void {
       }
     }
     const page = url.searchParams.get("page") ?? "1";
-    if (!/^[1-9][0-9]*$/u.test(page)) {
+    if (parsePositiveSafeInteger(page) === null) {
       throw repositoryUnavailable();
     }
     return;
@@ -673,19 +752,49 @@ function assertAllowedQuery(url: URL): void {
   }
 }
 
-function readNextPage(link: string | null): URL | undefined {
-  if (link === null || link.trim() === "") {
-    return undefined;
-  }
-  for (const part of link.split(",")) {
-    const match = /^\s*<([^>]+)>\s*;\s*rel="([^"]+)"\s*$/u.exec(part);
-    if (match?.[2] === "next" && match[1] !== undefined) {
-      const url = new URL(match[1]);
-      assertAllowedUrl(url);
-      return url;
+function readNextPage(link: string | null, currentUrl: URL): URL | undefined {
+  try {
+    const nextUrl = parseNextPageLink(link, currentUrl);
+    if (nextUrl !== undefined) {
+      assertAllowedUrl(nextUrl);
     }
+    return nextUrl;
+  } catch {
+    throw repositoryUnavailable();
   }
-  return undefined;
+}
+
+function parseGitObject(
+  value: unknown
+): { sha: string; type: string } | null {
+  if (typeof value !== "object" || value === null) {
+    return null;
+  }
+  const candidate = value as { sha?: unknown; type?: unknown };
+  if (
+    typeof candidate.sha !== "string" ||
+    !new RegExp(`^${SHA}$`, "u").test(candidate.sha) ||
+    typeof candidate.type !== "string"
+  ) {
+    return null;
+  }
+  return { sha: candidate.sha, type: candidate.type };
+}
+
+function parseGitTag(value: unknown): GitTag | null {
+  if (typeof value !== "object" || value === null) {
+    return null;
+  }
+  const candidate = value as { sha?: unknown; object?: unknown };
+  const object = parseGitObject(candidate.object);
+  if (
+    typeof candidate.sha !== "string" ||
+    !new RegExp(`^${SHA}$`, "u").test(candidate.sha) ||
+    object === null
+  ) {
+    return null;
+  }
+  return { sha: candidate.sha, object };
 }
 
 function parseRepositoryAccess(value: unknown): RepositoryAccess | null {
@@ -851,6 +960,7 @@ function successJsonMaxBytes(url: URL): number {
     return GITHUB_SUCCESS_JSON_MAX_BYTES.repositoryPage;
   }
   if (path.includes("/git/ref/")) return GITHUB_SUCCESS_JSON_MAX_BYTES.ref;
+  if (path.includes("/git/tags/")) return GITHUB_SUCCESS_JSON_MAX_BYTES.tag;
   if (path.includes("/commits/")) return GITHUB_SUCCESS_JSON_MAX_BYTES.commit;
   if (path.includes("/compare/")) return GITHUB_SUCCESS_JSON_MAX_BYTES.compare;
   if (path.includes("/git/trees/")) return GITHUB_SUCCESS_JSON_MAX_BYTES.tree;

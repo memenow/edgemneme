@@ -160,7 +160,7 @@ describe("search planning", () => {
       revisionId: "revision-1",
       memoryVersion: 1,
       chunkId: "chunk-1",
-      content: "Synthetic fixture.",
+      chunkContent: "Synthetic fixture.",
       contentSha256: "sha",
       kind: "decision",
       memoryClass: "semantic",

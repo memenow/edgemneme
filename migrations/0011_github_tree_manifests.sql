@@ -289,9 +289,37 @@ CREATE TABLE github_tree_manifest_deltas (
     AND path_digest NOT GLOB '*[^0-9a-f]*'
   ),
   safe_path TEXT,
-  change_kind TEXT NOT NULL CHECK (change_kind IN ('added', 'changed', 'deleted')),
-  old_blob_sha TEXT,
-  new_blob_sha TEXT,
+  change_kind TEXT NOT NULL CHECK (
+    change_kind IN ('added', 'changed', 'deleted', 'withdrawn')
+  ),
+  old_blob_sha TEXT CHECK (
+    old_blob_sha IS NULL
+    OR (
+      length(old_blob_sha) BETWEEN 40 AND 128
+      AND old_blob_sha NOT GLOB '*[^0-9A-Fa-f]*'
+    )
+  ),
+  new_blob_sha TEXT CHECK (
+    new_blob_sha IS NULL
+    OR (
+      length(new_blob_sha) BETWEEN 40 AND 128
+      AND new_blob_sha NOT GLOB '*[^0-9A-Fa-f]*'
+    )
+  ),
+  old_disposition TEXT CHECK (
+    old_disposition IS NULL
+    OR old_disposition IN (
+      'text', 'binary_excluded', 'generated_excluded',
+      'sensitive_tombstone', 'partial'
+    )
+  ),
+  new_disposition TEXT CHECK (
+    new_disposition IS NULL
+    OR new_disposition IN (
+      'text', 'binary_excluded', 'generated_excluded',
+      'sensitive_tombstone', 'partial'
+    )
+  ),
   affected_memory_ids_json TEXT NOT NULL DEFAULT '[]' CHECK (
     json_valid(affected_memory_ids_json)
     AND json_type(affected_memory_ids_json) = 'array'
@@ -306,12 +334,53 @@ CREATE TABLE github_tree_manifest_deltas (
   UNIQUE (project_id, old_manifest_id, new_manifest_id, path_digest),
   UNIQUE (project_id, idempotency_key),
   CHECK (
-    (change_kind = 'added' AND old_blob_sha IS NULL AND new_blob_sha IS NOT NULL)
+    (
+      change_kind = 'added'
+      AND old_blob_sha IS NULL
+      AND old_disposition IS NULL
+      AND new_blob_sha IS NOT NULL
+      AND new_disposition IS NOT NULL
+    )
     OR
-    (change_kind = 'changed' AND old_blob_sha IS NOT NULL
-      AND new_blob_sha IS NOT NULL AND old_blob_sha <> new_blob_sha)
+    (
+      change_kind = 'changed'
+      AND old_manifest_id IS NOT NULL
+      AND old_blob_sha IS NOT NULL
+      AND new_blob_sha IS NOT NULL
+      AND old_disposition IS NOT NULL
+      AND new_disposition IS NOT NULL
+      AND (
+        old_blob_sha <> new_blob_sha
+        OR old_disposition <> new_disposition
+      )
+      AND NOT (
+        old_disposition = 'text'
+        AND new_disposition IN (
+          'binary_excluded', 'generated_excluded', 'sensitive_tombstone'
+        )
+      )
+    )
     OR
-    (change_kind = 'deleted' AND old_blob_sha IS NOT NULL AND new_blob_sha IS NULL)
+    (
+      change_kind = 'deleted'
+      AND old_manifest_id IS NOT NULL
+      AND old_blob_sha IS NOT NULL
+      AND old_disposition IS NOT NULL
+      AND new_blob_sha IS NULL
+      AND new_disposition IS NULL
+    )
+    OR
+    (
+      change_kind = 'withdrawn'
+      AND safe_path IS NULL
+      AND old_manifest_id IS NOT NULL
+      AND old_blob_sha IS NOT NULL
+      AND new_blob_sha IS NOT NULL
+      AND old_disposition = 'text'
+      AND new_disposition IN (
+        'binary_excluded', 'generated_excluded', 'sensitive_tombstone'
+      )
+    )
   )
 );
 
@@ -745,8 +814,63 @@ WHEN NOT EXISTS (
         AND manifest.status = 'complete'
     )
   )
+  OR (
+    NEW.change_kind IN ('added', 'changed', 'withdrawn')
+    AND NOT EXISTS (
+      SELECT 1 FROM github_tree_manifest_entries AS entry
+      WHERE entry.project_id = NEW.project_id
+        AND entry.manifest_id = NEW.new_manifest_id
+        AND entry.path_digest = NEW.path_digest
+        AND entry.blob_sha = NEW.new_blob_sha
+        AND entry.disposition = NEW.new_disposition
+        AND (
+          (
+            NEW.change_kind = 'withdrawn'
+            AND NEW.safe_path IS NULL
+          )
+          OR (
+            NEW.change_kind <> 'withdrawn'
+            AND entry.safe_path IS NEW.safe_path
+          )
+        )
+    )
+  )
+  OR (
+    NEW.change_kind = 'deleted'
+    AND EXISTS (
+      SELECT 1 FROM github_tree_manifest_entries AS entry
+      WHERE entry.project_id = NEW.project_id
+        AND entry.manifest_id = NEW.new_manifest_id
+        AND entry.path_digest = NEW.path_digest
+    )
+  )
+  OR (
+    NEW.change_kind = 'added'
+    AND NEW.old_manifest_id IS NOT NULL
+    AND EXISTS (
+      SELECT 1 FROM github_tree_manifest_entries AS entry
+      WHERE entry.project_id = NEW.project_id
+        AND entry.manifest_id = NEW.old_manifest_id
+        AND entry.path_digest = NEW.path_digest
+    )
+  )
+  OR (
+    NEW.change_kind IN ('changed', 'deleted', 'withdrawn')
+    AND NOT EXISTS (
+      SELECT 1 FROM github_tree_manifest_entries AS entry
+      WHERE entry.project_id = NEW.project_id
+        AND entry.manifest_id = NEW.old_manifest_id
+        AND entry.path_digest = NEW.path_digest
+        AND entry.blob_sha = NEW.old_blob_sha
+        AND entry.disposition = NEW.old_disposition
+        AND (
+          NEW.change_kind <> 'deleted'
+          OR entry.safe_path IS NEW.safe_path
+        )
+    )
+  )
 BEGIN
-  SELECT RAISE(ABORT, 'GitHub tree manifest deltas require complete manifests');
+  SELECT RAISE(ABORT, 'GitHub tree manifest delta provenance is invalid');
 END;
 
 CREATE TRIGGER github_tree_manifest_deltas_no_update

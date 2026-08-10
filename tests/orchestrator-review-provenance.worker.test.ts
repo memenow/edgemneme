@@ -262,7 +262,14 @@ describe("candidate review evidence-to-scope provenance", () => {
     expect(database.batches).toHaveLength(0);
     expect(database.reads).toContainEqual({
       sql: expect.stringContaining("AS memory_count"),
-      bindings: ["repository-a", "project-1", 0]
+      bindings: [
+        "project-1",
+        "",
+        "",
+        "repository-a",
+        "project-1",
+        0
+      ]
     });
   });
 

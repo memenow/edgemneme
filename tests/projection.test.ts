@@ -122,14 +122,14 @@ describe("R2 projection snapshot plan", () => {
       projectVersion: 9,
       snapshotId: "snapshot-9",
       heads: [PROCEDURE, DECISION],
-      revisions: [PROCEDURE, DECISION, HISTORICAL_DECISION]
+      revisions: [PROCEDURE, DECISION]
     });
 
     expect(plan.prefix).toBe("projects/project-1/projections/snapshot-9/");
     expect(plan.writes.map((write) => write.key)).toEqual(
       [...plan.writes.map((write) => write.key)].sort()
     );
-    expect(plan.writes).toHaveLength(36);
+    expect(plan.writes).toHaveLength(35);
     expect(findWrite(plan, "README.md").body).toContain("Project version: `9`");
     expect(findWrite(plan, "indexes/by-kind/reference/index.json")).toBeDefined();
     expect(findWrite(plan, "indexes/by-class/episodic/index.md")).toBeDefined();
@@ -169,10 +169,10 @@ describe("R2 projection snapshot plan", () => {
     });
     expect(
       manifest.revisions.map((entry) => `${entry.memory_id}:${entry.memory_version}`)
-    ).toEqual(["memory-1:1", "memory-1:2", "memory-2:1"]);
+    ).toEqual(["memory-1:2", "memory-2:1"]);
     expect(manifest.revisions[0]).toMatchObject({
       valid_from: "2026-07-25T00:00:00.000Z",
-      valid_until: "2026-07-25T00:00:00.000Z"
+      valid_until: null
     });
     expect(manifest.files).toHaveLength(plan.writes.length - 1);
     expect(manifest.files.some((entry) => entry.key.endsWith("/manifest.json"))).toBe(false);
@@ -182,7 +182,7 @@ describe("R2 projection snapshot plan", () => {
       projectVersion: 9,
       snapshotId: "snapshot-9",
       heads: [DECISION, PROCEDURE],
-      revisions: [HISTORICAL_DECISION, DECISION, PROCEDURE]
+      revisions: [DECISION, PROCEDURE]
     });
     expect(reversePlan).toEqual(plan);
     await expect(validateProjectionSnapshotPlan(plan)).resolves.toEqual({
@@ -268,7 +268,7 @@ describe("R2 projection snapshot plan", () => {
         heads: [DECISION],
         revisions: [HISTORICAL_DECISION]
       })
-    ).rejects.toThrow("Head revision is missing from revisions: revision-2");
+    ).rejects.toThrow("Revision is not the canonical current head: revision-1");
   });
 
   it("rejects inconsistent revision identity, version, and snapshot metadata", async () => {
@@ -313,7 +313,7 @@ describe("R2 projection snapshot plan", () => {
         heads: [HISTORICAL_DECISION],
         revisions: [HISTORICAL_DECISION, DECISION]
       })
-    ).rejects.toThrow("Revision is newer than its canonical head");
+    ).rejects.toThrow("Revision is not the canonical current head: revision-2");
 
     await expect(
       buildProjectionSnapshotPlan({

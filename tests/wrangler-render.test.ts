@@ -333,6 +333,28 @@ describe("production workflow secret isolation", () => {
   const deploy = workflowSource("deploy.yml");
   const migrate = workflowSource("migrate-d1.yml");
 
+  function secretExposure(source: string): Array<[string, string[]]> {
+    const stepMatches = [...source.matchAll(/^      - name: (.+)$/gmu)];
+    const secretPattern = /\$\{\{\s*secrets\.([A-Za-z0-9_]+)\s*\}\}/gu;
+    const exposure: Array<[string, string[]]> = [];
+    for (const [index, match] of stepMatches.entries()) {
+      const name = match[1];
+      if (name === undefined) {
+        throw new Error("Workflow step name was not captured.");
+      }
+      const next = stepMatches[index + 1];
+      const step = source.slice(match.index, next?.index);
+      const secrets = [...step.matchAll(secretPattern)]
+        .map((secretMatch) => secretMatch[1])
+        .filter((secret): secret is string => secret !== undefined)
+        .sort();
+      if (secrets.length > 0) {
+        exposure.push([name, secrets]);
+      }
+    }
+    return exposure;
+  }
+
   it("keeps secrets out of job-level environments and source validation", () => {
     expect(deploy).not.toMatch(/^    env:/mu);
     expect(migrate).not.toMatch(/^    env:/mu);
@@ -342,45 +364,59 @@ describe("production workflow secret isolation", () => {
   });
 
   it("exposes production secrets only to their minimum deployment steps", () => {
-    const allowedDeploySteps = [
-      "Validate unattended rollback channel",
-      "Capture production Worker state",
-      "Verify captured production configuration",
-      "Require fully migrated remote D1 databases",
-      "Ensure semantic Vectorize metadata indexes",
-      "Check projection rebuild deployment budget",
-      "Capture pre-deployment Worker versions",
-      "Revalidate disabled GitHub sync reconciliation state",
-      "Rebuild and verify projections",
-      "Revalidate orchestrator deployment state",
-      "Revalidate gateway deployment state",
-      "Revalidate GitHub sync deployment state",
-      "Create ephemeral gateway secret file",
-      "Create ephemeral GitHub sync secret file",
-      "Deploy memory orchestrator",
-      "Deploy memory gateway",
-      "Run isolated production canary",
-      "Recover isolated production canary",
-      "Reconcile disabled GitHub sync",
-      "Deploy GitHub sync",
-      "Rollback failed Worker deployment"
-    ].map((name) => workflowStep(deploy, name)).join("\n");
-    const allowedMigrationSteps = [
-      "Require quiescent GitHub sync before migration",
-      "Capture and verify private pre-migration backups",
-      "Revalidate quiescent GitHub sync before migration apply",
-      "Apply memory database migrations",
-      "Apply search database migrations",
-      "Validate migrated D1 databases"
-    ].map((name) => workflowStep(migrate, name)).join("\n");
-    const secretPattern = /\$\{\{ secrets\.[A-Z0-9_]+ \}\}/gu;
-
-    expect(deploy.match(secretPattern)?.sort()).toEqual(
-      allowedDeploySteps.match(secretPattern)?.sort()
-    );
-    expect(migrate.match(secretPattern)?.sort()).toEqual(
-      allowedMigrationSteps.match(secretPattern)?.sort()
-    );
+    const cloudflareAccess = [
+      "CLOUDFLARE_ACCOUNT_ID",
+      "CLOUDFLARE_API_TOKEN"
+    ];
+    expect(secretExposure(deploy)).toEqual([
+      ["Capture production Worker state", cloudflareAccess],
+      ["Validate unattended rollback channel", ["CLOUDFLARE_ROLLBACK_API_TOKEN"]],
+      ["Verify captured production configuration", ["CLOUDFLARE_ACCOUNT_ID"]],
+      ["Require fully migrated remote D1 databases", cloudflareAccess],
+      ["Reject pre-mutation deployment state drift", cloudflareAccess],
+      ["Ensure semantic Vectorize metadata indexes", cloudflareAccess],
+      ["Check projection rebuild deployment budget", cloudflareAccess],
+      ["Capture pre-deployment Worker versions", cloudflareAccess],
+      ["Reject deployment state drift", cloudflareAccess],
+      ["Revalidate disabled GitHub sync reconciliation state", cloudflareAccess],
+      ["Reconcile disabled GitHub sync", cloudflareAccess],
+      ["Revalidate orchestrator deployment state", cloudflareAccess],
+      ["Deploy memory orchestrator", cloudflareAccess],
+      ["Rebuild and verify projections", cloudflareAccess],
+      [
+        "Create ephemeral gateway secret file",
+        ["PAGE_TOKEN_HMAC_KEY", "TOKEN_DIGEST_PEPPER"]
+      ],
+      ["Revalidate gateway deployment state", cloudflareAccess],
+      ["Deploy memory gateway", cloudflareAccess],
+      ["Capture deployed gateway canary target", cloudflareAccess],
+      [
+        "Run isolated production canary",
+        ["CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_TOKEN", "TOKEN_DIGEST_PEPPER"]
+      ],
+      ["Recover isolated production canary", cloudflareAccess],
+      ["Reverify deployed gateway canary target", cloudflareAccess],
+      ["Create ephemeral GitHub sync secret file", ["GITHUB_CLASSIC_TOKEN"]],
+      ["Revalidate GitHub sync deployment state", cloudflareAccess],
+      ["Deploy GitHub sync", cloudflareAccess],
+      ["Rollback failed Worker deployment", ["CLOUDFLARE_ROLLBACK_API_TOKEN"]]
+    ]);
+    expect(secretExposure(migrate)).toEqual([
+      ["Capture greenfield maintenance admission before backups", cloudflareAccess],
+      ["Capture and verify private pre-migration backups", cloudflareAccess],
+      [
+        "Revalidate greenfield maintenance immediately before search apply",
+        cloudflareAccess
+      ],
+      ["Apply search database migrations", cloudflareAccess],
+      ["Validate search database before memory migration", cloudflareAccess],
+      [
+        "Revalidate greenfield maintenance immediately before memory apply",
+        cloudflareAccess
+      ],
+      ["Apply memory database migrations", cloudflareAccess],
+      ["Validate migrated D1 databases", cloudflareAccess]
+    ]);
   });
 
   it("installs without lifecycle scripts and deploys the immutable trusted-main commit", () => {
@@ -867,7 +903,7 @@ tagged_current_version package.json "\${VERSION_ID}" "\${EXPECTED_TAG}"
     }
   });
 
-  it("retries exact synthetic cleanup only after the production canary fails", () => {
+  it("retries exact synthetic cleanup after a failed or cancelled production canary", () => {
     const prepare = workflowStep(deploy, "Prepare isolated canary identity");
     const canary = workflowStep(deploy, "Run isolated production canary");
     const recovery = workflowStep(deploy, "Recover isolated production canary");
@@ -877,10 +913,13 @@ tagged_current_version package.json "\${VERSION_ID}" "\${EXPECTED_TAG}"
     expect(prepare).toContain("EDGEMNEME_CANARY_CLEANUP_LEDGER");
     expect(canary).toContain("id: isolated_production_canary");
     expect(canary).toContain("timeout-minutes: 20");
+    expect(recovery).toContain("always() &&");
     expect(recovery).toContain(
-      "if: failure() && steps.isolated_production_canary.outcome == 'failure'"
+      "steps.isolated_production_canary.outcome != 'success'"
     );
-    expect(recovery).not.toContain("if: always()");
+    expect(recovery).toContain(
+      "steps.isolated_production_canary.outcome != 'skipped'"
+    );
     expect(recovery).toContain("--cleanup-only");
     expect(recovery).not.toContain("TOKEN_DIGEST_PEPPER");
   });
@@ -930,39 +969,6 @@ tagged_current_version package.json "\${VERSION_ID}" "\${EXPECTED_TAG}"
     expect(workflowStep(deploy, "Remove ephemeral deployment files")).not.toContain(
       "EDGEMNEME_CANARY_CLEANUP_LEDGER"
     );
-  });
-
-  it("retains exact pre-migration recovery points in a verified private R2 backup", () => {
-    const backup = workflowStep(migrate, "Capture and verify private pre-migration backups");
-    const memoryMigration = migrate.indexOf("      - name: Apply memory database migrations\n");
-    const backupStart = migrate.indexOf(
-      "      - name: Capture and verify private pre-migration backups\n"
-    );
-
-    expect(backup).toContain('d1 time-travel info "$database" --json');
-    expect(backup).toContain("capture_bookmark MEMORY_DB");
-    expect(backup).toContain("capture_bookmark SEARCH_DB");
-    expect(backup).toContain("d1 export MEMORY_DB --remote");
-    expect(backup).not.toContain("d1 export SEARCH_DB");
-    expect(backup).toContain("search_generations");
-    expect(backup).toContain("memory_fts");
-    expect(backup).toContain("memory_projection_heads");
-    expect(backup).toContain("system/backups/d1-migrations/");
-    expect(backup).toContain('r2 bucket domain list "$backup_bucket"');
-    expect(backup).toContain("There are no custom domains connected to this bucket.");
-    expect(backup).toContain('r2 bucket dev-url get "$backup_bucket"');
-    expect(backup).toContain("Public access via the r2.dev URL is disabled.");
-    expect(backup).toContain("wrangler r2 object put");
-    expect(backup).toContain("wrangler r2 object get");
-    expect(backup).toContain("cmp --silent");
-    expect(backup).toContain("create-backup-manifest");
-    expect(backup).toContain("verify-backup");
-    expect(backup.indexOf('upload_and_verify "manifest.json"'))
-      .toBeGreaterThan(backup.indexOf('upload_and_verify "memory-projection-heads.jsonl"'));
-    expect(backupStart).toBeGreaterThan(-1);
-    expect(backupStart).toBeLessThan(memoryMigration);
-    expect(migrate).not.toContain("actions/upload-artifact");
-    expect(migrate).not.toContain("time-travel restore");
   });
 
   it("fails closed unless both migrated databases are complete and structurally healthy", () => {

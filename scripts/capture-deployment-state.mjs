@@ -3,6 +3,7 @@
 import { createHash } from "node:crypto";
 import { appendFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
+import { observeGatewayTriggerState } from "./gateway-trigger-state.mjs";
 
 const ACTIVE_VERSION_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
@@ -12,6 +13,8 @@ const REQUEST_TIMEOUT_MS = 15_000;
 const STATE_FIELDS = new Set([
   "orchestrator_version",
   "gateway_version",
+  "gateway_trigger_state",
+  "gateway_trigger_fingerprint",
   "github_sync_version",
   "github_sync_state",
   "github_sync_schedule_state",
@@ -185,17 +188,26 @@ async function observeDeploymentState(environment, fetchImpl) {
     token: requiredValue(environment, "CLOUDFLARE_API_TOKEN"),
     fetchImpl
   };
-  const [orchestratorDeployments, gatewayDeployments, githubSyncDeployments] =
+  const [
+    orchestratorDeployments,
+    gatewayDeployments,
+    githubSyncDeployments,
+    gatewayTrigger
+  ] =
     await Promise.all([
       readWorkerDeployments(context, "edgemneme-memory-orchestrator"),
       readWorkerDeployments(context, "edgemneme-memory-gateway"),
-      readWorkerDeployments(context, GITHUB_SYNC_WORKER)
+      readWorkerDeployments(context, GITHUB_SYNC_WORKER),
+      observeGatewayTriggerState(environment, fetchImpl)
     ]);
 
   const orchestratorVersion =
     orchestratorDeployments === undefined ? "absent" : activeWorkerVersion(orchestratorDeployments);
   const gatewayVersion =
     gatewayDeployments === undefined ? "absent" : activeWorkerVersion(gatewayDeployments);
+  if ((gatewayDeployments === undefined) !== !gatewayTrigger.state.worker_present) {
+    throw new Error("The gateway Worker and its remote trigger presence are inconsistent.");
+  }
   const githubSyncState = githubSyncDeployments === undefined ? "absent" : "present";
   let githubSyncVersion = "absent";
   let githubSyncScheduleState = "absent";
@@ -215,6 +227,8 @@ async function observeDeploymentState(environment, fetchImpl) {
   return {
     orchestrator_version: orchestratorVersion,
     gateway_version: gatewayVersion,
+    gateway_trigger_state: gatewayTrigger.encoded,
+    gateway_trigger_fingerprint: gatewayTrigger.fingerprint,
     github_sync_version: githubSyncVersion,
     github_sync_state: githubSyncState,
     github_sync_schedule_state: githubSyncScheduleState,

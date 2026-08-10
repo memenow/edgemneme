@@ -109,6 +109,8 @@ const HEADS_SQL = `SELECT m.memory_id, m.current_revision_id, m.memory_version, 
                           m.memory_class, m.scope, m.scope_id, m.status
                    FROM memories m
                    WHERE m.project_id = ?
+                     AND m.current_revision_id IS NOT NULL
+                     AND m.status IN ('active', 'contested')
                    ORDER BY m.memory_id ASC`;
 
 const REVISIONS_SQL = `SELECT v.memory_id, v.revision_id, v.memory_version,
@@ -119,7 +121,8 @@ const REVISIONS_SQL = `SELECT v.memory_id, v.revision_id, v.memory_version,
                        JOIN memories m
                          ON m.project_id = v.project_id
                         AND m.memory_id = v.memory_id
-                       WHERE v.project_id = ?
+                        AND m.current_revision_id = v.revision_id
+                       WHERE v.project_id = ? AND m.status IN ('active', 'contested')
                        ORDER BY v.memory_id ASC, v.memory_version ASC,
                                 v.revision_id ASC`;
 
@@ -128,7 +131,11 @@ const EVIDENCE_SQL = `SELECT ve.revision_id, ve.evidence_id
                       JOIN memory_versions v
                         ON v.project_id = ve.project_id
                        AND v.revision_id = ve.revision_id
-                      WHERE ve.project_id = ?
+                      JOIN memories m
+                        ON m.project_id = v.project_id
+                       AND m.memory_id = v.memory_id
+                       AND m.current_revision_id = v.revision_id
+                      WHERE ve.project_id = ? AND m.status IN ('active', 'contested')
                       ORDER BY ve.revision_id ASC, ve.evidence_id ASC`;
 
 export async function publishProjectProjection<

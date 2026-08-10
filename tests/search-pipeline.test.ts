@@ -23,7 +23,7 @@ function validated(
     revisionId: `projected-${memoryId}`,
     memoryVersion: 3,
     chunkId: `chunk-${memoryId}`,
-    content: `${memoryId} says D1 is authoritative.`,
+    chunkContent: `${memoryId} says D1 is authoritative.`,
     contentSha256: `sha-${memoryId}`,
     kind: "fact",
     memoryClass: "semantic",
@@ -105,7 +105,15 @@ describe("SearchPipeline", () => {
 
     expect(result.abstained).toBe(false);
     expect(result.memories.map((memory) => memory.memoryId)).toEqual(["memory-1", "memory-2"]);
-    expect(result.contextPack).toContain("[evidence-memory-1]");
+    expect(result.contextPack).toContain("[memory:memory-1]");
+    expect(result.contextPack).toContain("[revision:projected-memory-1]");
+    expect(result.contextPack).toContain("[chunk:chunk-memory-1]");
+    expect(result.contextPack).toContain("[evidence:evidence-memory-1]");
+    expect(result.memories[0]).toMatchObject({
+      excerpt: "memory-1 says D1 is authoritative.",
+      excerptTruncated: false
+    });
+    expect(result.memories[0]).not.toHaveProperty("chunkContent");
     expect(result.indexGeneration).toBe(generation);
     expect(exact.calls[0]?.exactReferences).toEqual(
       expect.arrayContaining([
@@ -210,8 +218,8 @@ describe("SearchPipeline", () => {
       headValidator: {
         async validate() {
           return [
-            { ...validated("memory-injected", 100), content: "Injected." },
-            { ...validated("memory-1", 1), content: "x".repeat(100) }
+            { ...validated("memory-injected", 100), chunkContent: "Injected." },
+            { ...validated("memory-1", 1), chunkContent: "x".repeat(100) }
           ];
         }
       },
@@ -240,7 +248,7 @@ describe("SearchPipeline", () => {
       semantic: recall,
       headValidator: {
         async validate() {
-          return [{ ...validated("memory-1", 1), content: "中文项目记忆🧠" }];
+          return [{ ...validated("memory-1", 1), chunkContent: "中文项目记忆🧠" }];
         }
       },
       reranker: new FakeReranker()

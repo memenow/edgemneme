@@ -6,19 +6,23 @@ import {
   pendingGitHubSyncActivationGuardSql,
   type PendingGitHubSyncActivationFence
 } from "./sync-activation-fence";
+import {
+  buildGitHubBlobEvidenceId,
+  buildGitHubClearEvidenceLocator,
+  buildGitHubTombstoneEvidenceLocator,
+  type GitHubCandidateEvidenceIdentity
+} from "./candidate-evidence-identity";
+
+export {
+  buildGitHubBlobEvidenceId,
+  buildGitHubClearEvidenceLocator,
+  buildGitHubTombstoneEvidenceLocator
+} from "./candidate-evidence-identity";
 
 const MAX_BATCH_BYTES = 256 * 1024;
 const MAX_BATCH_ROWS = 100;
 
-export interface PersistableGitHubCandidate {
-  evidenceId: string;
-  locator: string;
-  repositoryId: string;
-  repositoryRef: string;
-  repositoryPath: string | null;
-  repositoryAuthority: "default_branch" | "tracked_ref";
-  excerptHash: string;
-  sensitivityStatus: "clear" | "tombstone";
+export interface PersistableGitHubCandidate extends GitHubCandidateEvidenceIdentity {
   observation?: {
     observationId: string;
     content: string;
@@ -39,63 +43,6 @@ interface CandidateTargetRow {
   repository_authority: "default_branch" | "tracked_ref";
   observed_sha: string;
   external_id: number;
-}
-
-export async function buildGitHubBlobEvidenceId(input: {
-  projectId: string;
-  repositoryId: string;
-  externalRepositoryId: number;
-  repositoryRef: string;
-  observedSha: string;
-  repositoryPath: string;
-  blobSha: string;
-}): Promise<string> {
-  return await sha256(
-    [
-      "github.blob.evidence",
-      input.projectId,
-      input.repositoryId,
-      String(input.externalRepositoryId),
-      input.repositoryRef,
-      input.observedSha,
-      input.repositoryPath,
-      input.blobSha
-    ].join("\n")
-  );
-}
-
-export async function buildGitHubClearEvidenceLocator(input: {
-  externalRepositoryId: number;
-  repositoryRef: string;
-  observedSha: string;
-  repositoryPath: string;
-}): Promise<string> {
-  const encodedPath = input.repositoryPath
-    .split("/")
-    .map(encodeURIComponent)
-    .join("/");
-  const refDigest = await sha256(
-    ["github.ref", input.repositoryRef].join("\n")
-  );
-  return (
-    `github://${input.externalRepositoryId}/${input.observedSha}/` +
-    `ref-sha256/${refDigest}/${encodedPath}`
-  );
-}
-
-export async function buildGitHubTombstoneEvidenceLocator(input: {
-  externalRepositoryId: number;
-  repositoryRef: string;
-  observedSha: string;
-  repositoryPath: string;
-}): Promise<string> {
-  const pathIdentityDigest = await sha256(
-    ["github.blob.path", input.repositoryRef, input.repositoryPath].join("\n")
-  );
-  return (
-    `github://${input.externalRepositoryId}/${input.observedSha}/path-sha256/` +
-    pathIdentityDigest
-  );
 }
 
 export async function prepareGitHubCandidateStatements(input: {
@@ -140,6 +87,7 @@ export async function prepareGitHubCandidateStatements(input: {
   const prepared = await Promise.all(
     input.candidates.map(async (candidate): Promise<PreparedCandidate> => {
       if (
+        !/^[0-9a-f]{64}$/u.test(candidate.evidenceId) ||
         candidate.repositoryId !== input.repositoryId ||
         candidate.repositoryRef !== input.repositoryRef ||
         candidate.repositoryAuthority !== target.repository_authority ||

@@ -8,6 +8,7 @@ import { z } from "zod";
 import { EdgeMnemeError, errorBody } from "../../src/contracts/errors";
 import { candidateIdentifierSchema } from "../../src/contracts/candidate-id";
 import type { MemoryEvent } from "../../src/gateway/service";
+import { markGitHubSyncPendingReview } from "../../src/github/sync-review-cursor";
 import { canonicalJson } from "../../src/security/canonical-json";
 import { sha256 } from "../../src/security/crypto";
 import {
@@ -48,16 +49,20 @@ import {
   reapExpiredSyntheticProjects
 } from "../../src/workflows/synthetic-cleanup";
 import { publishProjectProjection } from "../../src/projection/cloudflare";
+import { projectionScopeIndexKey } from "../../src/projection/markdown";
 import {
   publishMemorySearchProjection,
   SEARCH_VECTOR_CLEANUP_HOLDER_TIMEOUT
 } from "../../src/search/indexing";
 import { reapSearchVectorCleanupReceipts } from "../../src/search/vector-cleanup-janitor";
 import {
+  calculateProjectionRebuildSnapshotCapacity,
   calculateProjectionSnapshotCapacityAfterChange,
   checkProjectionSnapshotCapacity,
   readProjectionSnapshotAuthority,
   runProjectionRebuild,
+  type ProjectionRebuildSnapshotCapacity,
+  type ProjectionSnapshotAuthority,
   type ProjectionRebuildRequest
 } from "../../src/projection/rebuild";
 import {
@@ -91,6 +96,7 @@ interface WorkflowPayload {
   subjectId: string;
   observedSha?: string;
   ref?: string;
+  manifestId?: string;
   projectVersion?: number;
   projectionRebuild?: ProjectionRebuildRequest;
 }
@@ -123,6 +129,7 @@ const ORDINARY_WORKFLOW_KNOWN_NONTERMINAL_STATUSES = new Set([
   "waitingForPause",
   "paused"
 ]);
+const INVALIDATED_MEMORY_TOMBSTONE = "Memory invalidated.";
 
 interface Env {
   MEMORY_DB: D1Database;
@@ -422,32 +429,54 @@ function projectionCapacityExceeded(): EdgeMnemeError {
   );
 }
 
+function requireFormalProjectionScopeKey(input: {
+  projectId: string;
+  projectVersion: number;
+  scopeId: string;
+}): void {
+  try {
+    projectionScopeIndexKey(input.projectId, String(input.projectVersion), input.scopeId);
+  } catch (error) {
+    throw new EdgeMnemeError(
+      "VALIDATION_FAILED",
+      error instanceof Error
+        ? error.message
+        : "The formal memory scope cannot be represented as an R2 projection key."
+    );
+  }
+}
+
 async function requireFormalProjectionCapacity(input: {
   database: D1Database;
   projectId: string;
   expectedProjectVersion: number;
-  content: string;
-  addsMemory: boolean;
-  scopeId: string | null;
+  excludedMemoryId?: string;
+  projectedMemory: {
+    revisionCount: number;
+    contentBytes: number;
+    scopeId: string;
+  };
 }): Promise<void> {
   const authority = await readProjectionSnapshotAuthority(
     input.database.withSession("first-primary"),
     input.projectId,
     input.expectedProjectVersion,
-    input.scopeId
+    input.projectedMemory.scopeId,
+    input.excludedMemoryId ?? null
   );
   if (authority === null) {
     throw new EdgeMnemeError("VERSION_CONFLICT", "The expected version is stale.");
   }
-  if (authority.scope_exists !== 0 && authority.scope_exists !== 1) {
-    throw projectionCapacityExceeded();
-  }
   try {
+    requireProjectionSnapshotAuthority(
+      authority,
+      input.expectedProjectVersion
+    );
     const capacity = calculateProjectionSnapshotCapacityAfterChange(authority, {
-      memoryCount: input.addsMemory ? 1 : 0,
-      revisionCount: 1,
-      scopeCount: input.addsMemory && authority.scope_exists === 0 ? 1 : 0,
-      contentBytes: new TextEncoder().encode(input.content).byteLength
+      memoryCount: 1,
+      revisionCount: input.projectedMemory.revisionCount,
+      scopeCount: authority.scope_exists === 0 ? 1 : 0,
+      contentBytes: input.projectedMemory.contentBytes
     });
     if (!capacity.accepted) {
       throw projectionCapacityExceeded();
@@ -458,6 +487,80 @@ async function requireFormalProjectionCapacity(input: {
     }
     throw projectionCapacityExceeded();
   }
+}
+
+async function requireFormalProjectionInvalidationCapacity(input: {
+  database: D1Database;
+  projectId: string;
+  expectedProjectVersion: number;
+  targetMemoryId: string;
+  targetScopeId: string;
+}): Promise<void> {
+  const session = input.database.withSession("first-primary");
+  const before = await readProjectionSnapshotAuthority(
+    session,
+    input.projectId,
+    input.expectedProjectVersion,
+    input.targetScopeId
+  );
+  const after = await readProjectionSnapshotAuthority(
+    session,
+    input.projectId,
+    input.expectedProjectVersion,
+    input.targetScopeId,
+    input.targetMemoryId
+  );
+  if (before === null || after === null) {
+    throw new EdgeMnemeError("VERSION_CONFLICT", "The expected version is stale.");
+  }
+
+  try {
+    const beforeCapacity = requireProjectionSnapshotAuthority(
+      before,
+      input.expectedProjectVersion
+    );
+    const afterCapacity = requireProjectionSnapshotAuthority(
+      after,
+      input.expectedProjectVersion
+    );
+    const expectedAfterScopeCount =
+      before.scope_count - (after.scope_exists === 0 ? 1 : 0);
+    if (
+      before.scope_exists !== 1 ||
+      after.memory_count !== before.memory_count - 1 ||
+      after.revision_count !== before.revision_count - 1 ||
+      after.scope_count !== expectedAfterScopeCount ||
+      after.content_bytes > before.content_bytes ||
+      afterCapacity.writeCount >= beforeCapacity.writeCount ||
+      afterCapacity.estimatedSubrequests >= beforeCapacity.estimatedSubrequests
+    ) {
+      throw projectionCapacityExceeded();
+    }
+  } catch (error) {
+    if (error instanceof EdgeMnemeError) {
+      throw error;
+    }
+    throw projectionCapacityExceeded();
+  }
+}
+
+function requireProjectionSnapshotAuthority(
+  authority: ProjectionSnapshotAuthority,
+  expectedProjectVersion: number
+): ProjectionRebuildSnapshotCapacity {
+  if (
+    authority.project_version !== expectedProjectVersion ||
+    (authority.scope_exists !== 0 && authority.scope_exists !== 1) ||
+    (authority.scope_exists === 1 && authority.scope_count === 0)
+  ) {
+    throw projectionCapacityExceeded();
+  }
+  return calculateProjectionRebuildSnapshotCapacity({
+    memoryCount: authority.memory_count,
+    revisionCount: authority.revision_count,
+    scopeCount: authority.scope_count,
+    contentBytes: authority.content_bytes
+  });
 }
 
 export class ProjectCoordinator extends DurableObject<Env> {
@@ -553,6 +656,13 @@ export class ProjectCoordinator extends DurableObject<Env> {
       ) {
         throw new EdgeMnemeError("VERSION_CONFLICT", "The expected version is stale.");
       }
+      if (input.operation !== "invalidate") {
+        requireFormalProjectionScopeKey({
+          projectId: input.project_id,
+          projectVersion: input.expected_project_version + 1,
+          scopeId: targetRepositoryContext.scopeId
+        });
+      }
 
       const revision = await resolveMutationRevision(input, current, this.env.MEMORY_DB);
       if (!inspectMemoryModelInput(revision.content).accepted) {
@@ -561,14 +671,27 @@ export class ProjectCoordinator extends DurableObject<Env> {
           "The submitted data cannot be persisted safely."
         );
       }
-      await requireFormalProjectionCapacity({
-        database: this.env.MEMORY_DB,
-        projectId: input.project_id,
-        expectedProjectVersion: input.expected_project_version,
-        content: revision.content,
-        addsMemory: false,
-        scopeId: null
-      });
+      if (input.operation === "invalidate") {
+        await requireFormalProjectionInvalidationCapacity({
+          database: this.env.MEMORY_DB,
+          projectId: input.project_id,
+          expectedProjectVersion: input.expected_project_version,
+          targetMemoryId: input.target_memory_id,
+          targetScopeId: targetRepositoryContext.scopeId
+        });
+      } else {
+        await requireFormalProjectionCapacity({
+          database: this.env.MEMORY_DB,
+          projectId: input.project_id,
+          expectedProjectVersion: input.expected_project_version,
+          excludedMemoryId: input.target_memory_id,
+          projectedMemory: {
+            revisionCount: 1,
+            contentBytes: new TextEncoder().encode(revision.content).byteLength,
+            scopeId: targetRepositoryContext.scopeId
+          }
+        });
+      }
       const now = new Date().toISOString();
       const revisionId = crypto.randomUUID();
       const nextProjectVersion = input.expected_project_version + 1;
@@ -849,6 +972,11 @@ export class ProjectCoordinator extends DurableObject<Env> {
           "Approval requires safe content and a complete taxonomy proposal."
         );
       }
+      requireFormalProjectionScopeKey({
+        projectId: input.project_id,
+        projectVersion: nextProjectVersion,
+        scopeId
+      });
       const scopeOwnership = await resolveScopeRepositoryOwnership(
         this.env.MEMORY_DB,
         input.project_id,
@@ -959,9 +1087,11 @@ export class ProjectCoordinator extends DurableObject<Env> {
         database: this.env.MEMORY_DB,
         projectId: input.project_id,
         expectedProjectVersion: current.project_version,
-        content,
-        addsMemory: true,
-        scopeId
+        projectedMemory: {
+          revisionCount: 1,
+          contentBytes: new TextEncoder().encode(content).byteLength,
+          scopeId
+        }
       });
       plan = buildCandidatePromotionPlan({
         projectId: input.project_id,
@@ -1379,18 +1509,14 @@ export class MemoryWorkflow extends WorkflowEntrypoint<Env, WorkflowPayload> {
               event.payload.subjectId
             );
           } else if (event.payload.type === "github.sync.requested") {
-            await this.env.MEMORY_DB.prepare(
-              `UPDATE sync_cursors SET status = 'pending_review', updated_at = ?
-               WHERE project_id = ? AND repository_id = ? AND ref = ? AND observed_sha = ?`
-            )
-              .bind(
-                new Date().toISOString(),
-                event.payload.projectId,
-                event.payload.subjectId,
-                event.payload.ref ?? "",
-                event.payload.observedSha ?? ""
-              )
-              .run();
+            await markGitHubSyncPendingReview(this.env.MEMORY_DB, {
+              projectId: event.payload.projectId,
+              repositoryId: event.payload.subjectId,
+              ref: event.payload.ref ?? "",
+              observedSha: event.payload.observedSha ?? "",
+              manifestId: event.payload.manifestId ?? "",
+              updatedAt: new Date().toISOString()
+            });
           } else if (event.payload.type === "candidate.reviewed") {
             return null;
           } else if (
@@ -1498,7 +1624,11 @@ export default {
           type: event.type,
           subjectId,
           ...(event.type === "github.sync.requested"
-            ? { observedSha: event.observedSha, ref: event.ref }
+            ? {
+                observedSha: event.observedSha,
+                ref: event.ref,
+                manifestId: event.manifestId
+              }
             : {})
         });
         message.ack();
@@ -1977,6 +2107,7 @@ function parseOrdinaryWorkflowRequest(
   if (row.event_type === "github.sync.requested") {
     const observedSha = requireOrdinaryWorkflowSubject(payload.observedSha);
     const ref = requireOrdinaryWorkflowSubject(payload.ref);
+    const manifestId = requireOrdinaryWorkflowSubject(payload.manifestId);
     return {
       baseId: row.event_id,
       params: {
@@ -1984,7 +2115,8 @@ function parseOrdinaryWorkflowRequest(
         type: row.event_type,
         subjectId: requireOrdinaryWorkflowSubject(payload.repositoryId),
         observedSha,
-        ref
+        ref,
+        manifestId
       }
     };
   }
@@ -2603,7 +2735,7 @@ async function resolveMutationRevision(
   }
   if (input.operation === "invalidate") {
     return {
-      content: current.content,
+      content: INVALIDATED_MEMORY_TOMBSTONE,
       validFrom: current.valid_from,
       validUntil: current.valid_until
     };

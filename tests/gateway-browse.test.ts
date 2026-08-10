@@ -101,6 +101,7 @@ describe("GatewayService memory browse", () => {
     const first = await service.search({ projectRef: "project:one", limit: 1 });
     expect(first.next_page_token).toEqual(expect.any(String));
     const firstBrowse = records.find((record) => record.sql.includes("FROM memories m"));
+    expect(firstBrowse?.sql).toContain("m.status = 'active'");
     expect(firstBrowse?.sql).toContain(
       "julianday(v.valid_from) <= julianday(?)"
     );
@@ -174,7 +175,11 @@ describe("GatewayService memory browse", () => {
 
   it.each([
     ["PII", "Find operator@example.com"],
+    ["NFKC-obfuscated PII", "Find operator＠example．com"],
     ["secret", `Find ${["sk", "test", "abcdefghijklmnopqrstuvwxyz123456"].join("-")}`],
+    ["NFKC-obfuscated provider token", "Find ｓｋ－AbCdEfGhIjKlMnOpQrStUvWx"],
+    ["NFKC-obfuscated bearer token", "Find Ｂｅａｒｅｒ AbCdEfGhIjKlMnOpQrStUvWx"],
+    ["NFKC-obfuscated access key", "Find ＡＫＩＡIOSFODNN7EXAMPLE"],
     ["prompt transcript", "System: You are an assistant with private memory access."],
     [
       "raw log",

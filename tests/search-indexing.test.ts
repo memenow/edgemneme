@@ -1,8 +1,8 @@
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
+import { chunkMemoryContent } from "../src/search/chunking";
 import {
-  chunkMemoryContent,
   deleteMemorySearchProjection,
   deriveMemorySearchVectorId,
   parseQwenEmbedding,

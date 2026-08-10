@@ -268,9 +268,16 @@ export function vectorIdsFromProjectionRows(projectId, rows) {
     const generationId = requireRowIdentifier(row, "generation_id");
     const revisionId = requireRowIdentifier(row, "revision_id");
     const chunkId = requireRowIdentifier(row, "chunk_id");
-    return createHash("sha256")
+    if (row.project_id !== undefined && row.project_id !== projectId) {
+      throw new Error("The synthetic projection row crossed its project boundary.");
+    }
+    const vectorId = createHash("sha256")
       .update(`${generationId}\n${projectId}\n${revisionId}\n${chunkId}`)
       .digest("hex");
+    if (row.vector_id !== undefined && row.vector_id !== vectorId) {
+      throw new Error("The synthetic projection row has an invalid vector ID.");
+    }
+    return vectorId;
   });
 }
 
@@ -436,7 +443,9 @@ export async function executeSyntheticCleanup(steps) {
   await steps.waitForQuiescence();
   const ledger = steps.loadLedger() ?? steps.createLedger();
   steps.writeLedger(ledger);
-  await steps.deleteSearchProjection(ledger);
+  await steps.deleteSearchVectors(ledger);
+  await steps.verifySearchVectors(ledger);
+  await steps.deleteSearchState(ledger);
   await steps.deleteR2Projections(ledger);
   await steps.verifyProjectionCleanup(ledger);
   await steps.deleteAuthority();

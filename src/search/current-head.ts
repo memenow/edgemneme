@@ -4,7 +4,9 @@ import {
   MEMORY_SCOPES,
   MEMORY_STATUSES
 } from "../contracts/taxonomy";
+import { MEMORY_MODEL_INPUT_MAX_BYTES } from "../quality/sensitive-content";
 import { hierarchicalMemoryAccessPredicate } from "../security/auth";
+import { selectAuthoritativeMemoryChunk } from "./chunking";
 import type {
   CurrentHeadValidator,
   FusedRecallHit,
@@ -344,12 +346,17 @@ function validateCurrentHeads(
     }
     const common = validateCurrentHeadRow(row);
     for (const candidate of matching) {
+      const { authoritativeContent, ...attributes } = common;
       validated.push({
-        ...common,
+        ...attributes,
         projectId: input.projectId,
         memoryId,
         revisionId,
         chunkId: candidate.chunkId,
+        chunkContent: selectAuthoritativeMemoryChunk(
+          authoritativeContent,
+          candidate.chunkId
+        ),
         retrievalScore: candidate.retrievalScore,
         indexGeneration: input.filters.indexGeneration
       });
@@ -366,9 +373,10 @@ function validateCurrentHeadRow(
   | "memoryId"
   | "revisionId"
   | "chunkId"
+  | "chunkContent"
   | "retrievalScore"
   | "indexGeneration"
-> {
+> & { authoritativeContent: string } {
   if (!Number.isSafeInteger(row.memory_version) || row.memory_version < 1) {
     throw new Error("A current-head row contained an invalid memory version.");
   }
@@ -389,7 +397,7 @@ function validateCurrentHeadRow(
   ].sort();
   return {
     memoryVersion: row.memory_version,
-    content: requireIdentifier(row.content, "memory content"),
+    authoritativeContent: requireFormalMemoryContent(row.content),
     contentSha256: requireIdentifier(row.content_sha256, "content checksum"),
     kind,
     memoryClass,
@@ -435,6 +443,16 @@ function pairKey(memoryId: string, revisionId: string): string {
 function requireIdentifier(value: unknown, label: string): string {
   if (typeof value !== "string" || value.trim() === "" || value.length > 65_536) {
     throw new TypeError(`The ${label} must be a non-empty string.`);
+  }
+  return value;
+}
+
+function requireFormalMemoryContent(value: unknown): string {
+  if (typeof value !== "string" || value.length === 0 || value.includes("\0")) {
+    throw new TypeError("The memory content must be a non-empty string without null bytes.");
+  }
+  if (new TextEncoder().encode(value).byteLength > MEMORY_MODEL_INPUT_MAX_BYTES) {
+    throw new TypeError("The memory content exceeds the 16 KiB formal-memory limit.");
   }
   return value;
 }

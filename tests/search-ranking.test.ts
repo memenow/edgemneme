@@ -20,7 +20,7 @@ function candidate(
     revisionId: `revision-${memoryId}`,
     memoryVersion: 1,
     chunkId: `chunk-${memoryId}`,
-    content,
+    chunkContent: content,
     contentSha256: `sha-${memoryId}`,
     kind: "fact",
     memoryClass: "semantic",

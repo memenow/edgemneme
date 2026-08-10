@@ -164,13 +164,17 @@ export class SearchPipeline {
       if (memories.length === resultLimit) {
         break;
       }
-      const memory = withoutEmbedding(item.candidate, item.relevance);
-      const estimatedTokens = estimateTokens(renderContextEntry(memory));
-      if (consumedTokens + estimatedTokens > tokenBudget) {
+      const separatorTokens = memories.length === 0 ? 0 : estimateTokens("\n\n");
+      const budgeted = fitMemoryToContextBudget(
+        item.candidate,
+        item.relevance,
+        tokenBudget - consumedTokens - separatorTokens
+      );
+      if (budgeted === null) {
         continue;
       }
-      memories.push(memory);
-      consumedTokens += estimatedTokens;
+      memories.push(budgeted.memory);
+      consumedTokens += separatorTokens + budgeted.estimatedTokens;
     }
     if (memories.length === 0) {
       return abstain(input, "CONTEXT_BUDGET_EXCEEDED");
@@ -205,8 +209,67 @@ function buildContextPack(memories: readonly SearchResultMemory[]): string {
 }
 
 function renderContextEntry(memory: SearchResultMemory): string {
-  const citations = memory.evidenceIds.map((evidenceId) => `[${evidenceId}]`).join(" ");
-  return `${citations} ${memory.content}`;
+  return `${renderContextCitation(memory)} ${memory.excerpt}`;
+}
+
+function renderContextCitation(memory: {
+  memoryId: string;
+  revisionId: string;
+  chunkId: string;
+  evidenceIds: readonly string[];
+}): string {
+  const evidenceCitations = memory.evidenceIds
+    .map((evidenceId) => `[evidence:${evidenceId}]`)
+    .join(" ");
+  return (
+    `[memory:${memory.memoryId}] ` +
+    `[revision:${memory.revisionId}] ` +
+    `[chunk:${memory.chunkId}] ` +
+    evidenceCitations
+  );
+}
+
+function fitMemoryToContextBudget(
+  candidate: ValidatedSearchCandidate,
+  relevance: number,
+  tokenBudget: number
+): { memory: SearchResultMemory; estimatedTokens: number } | null {
+  const citationPrefix = `${renderContextCitation(candidate)} `;
+  const excerptBudget = tokenBudget - estimateTokens(citationPrefix);
+  if (excerptBudget < 1) {
+    return null;
+  }
+  const excerpt = truncateToTokenBudget(candidate.chunkContent, excerptBudget);
+  if (excerpt === "") {
+    return null;
+  }
+  const memory = withoutEmbedding(
+    candidate,
+    excerpt,
+    excerpt !== candidate.chunkContent,
+    relevance
+  );
+  const estimatedTokens = estimateTokens(renderContextEntry(memory));
+  return estimatedTokens <= tokenBudget ? { memory, estimatedTokens } : null;
+}
+
+function truncateToTokenBudget(content: string, tokenBudget: number): string {
+  if (estimateTokens(content) <= tokenBudget) {
+    return content;
+  }
+  const codePoints = [...content];
+  let lower = 0;
+  let upper = codePoints.length;
+  while (lower < upper) {
+    const midpoint = Math.ceil((lower + upper) / 2);
+    const candidate = codePoints.slice(0, midpoint).join("");
+    if (estimateTokens(candidate) <= tokenBudget) {
+      lower = midpoint;
+    } else {
+      upper = midpoint - 1;
+    }
+  }
+  return codePoints.slice(0, lower).join("");
 }
 
 function estimateTokens(content: string): number {
@@ -294,8 +357,14 @@ function candidateIdentity(candidate: {
 
 function withoutEmbedding(
   candidate: ValidatedSearchCandidate,
+  excerpt: string,
+  excerptTruncated: boolean,
   relevance: number
 ): SearchResultMemory {
-  const { embedding: _embedding, ...publicCandidate } = candidate;
-  return { ...publicCandidate, relevance };
+  const {
+    embedding: _embedding,
+    chunkContent: _chunkContent,
+    ...publicCandidate
+  } = candidate;
+  return { ...publicCandidate, excerpt, excerptTruncated, relevance };
 }

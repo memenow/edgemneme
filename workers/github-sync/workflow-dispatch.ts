@@ -1,14 +1,11 @@
 import type { WorkflowStep } from "cloudflare:workers";
-import {
-  GitHubReadOnlyClient,
-  GitHubSyncError
-} from "../../src/github/client";
+import { GitHubReadOnlyClient, GitHubSyncError } from "../../src/github/client";
 import {
   chunkWorkflowBatch,
   GITHUB_SYNC_SLOT_MS,
-  githubDispatchIdentity,
-  githubRefWorkflowIdentity
+  githubDispatchIdentity
 } from "../../src/github/sync-scheduling";
+import { sha256 } from "../../src/security/crypto";
 import {
   completeGitHubDispatchMaterialization,
   establishGitHubDispatch,
@@ -21,18 +18,16 @@ import {
 import {
   MAX_GITHUB_ACCESS_BASELINE_REQUESTS,
   enforceApprovedAccessBaseline,
-  materializeAndSelectScheduledRefs,
+  materializeAndSelectScheduledRefsGuarded,
   parseTrackedRefs,
   recordInvalidCredentialObservation,
   recordSyncFailure,
-  requiresFullReconciliation,
   type ActiveGitHubSyncEnv,
   type ConfiguredRefRow,
   type Env,
   type GitHubDispatchWorkflowPayload,
   type GitHubRefSyncWorkflowPayload,
-  type RepositoryRow,
-  type ScheduledRefRow
+  type RepositoryRow
 } from "./index";
 import {
   LANE_LEASE_SAFETY_MARGIN_MS,
@@ -42,30 +37,86 @@ import {
   activeWorkflowEnv,
   createDurableWorkflowRequestPacer,
   failDispatchWorkflow,
-  reconcilePriorDispatchState,
+  reconcilePriorDispatchStateWithUsage,
   workflowSyncError,
   type SerializedSyncAttempt
 } from "./workflow-runtime";
+import {
+  GITHUB_DISPATCH_LANE_MAX_ATTEMPTS,
+  MATERIALIZATION_BATCH_SIZE,
+  MAX_REPOSITORY_ADMISSION_SUMMARY_PAGES,
+  REPOSITORY_ID_PAGE_SIZE,
+  REPOSITORY_SNAPSHOT_PAGE_SIZE,
+  assertGitHubDispatchAdmission,
+  assertGitHubDispatchStepResult,
+  type GitHubDispatchAdmissionInventory
+} from "./workflow-dispatch-admission";
+import { persistDispatchItems } from "./workflow-dispatch-item-persistence";
+
+export {
+  GITHUB_DISPATCH_LANE_MAX_ATTEMPTS,
+  GITHUB_DISPATCH_STEP_RESULT_LIMIT_BYTES,
+  GITHUB_DISPATCH_STEP_RESULT_RESERVE_BYTES,
+  GITHUB_DISPATCH_SUBREQUEST_LIMIT,
+  GITHUB_DISPATCH_SUBREQUEST_RESERVE,
+  GITHUB_DISPATCH_WORKFLOW_STEP_LIMIT,
+  GITHUB_DISPATCH_WORKFLOW_STEP_RESERVE,
+  assertGitHubDispatchStepResult,
+  estimateGitHubDispatchAdmission
+} from "./workflow-dispatch-admission";
+export type {
+  GitHubDispatchAdmissionEstimate,
+  GitHubDispatchAdmissionInventory
+} from "./workflow-dispatch-admission";
+export { persistDispatchItems } from "./workflow-dispatch-item-persistence";
 
 const DISPATCH_EXECUTION_BUDGET_MS = 12 * 60 * 1_000;
-const REPOSITORY_ID_PAGE_SIZE = 16;
-const REPOSITORY_PROCESS_PAGE_SIZE = 16;
-const REPOSITORY_FAILURE_PAGE_SIZE = 1;
 
-interface PersistedDispatchItem {
-  itemId: string;
-  workflowInstanceId: string;
-  selected: ScheduledRefRow;
-  fullReconciliation: boolean;
-}
 interface RepositoryPageCursor {
   afterProjectId: string;
   afterRepositoryId: string;
   hasMore: boolean;
 }
 
-interface EligibleRepositoryIdPage extends RepositoryPageCursor {
+interface RepositoryAdmissionSummaryPage extends RepositoryPageCursor {
   repositoryIds: number[];
+  repositoryFingerprints: string[];
+  enabledRepositoryRows: number;
+  validRepositoryRows: number;
+  invalidRepositoryRows: number;
+  parsedRefCount: number;
+  materializationBatchCount: number;
+}
+
+type RepositoryAdmissionSnapshot =
+  | {
+      valid: true;
+      fingerprint: string;
+      externalRepositoryId: number;
+      projectId: string;
+      repositoryId: string;
+      refs: string[];
+    }
+  | {
+      valid: false;
+      fingerprint: string;
+      projectId: string;
+      repositoryId: string;
+    };
+
+interface RepositoryAdmissionSnapshotPage extends RepositoryPageCursor {
+  snapshot: RepositoryAdmissionSnapshot | null;
+}
+
+interface CollectedAdmissionSummary {
+  inventory: GitHubDispatchAdmissionInventory;
+  repositoryFingerprints: string[];
+}
+
+interface CollectedAdmissionSnapshots {
+  inventory: GitHubDispatchAdmissionInventory;
+  allowedRepositoryIds: Set<number>;
+  snapshots: RepositoryAdmissionSnapshot[];
 }
 
 async function loadRepositoryPage(
@@ -92,23 +143,14 @@ async function loadRepositoryPage(
   return rows.results;
 }
 
-async function configuredRefsForRepository(
-  database: D1Database,
-  repository: RepositoryRow,
-  scheduledTime: number
-): Promise<ConfiguredRefRow[] | null> {
+function configuredRefsForRepository(
+  repository: RepositoryRow
+): ConfiguredRefRow[] | null {
   if (
     !Number.isSafeInteger(repository.expected_owner_external_id) ||
     (repository.expected_owner_external_id ?? 0) <= 0 ||
     repository.default_branch === null
   ) {
-    await recordSyncFailure(
-      database,
-      repository,
-      "refs/heads/unknown",
-      new GitHubSyncError("GITHUB_REPOSITORY_UNAVAILABLE"),
-      scheduledTime
-    );
     return null;
   }
   try {
@@ -120,26 +162,35 @@ async function configuredRefsForRepository(
       repository_id: repository.repository_id,
       ref
     }));
-  } catch (error) {
-    await recordSyncFailure(
-      database,
-      repository,
-      "refs/heads/unknown",
-      error instanceof GitHubSyncError
-        ? error
-        : new GitHubSyncError("GITHUB_REPOSITORY_UNAVAILABLE"),
-      scheduledTime
-    );
+  } catch {
     return null;
   }
 }
 
-async function loadEligibleRepositoryIdPage(
+async function repositoryFingerprint(
+  repository: RepositoryRow
+): Promise<string> {
+  return sha256(JSON.stringify(
+    [
+      repository.project_id,
+      repository.repository_id,
+      repository.external_id,
+      repository.expected_owner_external_id,
+      repository.owner,
+      repository.name,
+      repository.default_branch,
+      repository.tracked_refs_json,
+      repository.repository_configuration_version,
+      repository.repository_updated_at
+    ]
+  ));
+}
+
+async function loadRepositoryAdmissionSummaryPage(
   database: D1Database,
-  scheduledTime: number,
   afterProjectId: string,
   afterRepositoryId: string
-): Promise<EligibleRepositoryIdPage> {
+): Promise<RepositoryAdmissionSummaryPage> {
   const repositories = await loadRepositoryPage(
     database,
     afterProjectId,
@@ -147,139 +198,343 @@ async function loadEligibleRepositoryIdPage(
     REPOSITORY_ID_PAGE_SIZE
   );
   const repositoryIds: number[] = [];
+  const repositoryFingerprints: string[] = [];
+  let validRepositoryRows = 0;
+  let invalidRepositoryRows = 0;
+  let parsedRefCount = 0;
+  let materializationBatchCount = 0;
   for (const repository of repositories) {
-    const refs = await configuredRefsForRepository(
-      database,
-      repository,
-      scheduledTime
-    );
+    repositoryFingerprints.push(await repositoryFingerprint(repository));
+    const refs = configuredRefsForRepository(repository);
     if (refs !== null) {
       repositoryIds.push(repository.external_id);
+      validRepositoryRows += 1;
+      parsedRefCount += refs.length;
+      materializationBatchCount += Math.ceil(
+        refs.length / MATERIALIZATION_BATCH_SIZE
+      );
+    } else {
+      invalidRepositoryRows += 1;
     }
   }
   const last = repositories.at(-1);
-  return {
+  const result = {
     repositoryIds,
+    repositoryFingerprints,
+    enabledRepositoryRows: repositories.length,
+    validRepositoryRows,
+    invalidRepositoryRows,
+    parsedRefCount,
+    materializationBatchCount,
     afterProjectId: last?.project_id ?? afterProjectId,
     afterRepositoryId: last?.repository_id ?? afterRepositoryId,
     hasMore: repositories.length === REPOSITORY_ID_PAGE_SIZE
   };
+  assertGitHubDispatchStepResult(result);
+  return result;
 }
 
-async function processRepositoryPage(
-  database: D1Database,
-  payload: GitHubDispatchWorkflowPayload,
-  allowedRepositoryIds: ReadonlySet<number>,
-  afterProjectId: string,
-  afterRepositoryId: string,
-  baselineError: GitHubSyncError | null
-): Promise<RepositoryPageCursor> {
-  const scheduledTime = Date.parse(payload.scheduledFor);
-  const repositories = await loadRepositoryPage(
-    database,
-    afterProjectId,
-    afterRepositoryId,
-    baselineError === null
-      ? REPOSITORY_PROCESS_PAGE_SIZE
-      : REPOSITORY_FAILURE_PAGE_SIZE
-  );
-  for (const repository of repositories) {
-    if (!allowedRepositoryIds.has(repository.external_id)) continue;
-    const configuredRefs = await configuredRefsForRepository(
-      database,
-      repository,
-      scheduledTime
-    );
-    if (configuredRefs === null) continue;
-    for (const configuredBatch of chunkWorkflowBatch(configuredRefs, 100)) {
-      const selected = await materializeAndSelectScheduledRefs(
-        database,
-        configuredBatch,
-        scheduledTime
-      );
-      if (baselineError === null) {
-        await persistDispatchItems(database, payload, selected);
-        continue;
-      }
-      for (const ref of selected) {
-        await recordSyncFailure(
-          database,
-          ref,
-          ref.ref,
-          baselineError,
-          scheduledTime,
-          "active",
-          ref
-        );
-      }
-    }
-  }
-  const last = repositories.at(-1);
-  return {
-    afterProjectId: last?.project_id ?? afterProjectId,
-    afterRepositoryId: last?.repository_id ?? afterRepositoryId,
-    hasMore: repositories.length === (
-      baselineError === null
-        ? REPOSITORY_PROCESS_PAGE_SIZE
-        : REPOSITORY_FAILURE_PAGE_SIZE
-    )
-  };
-}
-
-async function collectEligibleRepositoryIds(
+async function collectRepositoryAdmissionSummary(
   step: WorkflowStep,
-  database: D1Database,
-  scheduledTime: number
-): Promise<Set<number>> {
-  const repositoryIds = new Set<number>();
+  database: D1Database
+): Promise<CollectedAdmissionSummary> {
+  const allowedRepositoryIds = new Set<number>();
+  const repositoryFingerprints: string[] = [];
+  let enabledRepositoryRows = 0;
+  let validRepositoryRows = 0;
+  let invalidRepositoryRows = 0;
+  let parsedRefCount = 0;
+  let materializationBatchCount = 0;
   let afterProjectId = "";
   let afterRepositoryId = "";
+  let summaryPageCount = 0;
   for (let page = 0; ; page += 1) {
+    if (page >= MAX_REPOSITORY_ADMISSION_SUMMARY_PAGES) {
+      throw new GitHubSyncError("GITHUB_PARTIAL_SYNC");
+    }
     const result = await step.do(
-      `load eligible GitHub repository ids ${page + 1}`,
+      `summarize GitHub repository admission page ${page + 1}`,
       STEP_RETRY,
-      () => loadEligibleRepositoryIdPage(
+      () => loadRepositoryAdmissionSummaryPage(
         database,
-        scheduledTime,
         afterProjectId,
         afterRepositoryId
       )
     );
+    summaryPageCount += 1;
     for (const repositoryId of result.repositoryIds) {
-      repositoryIds.add(repositoryId);
+      allowedRepositoryIds.add(repositoryId);
+    }
+    repositoryFingerprints.push(...result.repositoryFingerprints);
+    enabledRepositoryRows += result.enabledRepositoryRows;
+    validRepositoryRows += result.validRepositoryRows;
+    invalidRepositoryRows += result.invalidRepositoryRows;
+    parsedRefCount += result.parsedRefCount;
+    materializationBatchCount += result.materializationBatchCount;
+    afterProjectId = result.afterProjectId;
+    afterRepositoryId = result.afterRepositoryId;
+    if (!result.hasMore) break;
+  }
+  return {
+    inventory: {
+      enabledRepositoryRows,
+      validRepositoryRows,
+      invalidRepositoryRows,
+      parsedRefCount,
+      materializationBatchCount,
+      uniqueExternalRepositoryIds: allowedRepositoryIds.size,
+      summaryPageCount,
+      snapshotPageCount: enabledRepositoryRows + 1
+    },
+    repositoryFingerprints
+  };
+}
+
+async function loadRepositoryAdmissionSnapshotPage(
+  database: D1Database,
+  afterProjectId: string,
+  afterRepositoryId: string
+): Promise<RepositoryAdmissionSnapshotPage> {
+  const repositories = await loadRepositoryPage(
+    database,
+    afterProjectId,
+    afterRepositoryId,
+    REPOSITORY_SNAPSHOT_PAGE_SIZE
+  );
+  const repository = repositories[0];
+  const fingerprint = repository === undefined
+    ? null
+    : await repositoryFingerprint(repository);
+  const configuredRefs = repository === undefined
+    ? null
+    : configuredRefsForRepository(repository);
+  const snapshot: RepositoryAdmissionSnapshot | null =
+    repository === undefined || fingerprint === null
+      ? null
+      : configuredRefs === null
+        ? {
+            valid: false,
+            fingerprint,
+            projectId: repository.project_id,
+            repositoryId: repository.repository_id
+          }
+        : {
+            valid: true,
+            fingerprint,
+            externalRepositoryId: repository.external_id,
+            projectId: repository.project_id,
+            repositoryId: repository.repository_id,
+            refs: configuredRefs.map((configured) => configured.ref)
+          };
+  const last = repositories.at(-1);
+  const result = {
+    snapshot,
+    afterProjectId: last?.project_id ?? afterProjectId,
+    afterRepositoryId: last?.repository_id ?? afterRepositoryId,
+    hasMore: repositories.length === REPOSITORY_SNAPSHOT_PAGE_SIZE
+  };
+  assertGitHubDispatchStepResult(result);
+  return result;
+}
+
+function inventoriesMatch(
+  left: GitHubDispatchAdmissionInventory,
+  right: GitHubDispatchAdmissionInventory
+): boolean {
+  return Object.keys(left).every((key) =>
+    left[key as keyof GitHubDispatchAdmissionInventory] ===
+      right[key as keyof GitHubDispatchAdmissionInventory]
+  );
+}
+
+async function collectRepositoryAdmissionSnapshots(
+  step: WorkflowStep,
+  database: D1Database,
+  summary: CollectedAdmissionSummary
+): Promise<CollectedAdmissionSnapshots> {
+  const snapshots: RepositoryAdmissionSnapshot[] = [];
+  const allowedRepositoryIds = new Set<number>();
+  const repositoryFingerprints: string[] = [];
+  let validRepositoryRows = 0;
+  let invalidRepositoryRows = 0;
+  let parsedRefCount = 0;
+  let materializationBatchCount = 0;
+  let afterProjectId = "";
+  let afterRepositoryId = "";
+  let snapshotPageCount = 0;
+  for (let page = 0; ; page += 1) {
+    if (page >= summary.inventory.snapshotPageCount) {
+      throw new GitHubSyncError("GITHUB_RECONCILIATION_REQUIRED");
+    }
+    const result = await step.do(
+      `snapshot GitHub repository admission row ${page + 1}`,
+      STEP_RETRY,
+      () => loadRepositoryAdmissionSnapshotPage(
+        database,
+        afterProjectId,
+        afterRepositoryId
+      )
+    );
+    snapshotPageCount += 1;
+    if (result.snapshot !== null) {
+      snapshots.push(result.snapshot);
+      repositoryFingerprints.push(result.snapshot.fingerprint);
+      if (result.snapshot.valid) {
+        validRepositoryRows += 1;
+        allowedRepositoryIds.add(result.snapshot.externalRepositoryId);
+        parsedRefCount += result.snapshot.refs.length;
+        materializationBatchCount += Math.ceil(
+          result.snapshot.refs.length / MATERIALIZATION_BATCH_SIZE
+        );
+      } else {
+        invalidRepositoryRows += 1;
+      }
     }
     afterProjectId = result.afterProjectId;
     afterRepositoryId = result.afterRepositoryId;
     if (!result.hasMore) break;
   }
-  return repositoryIds;
+  const inventory: GitHubDispatchAdmissionInventory = {
+    enabledRepositoryRows: snapshots.length,
+    validRepositoryRows,
+    invalidRepositoryRows,
+    parsedRefCount,
+    materializationBatchCount,
+    uniqueExternalRepositoryIds: allowedRepositoryIds.size,
+    summaryPageCount: summary.inventory.summaryPageCount,
+    snapshotPageCount
+  };
+  if (
+    !inventoriesMatch(summary.inventory, inventory) ||
+    repositoryFingerprints.length !== summary.repositoryFingerprints.length ||
+    repositoryFingerprints.some(
+      (fingerprint, index) =>
+        fingerprint !== summary.repositoryFingerprints[index]
+    )
+  ) {
+    throw new GitHubSyncError("GITHUB_RECONCILIATION_REQUIRED");
+  }
+  return { inventory, allowedRepositoryIds, snapshots };
 }
 
-async function processEligibleRepositories(
+async function loadRepositoryByIdentity(
+  database: D1Database,
+  projectId: string,
+  repositoryId: string
+): Promise<RepositoryRow | null> {
+  return database.withSession("first-primary").prepare(
+    `SELECT repository_id, project_id, external_id, expected_owner_external_id,
+            owner, name, default_branch, tracked_refs_json,
+            github_sync_configuration_version AS repository_configuration_version,
+            updated_at AS repository_updated_at
+     FROM repositories
+     WHERE project_id = ? AND repository_id = ?
+       AND lower(provider) = 'github' AND sync_enabled = 1`
+  ).bind(projectId, repositoryId).first<RepositoryRow>();
+}
+
+async function processRepositoryAdmissionSnapshot(
+  database: D1Database,
+  payload: GitHubDispatchWorkflowPayload,
+  snapshot: RepositoryAdmissionSnapshot,
+  baselineError: GitHubSyncError | null
+): Promise<void> {
+  const scheduledTime = Date.parse(payload.scheduledFor);
+  if (!snapshot.valid) {
+    const repository = await loadRepositoryByIdentity(
+      database,
+      snapshot.projectId,
+      snapshot.repositoryId
+    );
+    if (
+      repository !== null &&
+      await repositoryFingerprint(repository) === snapshot.fingerprint &&
+      configuredRefsForRepository(repository) === null
+    ) {
+      await recordSyncFailure(
+        database,
+        repository,
+        "refs/heads/unknown",
+        new GitHubSyncError("GITHUB_REPOSITORY_UNAVAILABLE"),
+        scheduledTime
+      );
+    }
+    return;
+  }
+  const repository = await loadRepositoryByIdentity(
+    database,
+    snapshot.projectId,
+    snapshot.repositoryId
+  );
+  if (
+    repository === null ||
+    await repositoryFingerprint(repository) !== snapshot.fingerprint
+  ) {
+    throw new GitHubSyncError("GITHUB_RECONCILIATION_REQUIRED");
+  }
+  const configuredRefs = snapshot.refs.map((ref) => ({
+    project_id: snapshot.projectId,
+    repository_id: snapshot.repositoryId,
+    ref
+  }));
+  for (const configuredBatch of chunkWorkflowBatch(
+    configuredRefs,
+    MATERIALIZATION_BATCH_SIZE
+  )) {
+    const selected = await materializeAndSelectScheduledRefsGuarded(
+      database,
+      configuredBatch,
+      repository,
+      scheduledTime
+    );
+    for (const ref of selected) {
+      if (await repositoryFingerprint(ref) !== snapshot.fingerprint) {
+        throw new GitHubSyncError("GITHUB_RECONCILIATION_REQUIRED");
+      }
+    }
+    if (baselineError === null) {
+      await persistDispatchItems(database, payload, selected);
+      continue;
+    }
+    for (const ref of selected) {
+      await recordSyncFailure(
+        database,
+        ref,
+        ref.ref,
+        baselineError,
+        scheduledTime,
+        "active",
+        ref
+      );
+    }
+  }
+}
+
+async function processRepositoryAdmissionSnapshots(
   step: WorkflowStep,
   database: D1Database,
   payload: GitHubDispatchWorkflowPayload,
-  allowedRepositoryIds: ReadonlySet<number>,
+  snapshots: RepositoryAdmissionSnapshot[],
   baselineError: GitHubSyncError | null
 ): Promise<void> {
-  let afterProjectId = "";
-  let afterRepositoryId = "";
-  for (let page = 0; ; page += 1) {
-    const result = await step.do(
-      `${baselineError === null ? "materialize" : "record baseline failure for"} GitHub repository page ${page + 1}`,
+  for (let index = 0; index < snapshots.length; index += 1) {
+    const snapshot = snapshots[index];
+    if (snapshot === undefined) {
+      throw new GitHubSyncError("GITHUB_RECONCILIATION_REQUIRED");
+    }
+    const action = baselineError === null
+      ? "materialize"
+      : "record baseline failure for";
+    await step.do(
+      `${action} GitHub repository ${index + 1}`,
       STEP_RETRY,
-      () => processRepositoryPage(
+      () => processRepositoryAdmissionSnapshot(
         database,
         payload,
-        allowedRepositoryIds,
-        afterProjectId,
-        afterRepositoryId,
+        snapshot,
         baselineError
       )
     );
-    afterProjectId = result.afterProjectId;
-    afterRepositoryId = result.afterRepositoryId;
-    if (!result.hasMore) break;
   }
 }
 
@@ -375,114 +630,6 @@ async function verifyApprovedAccessBaseline(
   }
 }
 
-async function persistDispatchItems(
-  database: D1Database,
-  payload: GitHubDispatchWorkflowPayload,
-  selectedRefs: ScheduledRefRow[]
-): Promise<number> {
-  const items: PersistedDispatchItem[] = [];
-  for (const selected of selectedRefs) {
-    const fullReconciliation = requiresFullReconciliation(
-      Date.parse(payload.scheduledFor),
-      selected.last_sync_at
-    );
-    const identity = await githubRefWorkflowIdentity({
-      dispatchId: payload.dispatchId,
-      projectId: selected.project_id,
-      repositoryId: selected.repository_id,
-      ref: selected.ref,
-      scheduledFor: payload.scheduledFor,
-      fullReconciliation
-    });
-    items.push({
-      itemId: identity.itemId,
-      workflowInstanceId: identity.instanceId,
-      selected,
-      fullReconciliation
-    });
-  }
-  const session = database.withSession("first-primary");
-  for (const batch of chunkWorkflowBatch(items, 100)) {
-    const serialized = JSON.stringify(
-      batch.map((item) => ({
-        item_id: item.itemId,
-        dispatch_id: payload.dispatchId,
-        project_id: item.selected.project_id,
-        repository_id: item.selected.repository_id,
-        ref: item.selected.ref,
-        scheduled_for: payload.scheduledFor,
-        full_reconciliation: item.fullReconciliation ? 1 : 0,
-        repository_configuration_version:
-          item.selected.repository_configuration_version,
-        cursor_version: item.selected.cursor_version,
-        selected_head_manifest_id: item.selected.selected_head_manifest_id,
-        selected_head_version: item.selected.selected_head_version,
-        repository_updated_at: item.selected.repository_updated_at,
-        cursor_status: item.selected.cursor_status,
-        cursor_updated_at: item.selected.cursor_updated_at,
-        workflow_instance_id: item.workflowInstanceId,
-        created_at: payload.scheduledFor
-      }))
-    );
-    await session.prepare(
-      `INSERT INTO github_sync_dispatch_items
-       (item_id, dispatch_id, project_id, repository_id, ref, scheduled_for,
-        full_reconciliation, repository_configuration_version, cursor_version,
-        selected_head_manifest_id, selected_head_version, repository_updated_at,
-        cursor_status, cursor_updated_at, workflow_instance_id, status, created_at)
-       SELECT json_extract(value, '$.item_id'),
-              json_extract(value, '$.dispatch_id'),
-              json_extract(value, '$.project_id'),
-              json_extract(value, '$.repository_id'),
-              json_extract(value, '$.ref'),
-              json_extract(value, '$.scheduled_for'),
-              json_extract(value, '$.full_reconciliation'),
-              json_extract(value, '$.repository_configuration_version'),
-              json_extract(value, '$.cursor_version'),
-              json_extract(value, '$.selected_head_manifest_id'),
-              json_extract(value, '$.selected_head_version'),
-              json_extract(value, '$.repository_updated_at'),
-              json_extract(value, '$.cursor_status'),
-              json_extract(value, '$.cursor_updated_at'),
-              json_extract(value, '$.workflow_instance_id'), 'pending',
-              json_extract(value, '$.created_at')
-       FROM json_each(?) WHERE 1
-       ON CONFLICT(item_id) DO NOTHING`
-    ).bind(serialized).run();
-    const mismatch = await session.prepare(
-      `WITH expected AS (SELECT value FROM json_each(?))
-       SELECT COUNT(*) AS mismatch_count
-       FROM expected
-       LEFT JOIN github_sync_dispatch_items AS item
-         ON item.item_id = json_extract(expected.value, '$.item_id')
-       WHERE item.item_id IS NULL
-          OR item.dispatch_id <> json_extract(expected.value, '$.dispatch_id')
-          OR item.project_id <> json_extract(expected.value, '$.project_id')
-          OR item.repository_id <> json_extract(expected.value, '$.repository_id')
-          OR item.ref <> json_extract(expected.value, '$.ref')
-          OR item.scheduled_for <> json_extract(expected.value, '$.scheduled_for')
-          OR item.full_reconciliation <> json_extract(expected.value, '$.full_reconciliation')
-          OR item.repository_configuration_version <>
-             json_extract(expected.value, '$.repository_configuration_version')
-          OR item.cursor_version <> json_extract(expected.value, '$.cursor_version')
-          OR item.selected_head_manifest_id IS NOT
-             json_extract(expected.value, '$.selected_head_manifest_id')
-          OR item.selected_head_version <>
-             json_extract(expected.value, '$.selected_head_version')
-          OR item.repository_updated_at <>
-             json_extract(expected.value, '$.repository_updated_at')
-          OR item.cursor_status <> json_extract(expected.value, '$.cursor_status')
-          OR item.cursor_updated_at <> json_extract(expected.value, '$.cursor_updated_at')
-          OR item.workflow_instance_id <>
-             json_extract(expected.value, '$.workflow_instance_id')`
-    ).bind(serialized).first<{ mismatch_count: number }>();
-    if (mismatch?.mismatch_count !== 0) {
-      throw new Error("GitHub dispatch items conflict with stored state.");
-    }
-  }
-  return items.length;
-}
-
 async function listDispatchItems(
   database: D1Database,
   dispatchId: string,
@@ -497,10 +644,12 @@ async function listDispatchItems(
     item_id: string;
     workflow_instance_id: string;
   }>();
-  return rows.results.map((row) => ({
+  const result = rows.results.map((row) => ({
     itemId: row.item_id,
     instanceId: row.workflow_instance_id
   }));
+  assertGitHubDispatchStepResult(result);
+  return result;
 }
 
 async function countDispatchItems(
@@ -591,7 +740,7 @@ export async function runGitHubDispatchWorkflow(
     })
   );
   if (existingStatus === "complete" || existingStatus === "failed") return;
-  await reconcilePriorDispatchState(
+  const priorUsage = await reconcilePriorDispatchStateWithUsage(
     step,
     active.MEMORY_DB,
     payload.scheduledFor,
@@ -599,25 +748,6 @@ export async function runGitHubDispatchWorkflow(
   );
   let lane: GitHubCredentialLaneToken | null = null;
   try {
-    lane = await acquireCredentialLane(
-      step,
-      active,
-      "dispatch",
-      payload.dispatchId,
-      admissionDeadlineMs
-    );
-    const dispatchStartedAtMs = await step.do(
-      "establish dispatch execution start",
-      () => Promise.resolve(Date.now())
-    );
-    const absoluteDeadlineMs = Math.min(
-      admissionDeadlineMs,
-      dispatchStartedAtMs + DISPATCH_EXECUTION_BUDGET_MS,
-      Date.parse(lane.leaseUntil) - LANE_LEASE_SAFETY_MARGIN_MS
-    );
-    if (absoluteDeadlineMs <= dispatchStartedAtMs) {
-      throw new GitHubSyncError("GITHUB_PARTIAL_SYNC");
-    }
     const materialized = await step.do(
       "check dispatch materialization receipt",
       STEP_RETRY,
@@ -627,27 +757,46 @@ export async function runGitHubDispatchWorkflow(
       )
     );
     if (!materialized) {
-      const allowedRepositoryIds = await collectEligibleRepositoryIds(
+      const summary = await collectRepositoryAdmissionSummary(
+        step,
+        active.MEMORY_DB
+      );
+      assertGitHubDispatchAdmission(summary.inventory, priorUsage);
+      const admission = await collectRepositoryAdmissionSnapshots(
         step,
         active.MEMORY_DB,
-        Date.parse(payload.scheduledFor)
+        summary
       );
-      if (allowedRepositoryIds.size === 0) {
-        await step.do("complete empty dispatch materialization", STEP_RETRY, () =>
-          completeGitHubDispatchMaterialization(active.MEMORY_DB, {
-            dispatchId: payload.dispatchId,
-            itemCount: 0,
-            completedAt: payload.scheduledFor
-          })
+      assertGitHubDispatchAdmission(admission.inventory, priorUsage);
+      if (admission.allowedRepositoryIds.size > 0) {
+        const acquiredLane = await acquireCredentialLane(
+          step,
+          active,
+          "dispatch",
+          payload.dispatchId,
+          admissionDeadlineMs,
+          { maxAttempts: GITHUB_DISPATCH_LANE_MAX_ATTEMPTS }
         );
-      } else {
+        lane = acquiredLane;
+        const dispatchStartedAtMs = await step.do(
+          "establish dispatch execution start",
+          () => Promise.resolve(Date.now())
+        );
+        const absoluteDeadlineMs = Math.min(
+          admissionDeadlineMs,
+          dispatchStartedAtMs + DISPATCH_EXECUTION_BUDGET_MS,
+          Date.parse(acquiredLane.leaseUntil) - LANE_LEASE_SAFETY_MARGIN_MS
+        );
+        if (absoluteDeadlineMs <= dispatchStartedAtMs) {
+          throw new GitHubSyncError("GITHUB_PARTIAL_SYNC");
+        }
         try {
           await verifyApprovedAccessBaseline(
             step,
             active,
             payload,
-            lane,
-            allowedRepositoryIds,
+            acquiredLane,
+            admission.allowedRepositoryIds,
             absoluteDeadlineMs
           );
         } catch (error) {
@@ -661,35 +810,35 @@ export async function runGitHubDispatchWorkflow(
               )
             );
           }
-          await processEligibleRepositories(
+          await processRepositoryAdmissionSnapshots(
             step,
             active.MEMORY_DB,
             payload,
-            allowedRepositoryIds,
+            admission.snapshots,
             baselineError
           );
           throw baselineError;
         }
-        await processEligibleRepositories(
-          step,
-          active.MEMORY_DB,
-          payload,
-          allowedRepositoryIds,
-          null
-        );
-        const itemCount = await step.do(
-          "count materialized dispatch items",
-          STEP_RETRY,
-          () => countDispatchItems(active.MEMORY_DB, payload.dispatchId)
-        );
-        await step.do("complete dispatch materialization", STEP_RETRY, () =>
-          completeGitHubDispatchMaterialization(active.MEMORY_DB, {
-            dispatchId: payload.dispatchId,
-            itemCount,
-            completedAt: payload.scheduledFor
-          })
-        );
       }
+      await processRepositoryAdmissionSnapshots(
+        step,
+        active.MEMORY_DB,
+        payload,
+        admission.snapshots,
+        null
+      );
+      const itemCount = await step.do(
+        "count materialized dispatch items",
+        STEP_RETRY,
+        () => countDispatchItems(active.MEMORY_DB, payload.dispatchId)
+      );
+      await step.do("complete dispatch materialization", STEP_RETRY, () =>
+        completeGitHubDispatchMaterialization(active.MEMORY_DB, {
+          dispatchId: payload.dispatchId,
+          itemCount,
+          completedAt: payload.scheduledFor
+        })
+      );
     }
   } catch (error) {
     await failDispatchWorkflow(

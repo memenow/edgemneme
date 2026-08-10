@@ -7,10 +7,6 @@ const workflow = readFileSync(
   join(process.cwd(), ".github", "workflows", "deploy.yml"),
   "utf8"
 );
-const migrationWorkflow = readFileSync(
-  join(process.cwd(), ".github", "workflows", "migrate-d1.yml"),
-  "utf8"
-);
 const githubWorkflowMigration = readFileSync(
   join(process.cwd(), "migrations", "0019_github_sync_workflows.sql"),
   "utf8"
@@ -53,30 +49,6 @@ function nodeHeredocContaining(step: string, marker: string): string {
     throw new Error(`A Node heredoc containing ${marker} was not found.`);
   }
   return heredoc;
-}
-
-function migrationStep(name: string): string {
-  const marker = `      - name: ${name}\n`;
-  const start = migrationWorkflow.indexOf(marker);
-  if (start === -1) {
-    throw new Error(`Migration workflow step ${name} was not found.`);
-  }
-  const next = migrationWorkflow.indexOf("\n      - name: ", start + marker.length);
-  return migrationWorkflow.slice(start, next === -1 ? undefined : next);
-}
-
-function migrationRunScript(name: string): string {
-  const step = migrationStep(name);
-  const marker = "        run: |\n";
-  const start = step.indexOf(marker);
-  if (start === -1) {
-    throw new Error(`Migration workflow step ${name} does not contain a literal run script.`);
-  }
-  return step
-    .slice(start + marker.length)
-    .split("\n")
-    .map((line) => (line.startsWith("          ") ? line.slice(10) : line))
-    .join("\n");
 }
 
 function rollbackFunction(): string {
@@ -311,7 +283,6 @@ ${lifecycleClient}
     expect(result.stdout).toBe("pending");
     for (const lifecycle of [
       workflowStep("Reconcile disabled GitHub sync"),
-      migrationStep("Require quiescent GitHub sync before migration"),
       workflowStep("Rollback failed Worker deployment")
     ]) {
       expect(lifecycle).toContain("statusInstanceKeys");
@@ -360,304 +331,12 @@ ${lifecycleClient}
     expect(result.stderr).toContain("inventory");
     for (const lifecycle of [
       workflowStep("Reconcile disabled GitHub sync"),
-      migrationStep("Require quiescent GitHub sync before migration"),
       workflowStep("Deploy GitHub sync"),
       workflowStep("Rollback failed Worker deployment")
     ]) {
       expect(lifecycle).toContain("workflowInventoryNames");
       expect(lifecycle).toContain("total_pages");
     }
-  });
-
-  it.each([
-    ["legacy present with zero Workflows", "legacy-or-exact", 0, 0],
-    ["Workflow-capable present with exact three", "legacy-or-exact", 3, 0],
-    ["legacy present with a partial inventory", "legacy-or-exact", 1, 1],
-    ["legacy present with a fourth inventory entry", "legacy-or-exact", 4, 1],
-    ["absent Worker with zero Workflows", "absent", 0, 0],
-    ["absent Worker with orphan Workflows", "absent", 3, 1]
-  ])("classifies migration inventory for %s", (_label, inventoryState, size, expectedStatus) => {
-    const lifecycleClient = nodeHeredocContaining(
-      migrationRunScript("Require quiescent GitHub sync before migration"),
-      "const workflowContracts ="
-    );
-    const entries = [
-      ["dispatch", "edgemneme-github-dispatch-workflow", "GitHubDispatchWorkflow"],
-      ["ref", "edgemneme-github-ref-sync-workflow", "GitHubRefSyncWorkflow"],
-      ["retention", "edgemneme-github-retention-workflow", "GitHubRetentionWorkflow"],
-      ["legacy", "edgemneme-github-legacy-workflow", "LegacyGitHubWorkflow"]
-    ].slice(0, size);
-    const script = `
-const inventory = ${JSON.stringify(entries)}.map(([id, name, class_name]) => ({
-  id, name, class_name, script_name: "edgemneme-github-sync", schedules: []
-}));
-const definitions = Object.fromEntries(inventory.map((item) => [item.name, item.class_name]));
-globalThis.fetch = async (input) => {
-  const url = new URL(String(input));
-  if (url.pathname.endsWith("/workflows")) {
-    return Response.json({
-      success: true,
-      result: inventory,
-      result_info: {
-        count: inventory.length,
-        page: 1,
-        per_page: 100,
-        total_count: inventory.length,
-        total_pages: inventory.length === 0 ? 0 : 1
-      }
-    });
-  }
-  if (!url.pathname.endsWith("/instances")) {
-    const name = decodeURIComponent(url.pathname.split("/").at(-1));
-    return Response.json({
-      success: true,
-      result: { name, class_name: definitions[name], script_name: "edgemneme-github-sync" }
-    });
-  }
-  return Response.json({ success: true, result: [], result_info: { cursor: null } });
-};
-${lifecycleClient}
-`;
-    const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
-      env: {
-        ...process.env,
-        CLOUDFLARE_ACCOUNT_ID: "synthetic-account",
-        CLOUDFLARE_API_TOKEN: "synthetic-token",
-        ALLOW_MISSING_WORKFLOWS: "true",
-        EXPECTED_WORKFLOW_INVENTORY: inventoryState
-      },
-      encoding: "utf8"
-    });
-
-    expect(result.status, result.stderr).toBe(expectedStatus);
-    if (expectedStatus === 0) expect(result.stdout).toBe("clear");
-  });
-
-  it("gates migrations on a disabled runtime and two exhaustive zero observations", () => {
-    const gate = migrationStep("Require quiescent GitHub sync before migration");
-    const backupStart = migrationWorkflow.indexOf(
-      "      - name: Capture and verify private pre-migration backups\n"
-    );
-
-    expect(migrationWorkflow).toContain("ENABLE_GITHUB_SYNC: ${{ vars.ENABLE_GITHUB_SYNC }}");
-    expect(gate).toContain('ENABLE_GITHUB_SYNC:-');
-    expect(gate).toContain('!= "false"');
-    expect(gate).toContain("/workers/scripts/edgemneme-github-sync/settings");
-    expect(gate).toContain("GITHUB_SYNC_ENABLED");
-    expect(gate).toContain("/workers/scripts/edgemneme-github-sync/schedules");
-    expect(gate).toContain("const workflowContracts =");
-    expect(gate).toContain('ALLOW_MISSING_WORKFLOWS="true"');
-    expect(gate).toContain("cursor");
-    expect(gate).toContain("sqlite_master");
-    expect(gate).toContain("zero_observations");
-    expect(gate).toContain("zero_observations=0");
-    expect(gate).toContain("sleep 60");
-    expect(gate).toContain("status IN ('materialized', 'dispatching')");
-    expect(gate).toContain("holder_id IS NOT NULL");
-    expect(migrationWorkflow.indexOf("      - name: Require quiescent GitHub sync before migration\n"))
-      .toBeLessThan(backupStart);
-  });
-
-  it("rechecks the same disabled Worker version around every migration zero observation", () => {
-    const gate = migrationStep("Require quiescent GitHub sync before migration");
-    const loopStart = gate.indexOf("for ((attempt = 1; attempt <= 5; attempt++)); do");
-    const increment = gate.indexOf(
-      "zero_observations=$((zero_observations + 1))",
-      loopStart
-    );
-    const loop = gate.slice(loopStart, increment);
-
-    expect(gate).toContain('captured_runtime_version="$(github_sync_runtime_state)"');
-    expect(gate).toContain("latest.versions.length !== 1");
-    expect(gate).toContain("latest.versions[0]?.percentage !== 100");
-    expect(gate).toContain("latest.versions[0].version_id");
-    expect(loop.match(/github_sync_runtime_state/g)).toHaveLength(2);
-    expect(loop.match(/github_sync_schedule_state/g)).toHaveLength(2);
-    expect(loop).toContain(
-      '[[ "$observed_runtime_version" != "$captured_runtime_version" ]]'
-    );
-    expect(loop).toContain(
-      '[[ "$verified_runtime_version" != "$captured_runtime_version" ]]'
-    );
-    expect(loop.indexOf("github_sync_runtime_state")).toBeLessThan(
-      loop.indexOf("cloudflare_github_workflow_state")
-    );
-    expect(loop.lastIndexOf("github_sync_runtime_state")).toBeLessThan(
-      loop.indexOf("github_sync_d1_state")
-    );
-    const reconciliation = loop.indexOf(
-      "node scripts/github-sync-quiescence.mjs reconcile"
-    );
-    expect(loop.lastIndexOf("github_sync_schedule_state", reconciliation))
-      .toBeGreaterThan(loop.indexOf("cloudflare_github_workflow_state"));
-    expect(loop.indexOf("github_sync_schedule_state", reconciliation))
-      .toBeLessThan(loop.indexOf("github_sync_runtime_state", reconciliation));
-  });
-
-  it("reconciles disabled orphan state only inside the three pre-D1 drain fences", () => {
-    const invocation = "node scripts/github-sync-quiescence.mjs reconcile";
-    const disabledObservation = shellFunctionBetween(
-      "Reconcile disabled GitHub sync",
-      "github_sync_zero_observation",
-      "wait_for_github_sync_drain"
-    );
-    const rollbackDrain = shellFunctionBetween(
-      "Rollback failed Worker deployment",
-      "wait_for_github_sync_drain",
-      "github_sync_secret_state"
-    );
-    const migrationGate = migrationStep("Require quiescent GitHub sync before migration");
-    const migrationLoop = migrationGate.slice(
-      migrationGate.indexOf("for ((attempt = 1; attempt <= 5; attempt++)); do"),
-      migrationGate.indexOf("zero_observations=$((zero_observations + 1))")
-    );
-    const finalMigrationGate = migrationStep(
-      "Revalidate quiescent GitHub sync before migration apply"
-    );
-    const exactCalls = [
-      ...`${workflow}\n${migrationWorkflow}`.matchAll(
-        /reconciliation_state="\$\(\n\s+node scripts\/github-sync-quiescence\.mjs reconcile \\\n\s+--config "\$config" \\\n\s+--disabled-version "\$(quiesced_version|expected_version|captured_runtime_version)" \\\n\s+--schedule-state clear \\\n\s+--workflow-state clear\n\s+\)" \|\| (?:return|exit) 1/g
-      )
-    ];
-
-    expect(workflow.split(invocation)).toHaveLength(3);
-    expect(migrationWorkflow.split(invocation)).toHaveLength(2);
-    expect(exactCalls.map((match) => match[1]).sort()).toEqual([
-      "captured_runtime_version",
-      "expected_version",
-      "quiesced_version"
-    ]);
-    expect(finalMigrationGate).not.toContain("scripts/github-sync-quiescence.mjs");
-
-    const disabledCall = disabledObservation.indexOf(invocation);
-    const disabledD1 = disabledObservation.indexOf(
-      'd1_state="$(github_sync_d1_state)"',
-      disabledCall
-    );
-    const disabledPending = disabledObservation.indexOf(
-      'if [[ "$reconciliation_state" == "pending" ]]',
-      disabledCall
-    );
-    expect(disabledCall).toBeGreaterThan(
-      disabledObservation.indexOf(
-        'if [[ "$schedule_state" != "clear" || "$workflow_state" != "clear" ]]'
-      )
-    );
-    expect(disabledCall).toBeLessThan(disabledD1);
-    expect(disabledObservation.slice(disabledCall, disabledD1)).toContain(
-      'verified_schedule_state="$(github_sync_schedule_state)"'
-    );
-    expect(disabledObservation.slice(disabledCall, disabledD1)).toContain(
-      'verified_workflow_state="$(cloudflare_github_workflow_state)"'
-    );
-    expect(disabledObservation.slice(disabledCall, disabledD1)).toContain(
-      'assert_disabled_version \\\n    "$quiesced_version" "$quiesce_tag" "$initial_secret_state"'
-    );
-    expect(disabledObservation.indexOf(
-      'verified_schedule_state="$(github_sync_schedule_state)"',
-      disabledCall
-    )).toBeLessThan(disabledPending);
-    expect(disabledObservation.indexOf(
-      'verified_workflow_state="$(cloudflare_github_workflow_state)"',
-      disabledCall
-    )).toBeLessThan(disabledPending);
-    expect(disabledObservation.indexOf("assert_disabled_version", disabledCall))
-      .toBeLessThan(disabledPending);
-    expect(disabledPending).toBeLessThan(disabledD1);
-    expect(disabledObservation.slice(disabledCall)).toContain(
-      '"$reconciliation_state" == "clear"'
-    );
-    expect(disabledObservation.slice(disabledCall, disabledD1)).toContain(
-      '--disabled-version "$quiesced_version"'
-    );
-
-    const rollbackCall = rollbackDrain.indexOf(invocation);
-    const rollbackD1 = rollbackDrain.indexOf(
-      'd1_state="$(github_sync_d1_state "$config")"',
-      rollbackCall
-    );
-    const rollbackPending = rollbackDrain.indexOf(
-      'if [[ "$reconciliation_state" == "pending" ]]',
-      rollbackCall
-    );
-    expect(rollbackCall).toBeGreaterThan(
-      rollbackDrain.indexOf(
-        'if [[ "$schedule_state" != "clear" || "$workflow_state" != "clear" ]]'
-      )
-    );
-    expect(rollbackCall).toBeLessThan(rollbackD1);
-    expect(rollbackDrain.slice(rollbackCall, rollbackD1)).toContain(
-      'verified_schedule_state="$(github_sync_schedule_state)"'
-    );
-    expect(rollbackDrain.slice(rollbackCall, rollbackD1)).toContain(
-      'verified_workflow_state="$(cloudflare_github_workflow_state)"'
-    );
-    expect(rollbackDrain.slice(rollbackCall, rollbackD1)).toContain(
-      'assert_exact_disabled_github_version \\\n      "$config" "$expected_version" "$expected_tag" "present"'
-    );
-    expect(rollbackDrain.indexOf(
-      'verified_schedule_state="$(github_sync_schedule_state)"',
-      rollbackCall
-    )).toBeLessThan(rollbackPending);
-    expect(rollbackDrain.indexOf(
-      'verified_workflow_state="$(cloudflare_github_workflow_state)"',
-      rollbackCall
-    )).toBeLessThan(rollbackPending);
-    expect(rollbackDrain.indexOf(
-      "assert_exact_disabled_github_version",
-      rollbackCall
-    )).toBeLessThan(rollbackPending);
-    expect(rollbackPending).toBeLessThan(rollbackD1);
-    expect(rollbackDrain.slice(rollbackCall)).toContain(
-      '"$reconciliation_state" == "clear"'
-    );
-    expect(rollbackDrain.slice(rollbackCall, rollbackD1)).toContain(
-      '--disabled-version "$expected_version"'
-    );
-
-    const migrationCall = migrationLoop.indexOf(invocation);
-    const migrationD1 = migrationLoop.indexOf(
-      'd1_state="$(github_sync_d1_state)"',
-      migrationCall
-    );
-    const migrationPending = migrationLoop.indexOf(
-      'if [[ "$reconciliation_state" == "pending" ]]',
-      migrationCall
-    );
-    expect(migrationCall).toBeGreaterThan(
-      migrationLoop.indexOf(
-        'if [[ "$schedule_state" != "clear" || "$workflow_state" != "clear" ]]'
-      )
-    );
-    expect(migrationCall).toBeLessThan(migrationD1);
-    expect(migrationLoop.slice(migrationCall, migrationD1)).toContain(
-      'verified_runtime_version="$(github_sync_runtime_state)"'
-    );
-    expect(migrationLoop.slice(migrationCall, migrationD1)).toContain(
-      '[[ "$verified_runtime_version" != "$captured_runtime_version" ]]'
-    );
-    expect(migrationLoop.slice(migrationCall, migrationD1)).toContain(
-      'verified_workflow_state="$(cloudflare_github_workflow_state)"'
-    );
-    expect(migrationLoop.indexOf(
-      'verified_schedule_state="$(',
-      migrationCall
-    )).toBeLessThan(migrationPending);
-    expect(migrationLoop.indexOf(
-      'verified_runtime_version="$(github_sync_runtime_state)"',
-      migrationCall
-    )).toBeLessThan(migrationPending);
-    expect(migrationLoop.indexOf(
-      'verified_workflow_state="$(cloudflare_github_workflow_state)"',
-      migrationCall
-    )).toBeLessThan(migrationPending);
-    expect(migrationPending).toBeLessThan(migrationD1);
-    expect(migrationLoop.slice(migrationCall)).toContain(
-      '"$reconciliation_state" == "clear"'
-    );
-    expect(migrationLoop.slice(migrationCall, migrationD1)).toContain(
-      '--disabled-version "$captured_runtime_version"'
-    );
   });
 
   it("paces every high-cost drain below the Cloudflare global API budget", () => {
@@ -667,22 +346,11 @@ ${lifecycleClient}
       "wait_for_github_sync_drain",
       "github_sync_secret_state"
     );
-    const initialMigration = migrationStep(
-      "Require quiescent GitHub sync before migration"
-    );
-    const finalMigration = migrationStep(
-      "Revalidate quiescent GitHub sync before migration apply"
-    );
-
     expect(disabled).toContain("for ((attempt = 1; attempt <= 30; attempt++)); do");
     expect(disabled).toContain("if (( attempt < 30 )); then");
     expect(rollback).toContain("for ((attempt = 1; attempt <= 25; attempt++)); do");
     expect(rollback).toContain("if (( attempt < 25 )); then");
-    for (const migration of [initialMigration, finalMigration]) {
-      expect(migration).toContain("for ((attempt = 1; attempt <= 5; attempt++)); do");
-      expect(migration).toContain("if (( attempt < 5 )); then");
-    }
-    for (const drain of [disabled, rollback, initialMigration, finalMigration]) {
+    for (const drain of [disabled, rollback]) {
       expect(drain).toContain("sleep 60");
       expect(drain).not.toContain("sleep 5");
     }
@@ -690,158 +358,6 @@ ${lifecycleClient}
     const conservativeCallsPerPoll = 119;
     const pollsPerFiveMinutes = 300 / 60;
     expect(conservativeCallsPerPoll * pollsPerFiveMinutes).toBeLessThan(1_200);
-  });
-
-  it("blocks migration reconciliation when Cron appears after runtime preflight", () => {
-    const script = migrationRunScript("Require quiescent GitHub sync before migration");
-    const start = script.indexOf("zero_observations=0");
-    const terminal =
-      'echo "GitHub sync is not quiescent; migration is blocked." >&2\nexit 1';
-    const end = script.indexOf(terminal, start);
-    const drain = script.slice(start, end + terminal.length);
-    const harness = [
-      "set -euo pipefail",
-      'captured_runtime_version="123e4567-e89b-42d3-a456-426614174000"',
-      'config="synthetic.jsonc"',
-      'github_sync_runtime_state() { printf "%s" "$captured_runtime_version"; }',
-      'cloudflare_github_workflow_state() { printf "%s" "clear"; }',
-      'github_sync_schedule_state() { printf "%s" "pending"; }',
-      'github_sync_d1_state() { echo "unexpected D1 read" >&2; return 91; }',
-      'node() { echo "unexpected reconciliation" >&2; return 92; }',
-      "sleep() { :; }",
-      drain
-    ].join("\n");
-    const result = spawnSync("bash", ["-c", harness], {
-      env: process.env,
-      encoding: "utf8"
-    });
-
-    expect(result.status).toBe(1);
-    expect(result.stderr).toContain("migration is blocked");
-    expect(result.stderr).not.toContain("unexpected reconciliation");
-    expect(result.stderr).not.toContain("unexpected D1 read");
-  });
-
-  it.each([
-    ["no Queue association", false, "none", false, 0],
-    ["a Queue binding", true, "none", false, 1],
-    ["a Queue consumer", false, "target", false, 1],
-    ["a malformed worker consumer", false, "malformed", false, 1],
-    ["a Queue producer", false, "none", true, 1]
-  ])(
-    "rejects migration quiescence with %s",
-    (
-      _label,
-      includeQueueBinding,
-      queueConsumerState,
-      includeQueueProducer,
-      expectedStatus
-    ) => {
-      const runtimeClient = nodeHeredocContaining(
-        migrationRunScript("Require quiescent GitHub sync before migration"),
-        "Cloudflare GitHub sync lifecycle inputs are incomplete."
-      );
-      const versionId = "123e4567-e89b-42d3-a456-426614174000";
-      const script = `
-globalThis.fetch = async (input) => {
-  const url = new URL(String(input));
-  if (url.pathname.endsWith("/deployments")) {
-    return Response.json({
-      success: true,
-      result: {
-        deployments: [{
-          created_on: "2026-08-01T00:00:00.000Z",
-          versions: [{ version_id: ${JSON.stringify(versionId)}, percentage: 100 }]
-        }]
-      }
-    });
-  }
-  if (url.pathname.endsWith("/settings")) {
-    return Response.json({
-      success: true,
-      result: {
-        bindings: [
-          { name: "GITHUB_SYNC_ENABLED", type: "plain_text", text: "false" },
-          ...(${JSON.stringify(includeQueueBinding)}
-            ? [{ name: "LEGACY_QUEUE", type: "queue", queue_name: "legacy" }]
-            : [])
-        ]
-      }
-    });
-  }
-  if (url.pathname.endsWith("/schedules")) {
-    return Response.json({ success: true, result: { schedules: [] } });
-  }
-  if (url.pathname.endsWith("/queues")) {
-    const queueConsumerState = ${JSON.stringify(queueConsumerState)};
-    const consumers = queueConsumerState === "none"
-      ? []
-      : [{
-          consumer_id: "consumer-1",
-          type: "worker",
-          ...(queueConsumerState === "target"
-            ? { script_name: "edgemneme-github-sync" }
-            : {}),
-          queue_name: "legacy"
-        }];
-    const producers = ${JSON.stringify(includeQueueProducer)}
-      ? [{ type: "worker", script: "edgemneme-github-sync" }]
-      : [];
-    return Response.json({
-      success: true,
-      result: [{
-        queue_id: "queue-1",
-        queue_name: "legacy",
-        consumers,
-        consumers_total_count: consumers.length,
-        producers,
-        producers_total_count: producers.length
-      }],
-      result_info: { count: 1, page: 1, per_page: 100, total_count: 1, total_pages: 1 }
-    });
-  }
-  throw new Error("Unexpected request: " + url);
-};
-${runtimeClient}
-`;
-      const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
-        env: {
-          ...process.env,
-          CLOUDFLARE_ACCOUNT_ID: "synthetic-account",
-          CLOUDFLARE_API_TOKEN: "synthetic-token"
-        },
-        encoding: "utf8"
-      });
-
-      expect(result.status, result.stderr).toBe(expectedStatus);
-      if (expectedStatus === 0) expect(result.stdout).toBe(versionId);
-    }
-  );
-
-  it("revalidates the captured quiescent state after backup immediately before D1 apply", () => {
-    const finalGate = migrationStep(
-      "Revalidate quiescent GitHub sync before migration apply"
-    );
-    const backup = migrationWorkflow.indexOf(
-      "      - name: Capture and verify private pre-migration backups\n"
-    );
-    const gate = migrationWorkflow.indexOf(
-      "      - name: Revalidate quiescent GitHub sync before migration apply\n"
-    );
-    const apply = migrationWorkflow.indexOf(
-      "      - name: Apply memory database migrations\n"
-    );
-
-    expect(backup).toBeLessThan(gate);
-    expect(gate).toBeLessThan(apply);
-    expect(finalGate).toContain("EDGEMNEME_MIGRATION_GITHUB_SYNC_VERSION");
-    expect(finalGate).toContain("latest.versions[0]?.percentage !== 100");
-    expect(finalGate).toContain("GITHUB_SYNC_ENABLED");
-    expect(finalGate).toContain("workflowInventoryNames");
-    expect(finalGate).toContain("nonterminalStatuses");
-    expect(finalGate).toContain("github_sync_d1_state");
-    expect(finalGate).toContain("zero_observations");
-    expect(finalGate).toContain("zero_observations=0");
   });
 
   it("rejects malformed Cloudflare version IDs before any Actions env or output write", () => {
@@ -879,8 +395,6 @@ ${captureClient}
       workflowStep("Reconcile disabled GitHub sync"),
       workflowStep("Deploy GitHub sync"),
       workflowStep("Rollback failed Worker deployment"),
-      migrationStep("Require quiescent GitHub sync before migration"),
-      migrationStep("Revalidate quiescent GitHub sync before migration apply")
     ]) {
       expect(lifecycle).toContain("[0-9a-f]{8}-[0-9a-f]{4}");
     }
@@ -986,7 +500,6 @@ github_sync_d1_state
   it("keeps every drain query aligned with the durable status contract", () => {
     const lifecycleSources = [
       workflowStep("Reconcile disabled GitHub sync"),
-      migrationStep("Require quiescent GitHub sync before migration"),
       workflowStep("Rollback failed Worker deployment")
     ];
     expect(githubWorkflowMigration).toContain(
@@ -1173,8 +686,6 @@ ${capabilityClient}
       workflowStep("Reconcile disabled GitHub sync"),
       workflowStep("Deploy GitHub sync"),
       workflowStep("Rollback failed Worker deployment"),
-      migrationStep("Require quiescent GitHub sync before migration"),
-      migrationStep("Revalidate quiescent GitHub sync before migration apply")
     ]) {
       expect(lifecycle).toContain("/queues");
       expect(lifecycle).toContain("consumers_total_count");

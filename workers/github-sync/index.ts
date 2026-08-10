@@ -2,11 +2,13 @@ import {
   createGitHubRequestPacer,
   GitHubReadOnlyClient,
   GitHubSyncError,
+  MAX_GITHUB_ANNOTATED_TAG_PEEL_REQUESTS,
   type GitComparison,
   type GitHubRateLimit,
   type GitHubRequestPacer,
   type GitHubSyncErrorCode
 } from "../../src/github/client";
+import { createRefScopeId } from "../../src/contracts/scope";
 import type { MemoryEvent } from "../../src/gateway/service";
 import {
   inspectMemoryModelInput,
@@ -110,6 +112,12 @@ export interface ScheduledRefRow extends RepositoryRow {
   last_sync_at: string | null;
 }
 
+export interface GuardedScheduledRefRow extends ScheduledRefRow {
+  materialization_cursor_state_json: string;
+  materialization_head_state_json: string;
+  materialization_active_item_count: number;
+}
+
 interface AccessBaselineRow {
   credential_version: string;
   user_id: number;
@@ -127,9 +135,10 @@ const MAX_RUN_BYTES = 16 * 1024 * 1024;
 const MAX_FILES = 2_000;
 export const GITHUB_SYNC_REQUEST_BUDGET = {
   accessBaseline: 900,
-  perRef: MAX_FILES + 5,
+  perRef: MAX_FILES + 5 + MAX_GITHUB_ANNOTATED_TAG_PEEL_REQUESTS,
   maxRefsPerSchedule: null,
-  maxTotalPerWorkflow: MAX_FILES + 5
+  maxTotalPerWorkflow:
+    MAX_FILES + 5 + MAX_GITHUB_ANNOTATED_TAG_PEEL_REQUESTS
 } as const;
 export const MAX_GITHUB_ACCESS_BASELINE_REQUESTS =
   GITHUB_SYNC_REQUEST_BUDGET.accessBaseline;
@@ -557,6 +566,303 @@ export async function materializeAndSelectScheduledRefs(
   return selected.results;
 }
 
+interface ScheduledRefMaterializationStateRow {
+  ref: string;
+  cursor_exists: number;
+  cursor_state_json: string;
+  head_state_json: string;
+  active_item_count: number;
+}
+
+interface ExpectedScheduledRefMaterializationState {
+  ref: string;
+  pre_cursor_exists: number;
+  post_cursor_exists: number;
+  pre_cursor_state_json: string;
+  post_cursor_state_json: string;
+  head_state_json: string;
+  active_item_count: number;
+}
+
+const MATERIALIZATION_CURRENT_STATE_SQL = `
+  SELECT configured.ref,
+         CASE WHEN cursor.ref IS NULL THEN 0 ELSE 1 END AS cursor_exists,
+         json_array(
+           cursor.observed_sha, cursor.status, cursor.etag,
+           cursor.last_sync_at, cursor.next_sync_at,
+           cursor.history_gap_possible, cursor.credential_status,
+           cursor.last_error_code, cursor.updated_at, cursor.ref_scope_id,
+           cursor.cursor_version
+         ) AS cursor_state_json,
+         json_array(
+           head.manifest_id, head.head_version, head.activated_at,
+           head.updated_at
+         ) AS head_state_json,
+         (
+           SELECT COUNT(*)
+           FROM github_sync_dispatch_items AS active_item
+           WHERE active_item.project_id = expected_repository.project_id
+             AND active_item.repository_id = expected_repository.repository_id
+             AND active_item.ref = configured.ref
+             AND active_item.status IN ('pending', 'running')
+         ) AS active_item_count
+  FROM configured
+  CROSS JOIN expected_repository
+  LEFT JOIN sync_cursors AS cursor
+    ON cursor.project_id = expected_repository.project_id
+   AND cursor.repository_id = expected_repository.repository_id
+   AND cursor.ref = configured.ref
+  LEFT JOIN github_tree_ref_heads AS head
+    ON head.project_id = expected_repository.project_id
+   AND head.repository_id = expected_repository.repository_id
+   AND head.ref = configured.ref`;
+
+function guardedMaterializationCtes(
+  expectedCursorStateColumn: "pre_cursor_state_json" | "post_cursor_state_json"
+): string {
+  const expectedCursorExistsColumn = expectedCursorStateColumn ===
+      "pre_cursor_state_json"
+    ? "pre_cursor_exists"
+    : "post_cursor_exists";
+  return `WITH configured AS (
+     SELECT CAST(value AS TEXT) AS ref FROM json_each(?)
+   ), expected_state AS (
+     SELECT CAST(json_extract(value, '$.ref') AS TEXT) AS ref,
+            CAST(json_extract(value, '$.${expectedCursorExistsColumn}') AS INTEGER)
+              AS cursor_exists,
+            CAST(json_extract(value, '$.${expectedCursorStateColumn}') AS TEXT)
+              AS cursor_state_json,
+            CAST(json_extract(value, '$.head_state_json') AS TEXT)
+              AS head_state_json,
+            CAST(json_extract(value, '$.active_item_count') AS INTEGER)
+              AS active_item_count
+     FROM json_each(?)
+   ), expected_repository(
+     project_id, repository_id, external_id, expected_owner_external_id,
+     owner, name, default_branch, tracked_refs_json,
+     repository_configuration_version, repository_updated_at
+   ) AS (VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)),
+   repository_guard AS (
+     SELECT expected_repository.project_id,
+            expected_repository.repository_id
+     FROM expected_repository
+     JOIN repositories AS repository
+       ON repository.project_id = expected_repository.project_id
+      AND repository.repository_id = expected_repository.repository_id
+      AND lower(repository.provider) = 'github'
+      AND repository.sync_enabled = 1
+      AND repository.external_id = expected_repository.external_id
+      AND repository.expected_owner_external_id
+            IS expected_repository.expected_owner_external_id
+      AND repository.owner = expected_repository.owner
+      AND repository.name = expected_repository.name
+      AND repository.default_branch IS expected_repository.default_branch
+      AND repository.tracked_refs_json = expected_repository.tracked_refs_json
+      AND repository.github_sync_configuration_version =
+            expected_repository.repository_configuration_version
+      AND repository.updated_at = expected_repository.repository_updated_at
+   ), current_state AS (
+     ${MATERIALIZATION_CURRENT_STATE_SQL}
+   ), state_guard AS (
+     SELECT 1 AS admitted
+     WHERE (SELECT COUNT(*) FROM configured) =
+           (SELECT COUNT(*) FROM expected_state)
+       AND NOT EXISTS (
+         SELECT 1
+         FROM expected_state
+         LEFT JOIN current_state
+           ON current_state.ref = expected_state.ref
+         WHERE current_state.ref IS NULL
+            OR current_state.cursor_exists <> expected_state.cursor_exists
+            OR current_state.cursor_state_json
+                 IS NOT expected_state.cursor_state_json
+            OR current_state.head_state_json IS NOT expected_state.head_state_json
+            OR current_state.active_item_count <>
+                 expected_state.active_item_count
+       )
+   )`;
+}
+
+function guardedMaterializationBindings(
+  configuredRefsJson: string,
+  expectedStateJson: string,
+  expectedRepository: RepositoryRow
+): unknown[] {
+  return [
+    configuredRefsJson,
+    expectedStateJson,
+    expectedRepository.project_id,
+    expectedRepository.repository_id,
+    expectedRepository.external_id,
+    expectedRepository.expected_owner_external_id,
+    expectedRepository.owner,
+    expectedRepository.name,
+    expectedRepository.default_branch,
+    expectedRepository.tracked_refs_json,
+    expectedRepository.repository_configuration_version,
+    expectedRepository.repository_updated_at
+  ];
+}
+
+export async function materializeAndSelectScheduledRefsGuarded(
+  database: D1Database,
+  configuredRefs: ConfiguredRefRow[],
+  expectedRepository: RepositoryRow,
+  scheduledTime: number
+): Promise<GuardedScheduledRefRow[]> {
+  if (configuredRefs.length === 0) {
+    return [];
+  }
+  if (
+    configuredRefs.some(
+      (configuredRef) =>
+        configuredRef.project_id !== expectedRepository.project_id ||
+        configuredRef.repository_id !== expectedRepository.repository_id
+    )
+  ) {
+    throw new TypeError(
+      "Guarded GitHub ref materialization requires one expected repository."
+    );
+  }
+
+  const scheduledAt = scheduledIso(scheduledTime);
+  const configuredRefsJson = JSON.stringify(
+    configuredRefs.map((configuredRef) => configuredRef.ref)
+  );
+  const session = database.withSession("first-primary");
+  const expectedRepositoryBindings = [
+    expectedRepository.project_id,
+    expectedRepository.repository_id
+  ];
+  const observedState = await session.prepare(
+    `WITH configured AS (
+       SELECT CAST(value AS TEXT) AS ref FROM json_each(?)
+     ), expected_repository(project_id, repository_id) AS (VALUES (?, ?))
+     ${MATERIALIZATION_CURRENT_STATE_SQL}`
+  ).bind(
+    configuredRefsJson,
+    ...expectedRepositoryBindings
+  ).all<ScheduledRefMaterializationStateRow>();
+  if (observedState.results.length !== configuredRefs.length) {
+    throw new GitHubSyncError("GITHUB_RECONCILIATION_REQUIRED");
+  }
+  const expectedState: ExpectedScheduledRefMaterializationState[] =
+    observedState.results.map((state) => ({
+      ref: state.ref,
+      pre_cursor_exists: state.cursor_exists,
+      post_cursor_exists: 1,
+      pre_cursor_state_json: state.cursor_state_json,
+      post_cursor_state_json: state.cursor_exists === 1
+        ? state.cursor_state_json
+        : JSON.stringify([
+            null,
+            "idle",
+            null,
+            null,
+            scheduledAt,
+            0,
+            "unknown",
+            null,
+            scheduledAt,
+            createRefScopeId(expectedRepository.repository_id, state.ref),
+            1
+          ]),
+      head_state_json: state.head_state_json,
+      active_item_count: state.active_item_count
+    }));
+  const expectedStateJson = JSON.stringify(expectedState);
+  const guardBindings = guardedMaterializationBindings(
+    configuredRefsJson,
+    expectedStateJson,
+    expectedRepository
+  );
+  const insertStatement = session.prepare(
+    `${guardedMaterializationCtes("pre_cursor_state_json")}
+     INSERT INTO sync_cursors
+     (project_id, repository_id, ref, status, next_sync_at,
+      history_gap_possible, credential_status, updated_at)
+     SELECT repository_guard.project_id, repository_guard.repository_id,
+            configured.ref, 'idle', ?, 0, 'unknown', ?
+     FROM configured
+     CROSS JOIN repository_guard
+     CROSS JOIN state_guard
+     WHERE 1
+     ON CONFLICT(project_id, repository_id, ref) DO NOTHING`
+  ).bind(...guardBindings, scheduledAt, scheduledAt);
+  const selectedStatement = session.prepare(
+    `${guardedMaterializationCtes("post_cursor_state_json")}, due AS (
+       SELECT repository.repository_id, repository.project_id,
+              repository.external_id, repository.expected_owner_external_id,
+              repository.owner, repository.name, repository.default_branch,
+              repository.tracked_refs_json, cursor.ref,
+              cursor.status AS cursor_status,
+              cursor.updated_at AS cursor_updated_at, cursor.cursor_version,
+              repository.github_sync_configuration_version AS
+                repository_configuration_version,
+              repository.updated_at AS repository_updated_at,
+              head.manifest_id AS selected_head_manifest_id,
+              COALESCE(head.head_version, 0) AS selected_head_version,
+              cursor.last_sync_at,
+              current_state.cursor_state_json AS
+                materialization_cursor_state_json,
+              current_state.head_state_json AS
+                materialization_head_state_json,
+              current_state.active_item_count AS
+                materialization_active_item_count
+       FROM configured
+       CROSS JOIN repository_guard
+       CROSS JOIN state_guard
+       JOIN current_state ON current_state.ref = configured.ref
+       JOIN sync_cursors AS cursor
+         ON cursor.project_id = repository_guard.project_id
+        AND cursor.repository_id = repository_guard.repository_id
+        AND cursor.ref = configured.ref
+       JOIN repositories AS repository
+         ON repository.project_id = cursor.project_id
+        AND repository.repository_id = cursor.repository_id
+       LEFT JOIN github_tree_ref_heads AS head
+         ON head.project_id = cursor.project_id
+        AND head.repository_id = cursor.repository_id
+        AND head.ref = cursor.ref
+       WHERE cursor.status <> 'paused'
+         AND (cursor.next_sync_at IS NULL OR cursor.next_sync_at <= ?)
+         AND NOT EXISTS (
+           SELECT 1 FROM github_sync_dispatch_items AS active_item
+           WHERE active_item.project_id = cursor.project_id
+             AND active_item.repository_id = cursor.repository_id
+             AND active_item.ref = cursor.ref
+             AND active_item.status IN ('pending', 'running')
+         )
+     )
+     SELECT repository_id, project_id, external_id,
+            expected_owner_external_id, owner, name, default_branch,
+            tracked_refs_json, repository_configuration_version,
+            repository_updated_at, ref, cursor_status, cursor_updated_at,
+            cursor_version, selected_head_manifest_id, selected_head_version,
+            last_sync_at, materialization_cursor_state_json,
+            materialization_head_state_json,
+            materialization_active_item_count
+     FROM due
+     ORDER BY cursor_updated_at, project_id, repository_id, ref
+     LIMIT ?`
+  ).bind(...guardBindings, scheduledAt, configuredRefs.length);
+  const fenceStatement = session.prepare(
+    `${guardedMaterializationCtes("post_cursor_state_json")}
+     SELECT COUNT(*) AS guard_count
+     FROM repository_guard CROSS JOIN state_guard`
+  ).bind(...guardBindings);
+  const results = await session.batch<
+    GuardedScheduledRefRow | { guard_count: number }
+  >(
+    [insertStatement, selectedStatement, fenceStatement]
+  );
+  const fence = results[2]?.results[0] as { guard_count?: number } | undefined;
+  if (fence?.guard_count !== 1) {
+    throw new GitHubSyncError("GITHUB_RECONCILIATION_REQUIRED");
+  }
+  return (results[1]?.results as GuardedScheduledRefRow[] | undefined) ?? [];
+}
+
 export async function syncScheduledRef(
   selected: ScheduledRefRow,
   env: ActiveGitHubSyncEnv,
@@ -687,6 +993,50 @@ async function verifyRepositoryForRef(
   return verifiedDefaultBranch;
 }
 
+async function readWithdrawnSensitivePathDigests(
+  database: D1Database,
+  projectId: string,
+  manifestId: string | null,
+  sensitivePathDigests: readonly string[]
+): Promise<Set<string>> {
+  if (manifestId === null || sensitivePathDigests.length === 0) {
+    return new Set();
+  }
+  const requestedPathDigests = [...new Set(sensitivePathDigests)];
+  if (
+    requestedPathDigests.length > MAX_FILES ||
+    requestedPathDigests.some(
+      (pathDigest) => !/^[0-9a-f]{64}$/u.test(pathDigest)
+    )
+  ) {
+    throw new GitHubSyncError("GITHUB_RECONCILIATION_REQUIRED");
+  }
+  const result = await database
+    .withSession("first-primary")
+    .prepare(
+      `WITH requested(path_digest) AS (
+         SELECT value FROM json_each(?) WHERE type = 'text'
+       )
+       SELECT entry.path_digest
+       FROM requested
+       JOIN github_tree_manifest_entries AS entry
+         ON entry.path_digest = requested.path_digest
+       WHERE entry.project_id = ? AND entry.manifest_id = ?
+         AND entry.disposition = 'text'
+       ORDER BY entry.path_digest`
+    )
+    .bind(JSON.stringify(requestedPathDigests), projectId, manifestId)
+    .all<{ path_digest: string }>();
+  const pathDigests = new Set<string>();
+  for (const row of result.results) {
+    if (!/^[0-9a-f]{64}$/u.test(row.path_digest)) {
+      throw new GitHubSyncError("GITHUB_RECONCILIATION_REQUIRED");
+    }
+    pathDigests.add(row.path_digest);
+  }
+  return pathDigests;
+}
+
 async function syncRef(
   repository: ScheduledRefRow,
   client: GitHubReadOnlyClient,
@@ -788,10 +1138,13 @@ async function syncRefAttempt(
     return;
   }
   const reference = result.value;
-  if (reference.ref !== ref || reference.object.type !== "commit") {
-    throw new GitHubSyncError("GITHUB_REPOSITORY_UNAVAILABLE");
-  }
-  const observedSha = reference.object.sha;
+  const observedSha = await client.peelReferenceToCommit(
+    repository.owner,
+    repository.name,
+    repository.external_id,
+    ref,
+    reference
+  );
   if (
     !fullReconciliation &&
     cursor?.observed_sha === observedSha &&
@@ -872,6 +1225,7 @@ async function syncRefAttempt(
   let partialDetected = false;
   const manifestEntries: GitHubTreeManifestEntry[] = [];
   const candidates: GitHubBlobCandidate[] = [];
+  const tombstonePathDigestByEvidenceId = new Map<string, string>();
   for (const entry of tree.tree) {
     if (entry.type !== "blob") {
       continue;
@@ -999,7 +1353,22 @@ async function syncRefAttempt(
           : "text"
     });
     candidates.push(candidate);
+    if (candidate.sensitivityStatus === "tombstone") {
+      tombstonePathDigestByEvidenceId.set(candidate.evidenceId, pathDigest);
+    }
   }
+  const withdrawnSensitivePathDigests = await readWithdrawnSensitivePathDigests(
+    env.MEMORY_DB,
+    repository.project_id,
+    activeHead?.manifestId ?? null,
+    [...tombstonePathDigestByEvidenceId.values()]
+  );
+  const persistableCandidates = candidates.filter((candidate) => {
+    const pathDigest = tombstonePathDigestByEvidenceId.get(candidate.evidenceId);
+    return (
+      pathDigest === undefined || !withdrawnSensitivePathDigests.has(pathDigest)
+    );
+  });
   await persistGitHubTreeManifestEntries(env.MEMORY_DB, manifest, manifestEntries);
   if (partialDetected) {
     throw new GitHubSyncError("GITHUB_PARTIAL_SYNC");
@@ -1053,14 +1422,15 @@ async function syncRefAttempt(
     manifestId: manifest.manifestId,
     observedSha,
     activationFence,
-    candidates
+    candidates: persistableCandidates
   });
   const syncEvent = await buildStableSyncEvent({
     projectId: repository.project_id,
     repositoryId: repository.repository_id,
     externalRepositoryId: repository.external_id,
     ref,
-    observedSha
+    observedSha,
+    manifestId: manifest.manifestId
   });
   const syncPayload = JSON.stringify(syncEvent);
   await activateGitHubTreeManifest({
@@ -1507,9 +1877,9 @@ export async function buildStableSyncEvent(input: {
   externalRepositoryId: number;
   ref: string;
   observedSha: string;
+  manifestId: string;
 }): Promise<Extract<MemoryEvent, { type: "github.sync.requested" }>> {
-  const idempotencyKey =
-    `github:${input.externalRepositoryId}:${input.ref}:${input.observedSha}`;
+  const idempotencyKey = `github:${input.externalRepositoryId}:${input.manifestId}`;
   const eventId = await sha256(
     [
       "github.sync.requested",
@@ -1517,7 +1887,8 @@ export async function buildStableSyncEvent(input: {
       input.repositoryId,
       String(input.externalRepositoryId),
       input.ref,
-      input.observedSha
+      input.observedSha,
+      input.manifestId
     ].join("\n")
   );
   return {
@@ -1528,6 +1899,7 @@ export async function buildStableSyncEvent(input: {
     externalRepositoryId: input.externalRepositoryId,
     ref: input.ref,
     observedSha: input.observedSha,
+    manifestId: input.manifestId,
     idempotencyKey
   };
 }
@@ -1558,6 +1930,8 @@ export async function buildGitHubBlobCandidate(input: {
   const pathInspection = inspectSensitivePath(input.path);
   const pathAccepted = pathInspection.accepted && !isSensitiveGitHubPath(input.path);
   const pathHash = await sha256(input.path);
+  const sensitivityStatus =
+    !contentInspection.accepted || !pathAccepted ? "tombstone" : "clear";
   const evidenceId = await buildGitHubBlobEvidenceId({
     projectId: input.projectId,
     repositoryId: input.repositoryId,
@@ -1565,9 +1939,10 @@ export async function buildGitHubBlobCandidate(input: {
     repositoryRef: input.ref,
     observedSha: input.observedSha,
     repositoryPath,
-    blobSha: input.blobSha
+    blobSha: input.blobSha,
+    sensitivityStatus
   });
-  if (!contentInspection.accepted || !pathAccepted) {
+  if (sensitivityStatus === "tombstone") {
     return {
       evidenceId,
       locator: await buildGitHubTombstoneEvidenceLocator({

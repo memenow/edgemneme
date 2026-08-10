@@ -95,7 +95,7 @@ describe("projection rebuild dispatch", () => {
       project_version: PROJECT_VERSION,
       search_generation_id: GENERATION_ID,
       memory_count: 1,
-      revision_count: 3,
+      revision_count: 1,
       scope_count: 1,
       content_bytes: 4_096,
       memory_heads: [{
@@ -120,7 +120,7 @@ describe("projection rebuild dispatch", () => {
         mode: "snapshot",
         searchGenerationId: GENERATION_ID,
         memoryCount: 1,
-        revisionCount: 3,
+        revisionCount: 1,
         scopeCount: 1,
         contentBytes: 4_096,
         headDigest: descriptor.headDigest

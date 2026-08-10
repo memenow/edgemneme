@@ -17,11 +17,13 @@ import {
   hasGitHubDispatchMaterializationReceipt,
   releaseGitHubCredentialLane,
   reserveGitHubDispatchRequest,
+  reserveGitHubRefRequest,
   tryAcquireGitHubCredentialLane
 } from "../src/github/sync-workflow";
 import {
   claimRepositorySync,
   ensureStableWorkflowInstance,
+  materializeAndSelectScheduledRefsGuarded,
   scheduleGitHubSyncWorkflows
 } from "../workers/github-sync/index";
 import {
@@ -39,11 +41,64 @@ import {
   reconcilePriorDispatchState,
   runGitHubDispatchWorkflow
 } from "../workers/github-sync/workflow-core";
+import {
+  GITHUB_DISPATCH_STEP_RESULT_LIMIT_BYTES,
+  GITHUB_DISPATCH_STEP_RESULT_RESERVE_BYTES,
+  GITHUB_DISPATCH_SUBREQUEST_LIMIT,
+  assertGitHubDispatchStepResult,
+  estimateGitHubDispatchAdmission,
+  persistDispatchItems,
+  type GitHubDispatchAdmissionInventory
+} from "../workers/github-sync/workflow-dispatch";
+import {
+  MAX_PRIOR_RECONCILIATION_STEPS,
+  reconcilePriorDispatchStateWithUsage,
+  type PriorReconciliationUsage
+} from "../workers/github-sync/workflow-runtime";
 import { finishRejectedUnboundRepositoryRun } from "../workers/github-sync/workflow-orphan";
+
+function admissionInventory(
+  refsPerValidRepository: number[],
+  input: {
+    invalidRepositoryRows?: number;
+    uniqueExternalRepositoryIds?: number;
+  } = {}
+): GitHubDispatchAdmissionInventory {
+  const invalidRepositoryRows = input.invalidRepositoryRows ?? 0;
+  const validRepositoryRows = refsPerValidRepository.length;
+  const enabledRepositoryRows = validRepositoryRows + invalidRepositoryRows;
+  return {
+    enabledRepositoryRows,
+    validRepositoryRows,
+    invalidRepositoryRows,
+    parsedRefCount: refsPerValidRepository.reduce(
+      (total, count) => total + count,
+      0
+    ),
+    materializationBatchCount: refsPerValidRepository.reduce(
+      (total, count) => total + Math.ceil(count / 100),
+      0
+    ),
+    uniqueExternalRepositoryIds:
+      input.uniqueExternalRepositoryIds ?? validRepositoryRows,
+    summaryPageCount: Math.floor(enabledRepositoryRows / 16) + 1,
+    snapshotPageCount: enabledRepositoryRows + 1
+  };
+}
+
+function priorUsage(subrequestCount = 12): PriorReconciliationUsage {
+  return {
+    pageCount: 4,
+    mutationPageCount: 0,
+    subrequestCount,
+    workflowStepCount: 5
+  };
+}
 
 describe("GitHub Workflow scheduling", () => {
   it("keeps prior-state reconciliation below the configured Workflow step limit", () => {
     expect(MAX_PRIOR_RECONCILIATION_PAGES * 2).toBeLessThan(10_000);
+    expect(MAX_PRIOR_RECONCILIATION_STEPS).toBe(129);
     expect(MAX_LIST_RECONCILIATION_SUBREQUESTS).toBe(3);
     expect(
       MAX_PRIOR_RECONCILIATION_PAGES * MAX_LIST_RECONCILIATION_SUBREQUESTS
@@ -79,6 +134,161 @@ describe("GitHub Workflow scheduling", () => {
         1
     );
     expect(() => overflow.reservePage()).toThrow("GITHUB_RECONCILIATION_REQUIRED");
+  });
+
+  it("admits the dispatcher workload boundary and rejects boundary plus one", () => {
+    let boundary = 0;
+    for (let repositoryRows = 1; repositoryRows <= 1_000; repositoryRows += 1) {
+      const estimate = estimateGitHubDispatchAdmission(
+        admissionInventory(Array.from({ length: repositoryRows }, () => 1)),
+        priorUsage()
+      );
+      if (!estimate.admitted) break;
+      boundary = repositoryRows;
+    }
+    expect(boundary).toBe(163);
+    const admitted = estimateGitHubDispatchAdmission(
+      admissionInventory(Array.from({ length: boundary }, () => 1)),
+      priorUsage()
+    );
+    const overflow = estimateGitHubDispatchAdmission(
+      admissionInventory(Array.from({ length: boundary + 1 }, () => 1)),
+      priorUsage()
+    );
+    expect(admitted.admitted).toBe(true);
+    expect(admitted.estimatedSubrequests).toBeLessThanOrEqual(
+      GITHUB_DISPATCH_SUBREQUEST_LIMIT
+    );
+    expect(admitted.estimatedSubrequests).toBe(9_977);
+    expect(overflow.admitted).toBe(false);
+    expect(overflow.estimatedSubrequests).toBe(10_028);
+  });
+
+  it("accounts for 513 refs, duplicate external IDs, and every project row", () => {
+    const maximumRepository = estimateGitHubDispatchAdmission(
+      admissionInventory([513]),
+      priorUsage()
+    );
+    expect(maximumRepository.admitted).toBe(false);
+    expect(maximumRepository.fanoutBatchCount).toBe(6);
+    expect(maximumRepository.estimatedGitHubSubrequests).toBe(900);
+    expect(maximumRepository.estimatedWorkflowBindingSubrequests).toBe(7_713);
+
+    const single = estimateGitHubDispatchAdmission(
+      admissionInventory([1], { uniqueExternalRepositoryIds: 1 }),
+      priorUsage()
+    );
+    const duplicateAcrossProjects = estimateGitHubDispatchAdmission(
+      admissionInventory([1, 1], { uniqueExternalRepositoryIds: 1 }),
+      priorUsage()
+    );
+    expect(duplicateAcrossProjects.estimatedD1Subrequests).toBeGreaterThan(
+      single.estimatedD1Subrequests
+    );
+    expect(duplicateAcrossProjects.estimatedWorkflowSteps).toBeGreaterThan(
+      single.estimatedWorkflowSteps
+    );
+  });
+
+  it("accumulates independent retry recovery for every fanout page", () => {
+    const estimate = estimateGitHubDispatchAdmission(
+      admissionInventory([100, 100, 71]),
+      priorUsage()
+    );
+    expect(estimate.fanoutBatchCount).toBe(3);
+    expect(estimate.estimatedWorkflowBindingSubrequests).toBe(
+      3 * ((1 + 5 * 100) + (1 + 5 * 100) + (1 + 5 * 71))
+    );
+  });
+
+  it("keeps compact repository snapshots below the persisted step-result budget", () => {
+    const projectId = "p".repeat(1_600);
+    const repositoryId = "r".repeat(1_600);
+    const refs = [
+      "refs/heads/main",
+      ...Array.from({ length: 344 }, (_, index) => `refs/heads/ref-${index}`)
+    ];
+    const repeatedIdentityShape = {
+      configuredRefs: refs.map((ref) => ({
+        project_id: projectId,
+        repository_id: repositoryId,
+        ref
+      }))
+    };
+    const compactShape = {
+      snapshot: {
+        valid: true,
+        fingerprint: "f".repeat(64),
+        externalRepositoryId: 42,
+        projectId,
+        repositoryId,
+        refs
+      },
+      afterProjectId: projectId,
+      afterRepositoryId: repositoryId,
+      hasMore: true
+    };
+    const bytes = (value: unknown): number =>
+      new TextEncoder().encode(JSON.stringify(value)).byteLength;
+
+    expect(bytes(repeatedIdentityShape)).toBeGreaterThan(
+      GITHUB_DISPATCH_STEP_RESULT_LIMIT_BYTES
+    );
+    expect(bytes(compactShape)).toBeLessThanOrEqual(
+      GITHUB_DISPATCH_STEP_RESULT_LIMIT_BYTES -
+        GITHUB_DISPATCH_STEP_RESULT_RESERVE_BYTES
+    );
+  });
+
+  it("admits the exact UTF-8 step-result boundary and rejects one byte more", () => {
+    const maximumJsonBytes =
+      GITHUB_DISPATCH_STEP_RESULT_LIMIT_BYTES -
+      GITHUB_DISPATCH_STEP_RESULT_RESERVE_BYTES;
+    const maximumStringBytes = maximumJsonBytes - 2;
+    const multibyteCharacters = Math.floor(maximumStringBytes / 3);
+    const exact =
+      "界".repeat(multibyteCharacters) +
+      "a".repeat(maximumStringBytes - multibyteCharacters * 3);
+    const bytes = (value: unknown): number =>
+      new TextEncoder().encode(JSON.stringify(value)).byteLength;
+
+    expect(bytes(exact)).toBe(maximumJsonBytes);
+    expect(() => assertGitHubDispatchStepResult(exact)).not.toThrow();
+    expect(bytes(`${exact}a`)).toBe(maximumJsonBytes + 1);
+    expect(() => assertGitHubDispatchStepResult(`${exact}a`)).toThrow(
+      "GITHUB_PARTIAL_SYNC"
+    );
+  });
+
+  it("uses actual prior usage while reporting the worst-case remainder", () => {
+    const inventory = admissionInventory([50]);
+    const available = estimateGitHubDispatchAdmission(inventory, priorUsage());
+    const exhausted = estimateGitHubDispatchAdmission(
+      inventory,
+      priorUsage(MAX_PRIOR_RECONCILIATION_SUBREQUESTS)
+    );
+    expect(available.admitted).toBe(true);
+    expect(exhausted.admitted).toBe(false);
+    expect(exhausted.priorActualRemainingSubrequests).toBe(2_800);
+    expect(exhausted.priorWorstCaseRemainingSubrequests).toBe(2_800);
+    expect(exhausted.priorWorstCaseRemainingWorkflowSteps).toBe(9_871);
+  });
+
+  it("returns the actual empty prior-reconciliation reservation", async () => {
+    const fixture = createDatabase();
+    await expect(
+      reconcilePriorDispatchStateWithUsage(
+        createImmediateWorkflowStep(),
+        fixture.d1,
+        "2026-07-29T12:00:00.000Z",
+        "credential-current"
+      )
+    ).resolves.toEqual({
+      pageCount: 4,
+      mutationPageCount: 0,
+      subrequestCount: 12,
+      workflowStepCount: 5
+    });
   });
 
   it("canonicalizes six-hour slots and builds bounded stable IDs", async () => {
@@ -497,6 +707,70 @@ describe("GitHub Workflow request budgets", () => {
     ).toEqual({ github_request_count: 100 });
   });
 
+  it("persists the annotated-tag allowance without changing the primary ref cap", async () => {
+    const fixture = createDatabase();
+    const repository = seedWorkflowRepository(fixture.database);
+    const runId = "6".repeat(64);
+    const dispatchId = "7".repeat(64);
+    const itemId = "8".repeat(64);
+    const scheduledFor = "2026-07-29T06:00:00.000Z";
+    seedWorkflowRun(fixture.database, {
+      ...repository,
+      runId,
+      scheduledFor,
+      leaseExpiresAt: "2026-07-29T07:00:00.000Z"
+    });
+    seedWorkflowDispatchItem(fixture.database, {
+      ...repository,
+      runId,
+      dispatchId,
+      itemId,
+      credentialVersion: "credential-current",
+      scheduledFor,
+      dispatchStatus: "dispatching"
+    });
+    const claimId = await credentialLaneClaimId({
+      credentialVersion: "credential-current",
+      holderKind: "ref",
+      holderId: itemId
+    });
+    const claim = await tryAcquireGitHubCredentialLane(fixture.d1, {
+      credentialVersion: "credential-current",
+      holderKind: "ref",
+      holderId: itemId,
+      claimId,
+      leaseMs: 60_000
+    });
+    if (!claim.acquired) throw new Error("lane claim failed");
+
+    const reservedBlocks: number[] = [];
+    for (;;) {
+      const reserved = await reserveGitHubRefRequest(
+        fixture.d1,
+        itemId,
+        claim.token,
+        2_013
+      );
+      if (reserved === null) break;
+      reservedBlocks.push(reserved);
+    }
+
+    expect(reservedBlocks).toEqual([
+      ...Array.from({ length: 20 }, () => 100),
+      5,
+      8
+    ]);
+    expect(
+      fixture.database.prepare(
+        `SELECT github_request_count, github_request_overflow_count
+         FROM github_sync_dispatch_items WHERE item_id = ?`
+      ).get(itemId)
+    ).toEqual({
+      github_request_count: 2_005,
+      github_request_overflow_count: 8
+    });
+  });
+
   it("rejects request blocks fenced by a newer lane holder", async () => {
     const fixture = createDatabase();
     const dispatchId = "9".repeat(64);
@@ -550,6 +824,537 @@ describe("GitHub Workflow request budgets", () => {
 });
 
 describe("GitHub dispatch materialization", () => {
+  const persistenceDrifts: readonly [
+    string,
+    (database: DatabaseSync, projectId: string, repositoryId: string) => void
+  ][] = [
+    ["disabled repository", (database, projectId, repositoryId) => {
+      database.prepare(
+        `UPDATE repositories SET sync_enabled = 0
+         WHERE project_id = ? AND repository_id = ?`
+      ).run(projectId, repositoryId);
+    }],
+    ["repository configuration", (database, projectId, repositoryId) => {
+      database.prepare(
+        `UPDATE repositories
+         SET owner = 'changed-owner',
+             github_sync_configuration_version =
+               github_sync_configuration_version + 1,
+             updated_at = '2026-07-29T06:00:01.000Z'
+         WHERE project_id = ? AND repository_id = ?`
+      ).run(projectId, repositoryId);
+    }],
+    ["paused cursor", (database, projectId, repositoryId) => {
+      database.prepare(
+        `UPDATE sync_cursors
+         SET status = 'paused', updated_at = '2026-07-29T06:00:01.000Z'
+         WHERE project_id = ? AND repository_id = ?
+           AND ref = 'refs/heads/main'`
+      ).run(projectId, repositoryId);
+    }],
+    ["head", (database, projectId, repositoryId) => {
+      const manifestId = "1".repeat(64);
+      database.prepare(
+        `INSERT INTO github_tree_manifests
+         (manifest_id, project_id, repository_id, ref, observed_sha, tree_sha,
+          repository_authority, collection_key, status, created_at)
+         VALUES (?, ?, ?, 'refs/heads/main', ?, ?, 'default_branch', ?,
+                 'staging', '2026-07-29T06:00:01.000Z')`
+      ).run(
+        manifestId,
+        projectId,
+        repositoryId,
+        "2".repeat(40),
+        "3".repeat(40),
+        `github:${repositoryId}:refs/heads/main:drift`
+      );
+      database.prepare(
+        `UPDATE github_tree_manifests
+         SET status = 'complete', entry_count = 0, entries_checksum = ?,
+             completed_at = '2026-07-29T06:00:01.000Z'
+         WHERE manifest_id = ?`
+      ).run("4".repeat(64), manifestId);
+      database.prepare(
+        `INSERT INTO github_tree_ref_heads
+         (project_id, repository_id, ref, manifest_id, head_version,
+          activated_at, updated_at)
+         VALUES (?, ?, 'refs/heads/main', ?, 1,
+                 '2026-07-29T06:00:01.000Z',
+                 '2026-07-29T06:00:01.000Z')`
+      ).run(projectId, repositoryId, manifestId);
+    }],
+    ["active item", (database, projectId, repositoryId) => {
+      seedWorkflowDispatchItem(database, {
+        projectId,
+        repositoryId,
+        ref: "refs/heads/main",
+        repositoryUpdatedAt: "2026-07-29T00:00:00.000Z",
+        cursorUpdatedAt: "2026-07-29T06:00:00.000Z",
+        dispatchId: "5".repeat(64),
+        itemId: "6".repeat(64),
+        credentialVersion: "credential-other",
+        scheduledFor: "2026-07-29T00:00:00.000Z",
+        dispatchStatus: "materialized"
+      });
+    }]
+  ];
+
+  it.each(persistenceDrifts)(
+    "rejects %s drift after selection and before pending-item insertion",
+    async (_name, mutate) => {
+      const projectId = "item-guard-project";
+      const repositoryId = "item-guard-repository";
+      let mutated = false;
+      const fixture = createDatabase({
+        remaining: 0,
+        matches: () => false,
+        beforeBatch: (database, statements) => {
+          if (
+            !mutated &&
+            statements.some((sql) =>
+              sql.includes("INSERT INTO github_sync_dispatch_items")
+            )
+          ) {
+            mutated = true;
+            mutate(database, projectId, repositoryId);
+          }
+        }
+      });
+      seedAdmissionRepository(fixture.database, {
+        projectId,
+        repositoryId,
+        externalId: 42,
+        trackedRefsJson: "[]"
+      });
+      const dispatchId = "7".repeat(64);
+      const scheduledFor = "2026-07-29T06:00:00.000Z";
+      fixture.database.prepare(
+        `INSERT INTO github_sync_dispatches
+         (dispatch_id, credential_version, workflow_instance_id, scheduled_for,
+          utc_date, status, created_at)
+         VALUES (?, 'credential-current', ?, ?, '2026-07-29',
+                 'materialized', ?)`
+      ).run(dispatchId, `ghd-${dispatchId}`, scheduledFor, scheduledFor);
+      const selected = await materializeAndSelectScheduledRefsGuarded(
+        fixture.d1,
+        [{
+          project_id: projectId,
+          repository_id: repositoryId,
+          ref: "refs/heads/main"
+        }],
+        {
+          project_id: projectId,
+          repository_id: repositoryId,
+          external_id: 42,
+          expected_owner_external_id: 7,
+          owner: "memenow",
+          name: repositoryId,
+          default_branch: "main",
+          tracked_refs_json: "[]",
+          repository_configuration_version: 1,
+          repository_updated_at: "2026-07-29T00:00:00.000Z"
+        },
+        Date.parse(scheduledFor)
+      );
+
+      await expect(persistDispatchItems(fixture.d1, {
+        dispatchId,
+        credentialVersion: "credential-current",
+        scheduledFor,
+        utcDate: "2026-07-29"
+      }, selected)).rejects.toThrow("GITHUB_RECONCILIATION_REQUIRED");
+      expect(mutated).toBe(true);
+      expect(fixture.database.prepare(
+        `SELECT COUNT(*) AS count FROM github_sync_dispatch_items
+         WHERE dispatch_id = ?`
+      ).get(dispatchId)).toEqual({ count: 0 });
+      expect(fixture.database.prepare(
+        `SELECT COUNT(*) AS count
+         FROM github_sync_dispatch_materialization_receipts
+         WHERE dispatch_id = ?`
+      ).get(dispatchId)).toEqual({ count: 0 });
+    }
+  );
+
+  it("inserts zero pending items when one ref in a multi-ref batch drifts", async () => {
+    const projectId = "multi-item-guard-project";
+    const repositoryId = "multi-item-guard-repository";
+    const trackedRefsJson = '["refs/heads/release"]';
+    let mutated = false;
+    const fixture = createDatabase({
+      remaining: 0,
+      matches: () => false,
+      beforeBatch: (database, statements) => {
+        if (
+          !mutated &&
+          statements.some((sql) =>
+            sql.includes("INSERT INTO github_sync_dispatch_items")
+          )
+        ) {
+          mutated = true;
+          database.prepare(
+            `UPDATE sync_cursors
+             SET status = 'paused',
+                 updated_at = '2026-07-29T06:00:01.000Z'
+             WHERE project_id = ? AND repository_id = ?
+               AND ref = 'refs/heads/main'`
+          ).run(projectId, repositoryId);
+        }
+      }
+    });
+    seedAdmissionRepository(fixture.database, {
+      projectId,
+      repositoryId,
+      externalId: 42,
+      trackedRefsJson
+    });
+    const dispatchId = "9".repeat(64);
+    const scheduledFor = "2026-07-29T06:00:00.000Z";
+    fixture.database.prepare(
+      `INSERT INTO github_sync_dispatches
+       (dispatch_id, credential_version, workflow_instance_id, scheduled_for,
+        utc_date, status, created_at)
+       VALUES (?, 'credential-current', ?, ?, '2026-07-29',
+               'materialized', ?)`
+    ).run(dispatchId, `ghd-${dispatchId}`, scheduledFor, scheduledFor);
+    const selected = await materializeAndSelectScheduledRefsGuarded(
+      fixture.d1,
+      ["refs/heads/main", "refs/heads/release"].map((ref) => ({
+        project_id: projectId,
+        repository_id: repositoryId,
+        ref
+      })),
+      {
+        project_id: projectId,
+        repository_id: repositoryId,
+        external_id: 42,
+        expected_owner_external_id: 7,
+        owner: "memenow",
+        name: repositoryId,
+        default_branch: "main",
+        tracked_refs_json: trackedRefsJson,
+        repository_configuration_version: 1,
+        repository_updated_at: "2026-07-29T00:00:00.000Z"
+      },
+      Date.parse(scheduledFor)
+    );
+    expect(selected).toHaveLength(2);
+
+    await expect(persistDispatchItems(fixture.d1, {
+      dispatchId,
+      credentialVersion: "credential-current",
+      scheduledFor,
+      utcDate: "2026-07-29"
+    }, selected)).rejects.toThrow("GITHUB_RECONCILIATION_REQUIRED");
+    expect(mutated).toBe(true);
+    expect(fixture.database.prepare(
+      `SELECT COUNT(*) AS count FROM github_sync_dispatch_items
+       WHERE dispatch_id = ?`
+    ).get(dispatchId)).toEqual({ count: 0 });
+  });
+
+  it("recovers an exact guarded pending-item batch after response loss", async () => {
+    const fixture = createDatabase({
+      remaining: 1,
+      matches: (sql) => sql.includes("INSERT INTO github_sync_dispatch_items")
+    });
+    const projectId = "item-recovery-project";
+    const repositoryId = "item-recovery-repository";
+    const dispatchId = "8".repeat(64);
+    const scheduledFor = "2026-07-29T06:00:00.000Z";
+    seedAdmissionRepository(fixture.database, {
+      projectId,
+      repositoryId,
+      externalId: 42,
+      trackedRefsJson: "[]"
+    });
+    fixture.database.prepare(
+      `INSERT INTO github_sync_dispatches
+       (dispatch_id, credential_version, workflow_instance_id, scheduled_for,
+        utc_date, status, created_at)
+       VALUES (?, 'credential-current', ?, ?, '2026-07-29',
+               'materialized', ?)`
+    ).run(dispatchId, `ghd-${dispatchId}`, scheduledFor, scheduledFor);
+    const selected = await materializeAndSelectScheduledRefsGuarded(
+      fixture.d1,
+      [{
+        project_id: projectId,
+        repository_id: repositoryId,
+        ref: "refs/heads/main"
+      }],
+      {
+        project_id: projectId,
+        repository_id: repositoryId,
+        external_id: 42,
+        expected_owner_external_id: 7,
+        owner: "memenow",
+        name: repositoryId,
+        default_branch: "main",
+        tracked_refs_json: "[]",
+        repository_configuration_version: 1,
+        repository_updated_at: "2026-07-29T00:00:00.000Z"
+      },
+      Date.parse(scheduledFor)
+    );
+
+    await expect(persistDispatchItems(fixture.d1, {
+      dispatchId,
+      credentialVersion: "credential-current",
+      scheduledFor,
+      utcDate: "2026-07-29"
+    }, selected)).resolves.toBe(1);
+    expect(fixture.database.prepare(
+      `SELECT COUNT(*) AS count FROM github_sync_dispatch_items
+       WHERE dispatch_id = ? AND status = 'pending'`
+    ).get(dispatchId)).toEqual({ count: 1 });
+  });
+
+  const guardedMaterializationDrifts: readonly [
+    string,
+    (database: DatabaseSync, projectId: string, repositoryId: string) => void,
+    number
+  ][] = [
+    [
+      "disabled repository",
+      (database, projectId, repositoryId) => {
+        database.prepare(
+          `UPDATE repositories SET sync_enabled = 0
+           WHERE project_id = ? AND repository_id = ?`
+        ).run(projectId, repositoryId);
+      },
+      0
+    ],
+    [
+      "repository configuration",
+      (database, projectId, repositoryId) => {
+        database.prepare(
+          `UPDATE repositories
+           SET owner = 'changed-owner',
+               github_sync_configuration_version =
+                 github_sync_configuration_version + 1,
+               updated_at = '2026-07-29T00:00:01.000Z'
+           WHERE project_id = ? AND repository_id = ?`
+        ).run(projectId, repositoryId);
+      },
+      0
+    ],
+    [
+      "tracked ref",
+      (database, projectId, repositoryId) => {
+        database.prepare(
+          `UPDATE repositories
+           SET tracked_refs_json = '["refs/heads/release"]',
+               github_sync_configuration_version =
+                 github_sync_configuration_version + 1,
+               updated_at = '2026-07-29T00:00:01.000Z'
+           WHERE project_id = ? AND repository_id = ?`
+        ).run(projectId, repositoryId);
+      },
+      0
+    ],
+    [
+      "paused cursor",
+      (database, projectId, repositoryId) => {
+        database.prepare(
+          `INSERT INTO sync_cursors
+           (project_id, repository_id, ref, status, history_gap_possible,
+            credential_status, updated_at)
+           VALUES (?, ?, 'refs/heads/main', 'paused', 0, 'unknown',
+                   '2026-07-29T00:00:01.000Z')`
+        ).run(projectId, repositoryId);
+      },
+      1
+    ]
+  ];
+
+  it("materializes and selects a stable repository through the guarded batch", async () => {
+    const fixture = createDatabase();
+    const projectId = "stable-project";
+    const repositoryId = "stable-repository";
+    seedAdmissionRepository(fixture.database, {
+      projectId,
+      repositoryId,
+      externalId: 42,
+      trackedRefsJson: "[]"
+    });
+
+    await expect(
+      materializeAndSelectScheduledRefsGuarded(
+        fixture.d1,
+        [{
+          project_id: projectId,
+          repository_id: repositoryId,
+          ref: "refs/heads/main"
+        }],
+        {
+          project_id: projectId,
+          repository_id: repositoryId,
+          external_id: 42,
+          expected_owner_external_id: 7,
+          owner: "memenow",
+          name: repositoryId,
+          default_branch: "main",
+          tracked_refs_json: "[]",
+          repository_configuration_version: 1,
+          repository_updated_at: "2026-07-29T00:00:00.000Z"
+        },
+        Date.parse("2026-07-29T06:00:00.000Z")
+      )
+    ).resolves.toMatchObject([{
+      project_id: projectId,
+      repository_id: repositoryId,
+      ref: "refs/heads/main",
+      cursor_status: "idle",
+      cursor_version: 1,
+      selected_head_manifest_id: null,
+      selected_head_version: 0
+    }]);
+  });
+
+  it.each(guardedMaterializationDrifts)(
+    "rejects %s drift between precheck and the guarded D1 batch",
+    async (_name, mutate, expectedCursorCount) => {
+      const projectId = "atomic-project";
+      const repositoryId = "atomic-repository";
+      const trackedRefsJson = "[]";
+      const fixture = createDatabase({
+        remaining: 0,
+        matches: () => false,
+        beforeBatch: (database) => mutate(database, projectId, repositoryId)
+      });
+      seedAdmissionRepository(fixture.database, {
+        projectId,
+        repositoryId,
+        externalId: 42,
+        trackedRefsJson
+      });
+
+      await expect(
+        materializeAndSelectScheduledRefsGuarded(
+          fixture.d1,
+          [{
+            project_id: projectId,
+            repository_id: repositoryId,
+            ref: "refs/heads/main"
+          }],
+          {
+            project_id: projectId,
+            repository_id: repositoryId,
+            external_id: 42,
+            expected_owner_external_id: 7,
+            owner: "memenow",
+            name: repositoryId,
+            default_branch: "main",
+            tracked_refs_json: trackedRefsJson,
+            repository_configuration_version: 1,
+            repository_updated_at: "2026-07-29T00:00:00.000Z"
+          },
+          Date.parse("2026-07-29T06:00:00.000Z")
+        )
+      ).rejects.toThrow("GITHUB_RECONCILIATION_REQUIRED");
+
+      expect(fixture.database.prepare(
+        `SELECT COUNT(*) AS count FROM sync_cursors
+         WHERE project_id = ? AND repository_id = ?`
+      ).get(projectId, repositoryId)).toEqual({ count: expectedCursorCount });
+      if (expectedCursorCount === 1) {
+        expect(fixture.database.prepare(
+          `SELECT status, next_sync_at FROM sync_cursors
+           WHERE project_id = ? AND repository_id = ?`
+        ).get(projectId, repositoryId)).toEqual({
+          status: "paused",
+          next_sync_at: null
+        });
+      }
+      expect(fixture.database.prepare(
+        "SELECT COUNT(*) AS count FROM github_sync_dispatch_items"
+      ).get()).toEqual({ count: 0 });
+      expect(fixture.database.prepare(
+        `SELECT COUNT(*) AS count
+         FROM github_sync_dispatch_materialization_receipts`
+      ).get()).toEqual({ count: 0 });
+    }
+  );
+
+  it("rejects an over-budget multi-project inventory before partial durable work", async () => {
+    const fixture = createDatabase();
+    const trackedRefsJson = JSON.stringify(
+      Array.from(
+        { length: 512 },
+        (_, index) => `refs/heads/admission-${index}`
+      )
+    );
+    seedAdmissionRepository(fixture.database, {
+      projectId: "admission-project-a",
+      repositoryId: "admission-repository-a",
+      externalId: 42,
+      trackedRefsJson
+    });
+    seedAdmissionRepository(fixture.database, {
+      projectId: "admission-project-b",
+      repositoryId: "admission-repository-b",
+      externalId: 43,
+      expectedOwnerExternalId: 8,
+      owner: "memenow-secondary",
+      trackedRefsJson
+    });
+    const scheduledTime =
+      canonicalGitHubSyncSlot(Date.now()) + 6 * 60 * 60 * 1_000;
+    const identity = await githubDispatchIdentity(
+      "credential-current",
+      scheduledTime
+    );
+    const refWorkflow = {
+      createBatch: vi.fn()
+    } as unknown as Workflow;
+
+    await expect(
+      runGitHubDispatchWorkflow(
+        {
+          dispatchId: identity.dispatchId,
+          credentialVersion: "credential-current",
+          scheduledFor: identity.scheduledFor,
+          utcDate: identity.utcDate
+        },
+        identity.instanceId,
+        createImmediateWorkflowStep(),
+        {
+          MEMORY_DB: fixture.d1,
+          GITHUB_SYNC_ENABLED: "true",
+          GITHUB_CLASSIC_TOKEN: "synthetic-token",
+          GITHUB_CREDENTIAL_VERSION: "credential-current",
+          GITHUB_REF_SYNC_WORKFLOW: refWorkflow
+        }
+      )
+    ).rejects.toThrow("GITHUB_PARTIAL_SYNC");
+
+    expect(fixture.database.prepare(
+      `SELECT COUNT(*) AS count FROM sync_cursors
+       WHERE project_id IN ('admission-project-a', 'admission-project-b')`
+    ).get()).toEqual({ count: 0 });
+    expect(fixture.database.prepare(
+      `SELECT COUNT(*) AS count FROM github_sync_dispatch_items
+       WHERE dispatch_id = ?`
+    ).get(identity.dispatchId)).toEqual({ count: 0 });
+    expect(fixture.database.prepare(
+      `SELECT COUNT(*) AS count
+       FROM github_sync_dispatch_materialization_receipts
+       WHERE dispatch_id = ?`
+    ).get(identity.dispatchId)).toEqual({ count: 0 });
+    expect(fixture.database.prepare(
+      `SELECT COUNT(*) AS count FROM github_credential_sync_lane
+       WHERE credential_version = 'credential-current'`
+    ).get()).toEqual({ count: 0 });
+    expect(fixture.database.prepare(
+      `SELECT status, last_error_code FROM github_sync_dispatches
+       WHERE dispatch_id = ?`
+    ).get(identity.dispatchId)).toEqual({
+      status: "failed",
+      last_error_code: "GITHUB_PARTIAL_SYNC"
+    });
+    expect(refWorkflow.createBatch).not.toHaveBeenCalled();
+  });
+
   it("recovers the terminal materialization receipt after response loss", async () => {
     const fixture = createDatabase({
       remaining: 1,
@@ -1433,6 +2238,10 @@ describe("GitHub Workflow migration", () => {
 interface SqliteFault {
   remaining: number;
   matches(sql: string): boolean;
+  beforeBatch?: (
+    database: DatabaseSync,
+    statements: readonly string[]
+  ) => void;
 }
 
 function createDatabase(fault?: SqliteFault): {
@@ -1448,6 +2257,50 @@ function createDatabase(fault?: SqliteFault): {
   }
   const d1 = new SqliteD1(database, fault) as unknown as D1Database;
   return { database, d1 };
+}
+
+function seedAdmissionRepository(
+  database: DatabaseSync,
+  input: {
+    projectId: string;
+    repositoryId: string;
+    externalId: number;
+    expectedOwnerExternalId?: number;
+    owner?: string;
+    trackedRefsJson: string;
+  }
+): void {
+  const timestamp = "2026-07-29T00:00:00.000Z";
+  database.prepare(
+    `INSERT INTO projects
+     (project_id, project_ref, locator, display_name, project_version,
+      created_at, updated_at)
+     VALUES (?, ?, ?, ?, 0, ?, ?)`
+  ).run(
+    input.projectId,
+    `project.${input.projectId}`,
+    `locator.${input.projectId}`,
+    input.projectId,
+    timestamp,
+    timestamp
+  );
+  database.prepare(
+    `INSERT INTO repositories
+     (repository_id, project_id, provider, external_id,
+      expected_owner_external_id, owner, name, default_branch,
+      tracked_refs_json, sync_enabled, created_at, updated_at)
+     VALUES (?, ?, 'github', ?, ?, ?, ?, 'main', ?, 1, ?, ?)`
+  ).run(
+    input.repositoryId,
+    input.projectId,
+    input.externalId,
+    input.expectedOwnerExternalId ?? 7,
+    input.owner ?? "memenow",
+    input.repositoryId,
+    input.trackedRefsJson,
+    timestamp,
+    timestamp
+  );
 }
 
 function seedWorkflowRepository(database: DatabaseSync): {
@@ -1610,10 +2463,14 @@ class SqliteD1 {
   async batch(statements: D1PreparedStatement[]): Promise<D1Result[]> {
     const sqliteStatements = statements as unknown as SqliteStatement[];
     const results: D1Result[] = [];
+    this.fault?.beforeBatch?.(
+      this.database,
+      sqliteStatements.map((statement) => statement.sourceSql())
+    );
     this.database.exec("BEGIN IMMEDIATE");
     try {
       for (const statement of sqliteStatements) {
-        results.push(statement.executeWithoutResponseFault());
+        results.push(statement.executeBatchWithoutResponseFault());
       }
       this.database.exec("COMMIT");
     } catch (error) {
@@ -1643,6 +2500,10 @@ class SqliteStatement {
     return this;
   }
 
+  sourceSql(): string {
+    return this.sql;
+  }
+
   run(): Promise<D1Result> {
     const result = this.executeWithoutResponseFault();
     if (this.consumeResponseFault()) {
@@ -1657,6 +2518,18 @@ class SqliteStatement {
       success: true,
       meta: { changes: Number(result.changes) },
       results: []
+    } as unknown as D1Result;
+  }
+
+  executeBatchWithoutResponseFault(): D1Result {
+    const statement = this.database.prepare(this.sql);
+    if (statement.columns().length === 0) {
+      return this.executeWithoutResponseFault();
+    }
+    return {
+      success: true,
+      meta: {},
+      results: statement.all(...this.bindings)
     } as unknown as D1Result;
   }
 

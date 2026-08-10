@@ -55,6 +55,19 @@ Query mode defaults to five results and is capped at ten. Browse mode is capped
 at fifty. Pagination is keyset-based and uses an opaque HMAC token; offset
 pagination and server-side cursor sessions are not supported.
 
+In query mode, each `memories[]` entry contains `excerpt` rather than the full
+formal-memory body. `excerpt` is taken from the exact recalled chunk after that
+chunk has been deterministically recomputed from the authorized current D1 head;
+FTS and Vectorize content is never returned or sent to the reranker. The
+`excerptTruncated` boolean is `true` only when the authoritative chunk was
+shortened, on a Unicode code-point boundary, to fit the remaining default
+2,500-token context budget. `contentSha256` continues to identify the complete
+authoritative revision, not the excerpt. The memory ID, revision ID, chunk ID,
+and every evidence ID remain on the result and are rendered as explicit
+citations in `context_pack`. Use the authorized
+`memory://projects/{project_ref}/memories/{memory_id}` resource when the full
+current content is required.
+
 `memory_search.filters.scope` and `memory_search.filters.scope_id` form one
 atomic filter. Callers must provide both fields or omit both fields in query and
 browse modes. Supplying either field alone returns `VALIDATION_FAILED` before
@@ -154,6 +167,8 @@ memory resources use the hierarchical ACL: a repository reader can read project
 memory and memory owned by its repository, but receives
 `RESOURCE_UNAVAILABLE` for memory owned by another repository. This preserves
 resource non-disclosure while keeping the project snapshot a project-only view.
+The current-memory resource returns the complete authorized formal-memory body;
+query excerpts do not replace or weaken this resource read path.
 
 Candidate approval validates structured edits and evidence, then performs the
 formal revision, head, audit, idempotency, outbox, and project-version changes in

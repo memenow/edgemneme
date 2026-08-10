@@ -15,7 +15,7 @@ const D1_COMPATIBLE: D1Compatible = true;
 const R2_COMPATIBLE: R2Compatible = true;
 
 describe("Cloudflare projection publisher", () => {
-  it("reads all authoritative rows through first-primary and activates the complete snapshot", async () => {
+  it("reads current authoritative heads through first-primary and activates the snapshot", async () => {
     expect(D1_COMPATIBLE).toBe(true);
     expect(R2_COMPATIBLE).toBe(true);
     const database = await createDatabase();
@@ -34,7 +34,7 @@ describe("Cloudflare projection publisher", () => {
       snapshotId: "project-1:9",
       manifestKey: "projects/project-1/projections/9/manifest.json",
       manifestSha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
-      writeCount: 33
+      writeCount: 32
     });
     expect(database.sessionConstraints).toEqual([
       "first-primary",
@@ -54,7 +54,7 @@ describe("Cloudflare projection publisher", () => {
       9,
       "project-1:9"
     ]);
-    expect(bucket.objects.size).toBe(33);
+    expect(bucket.objects.size).toBe(32);
     expect(bucket.objects.has("projects/project-1/projections/9/README.md")).toBe(true);
     expect(bucket.objects.has("projects/project-1/projections/9/objects/8e/memory-1.md")).toBe(
       true
@@ -63,7 +63,7 @@ describe("Cloudflare projection publisher", () => {
       bucket.objects.has(
         "projects/project-1/projections/9/revisions/8e/memory-1/revision-1.md"
       )
-    ).toBe(true);
+    ).toBe(false);
     expect(
       bucket.objects.has(
         "projects/project-1/projections/9/revisions/8e/memory-1/revision-2.md"
@@ -74,13 +74,6 @@ describe("Cloudflare projection publisher", () => {
         "projects/project-1/projections/9/revisions/8e/memory-1/revision-2.md"
       )?.body
     ).toContain('evidence_ids: ["evidence-a", "evidence-b"]');
-    const unboundedRevision = bucket.objects.get(
-      "projects/project-1/projections/9/revisions/8e/memory-1/revision-1.md"
-    )?.body;
-    expect(unboundedRevision).toContain("\nvalid_from: null\n");
-    expect(unboundedRevision).toContain(
-      '\nvalid_until: "2026-07-25T00:00:00.000Z"\n'
-    );
     if (result.status !== "activated") {
       throw new Error("Synthetic projection was not activated.");
     }
@@ -103,12 +96,82 @@ describe("Cloudflare projection publisher", () => {
       valid_from: "2026-07-25T00:00:00.000Z",
       valid_until: null
     });
-    expect(
-      manifestBody.revisions.find((revision) => revision.revision_id === "revision-1")
-    ).toMatchObject({
-      valid_from: null,
-      valid_until: "2026-07-25T00:00:00.000Z"
+    expect(manifestBody.revisions.map((revision) => revision.revision_id)).toEqual([
+      "revision-2"
+    ]);
+  });
+
+  it("omits an invalidated memory, all of its revisions, and its evidence", async () => {
+    const database = await createDatabase();
+    const invalidatedContent = "Historical content that must not remain in the current snapshot.";
+    database.heads.push({
+      memory_id: "memory-invalidated",
+      current_revision_id: "revision-invalidated",
+      memory_version: 1,
+      kind: "fact",
+      memory_class: "semantic",
+      scope: "project",
+      scope_id: "project-1",
+      status: "invalidated"
     });
+    database.revisions.push({
+      memory_id: "memory-invalidated",
+      revision_id: "revision-invalidated",
+      memory_version: 1,
+      content: invalidatedContent,
+      content_sha256: await sha256(invalidatedContent),
+      valid_from: null,
+      valid_until: null,
+      kind: "fact",
+      memory_class: "semantic",
+      scope: "project",
+      scope_id: "project-1",
+      status: "invalidated"
+    });
+    database.evidence.push({
+      revision_id: "revision-invalidated",
+      evidence_id: "evidence-invalidated"
+    });
+    const bucket = new FakeBucket();
+
+    const result = await publishProjectProjection({
+      memoryDb: database,
+      projections: bucket,
+      projectId: "project-1",
+      projectVersion: 9
+    });
+
+    expect(result).toMatchObject({ status: "activated", writeCount: 32 });
+    expect(database.allQueries).toHaveLength(3);
+    expect(database.allQueries.every((query) => query.includes("m.status IN ('active', 'contested')")))
+      .toBe(true);
+    const published = [...bucket.objects.values()].map((object) => object.body).join("\n");
+    expect(published).not.toContain("memory-invalidated");
+    expect(published).not.toContain("revision-invalidated");
+    expect(published).not.toContain("evidence-invalidated");
+    expect(published).not.toContain(invalidatedContent);
+  });
+
+  it("reactivates a safely corrected head without republishing unsafe legacy history", async () => {
+    const database = await createDatabase();
+    const unsafeLegacyContent = "<script>legacy scanner-flagged content</script>";
+    database.revisions[0]!.content = unsafeLegacyContent;
+    database.revisions[0]!.content_sha256 = await sha256(unsafeLegacyContent);
+    const bucket = new FakeBucket();
+
+    const result = await publishProjectProjection({
+      memoryDb: database,
+      projections: bucket,
+      projectId: "project-1",
+      projectVersion: 9
+    });
+
+    expect(result).toMatchObject({ status: "activated", writeCount: 32 });
+    const published = [...bucket.objects.values()].map((object) => object.body).join("\n");
+    expect(published).toContain("Use D1 as the only source of truth.");
+    expect(published).not.toContain(unsafeLegacyContent);
+    expect(published).not.toContain("revision-1");
+    expect(published).not.toContain("evidence-old");
   });
 
   it("returns stale before reading memories when the requested version is already old", async () => {
@@ -176,9 +239,9 @@ describe("Cloudflare projection publisher", () => {
       snapshotId: "project-1:9",
       expectedProjectVersion: 9,
       observedProjectVersion: null,
-      writeCount: 33
+      writeCount: 32
     });
-    expect(bucket.objects.size).toBe(33);
+    expect(bucket.objects.size).toBe(32);
     expect(database.batchCalls).toHaveLength(1);
   });
 
@@ -215,9 +278,9 @@ describe("Cloudflare projection publisher", () => {
       projectVersion: 9
     });
 
-    expect(bucket.objects.size).toBe(33);
-    expect(bucket.putCount).toBe(66);
-    expect(bucket.headCount).toBe(33);
+    expect(bucket.objects.size).toBe(32);
+    expect(bucket.putCount).toBe(64);
+    expect(bucket.headCount).toBe(32);
     expect(database.batchCalls).toHaveLength(2);
   });
 
@@ -241,7 +304,7 @@ describe("Cloudflare projection publisher", () => {
 
   it("rejects a D1 revision whose stored content checksum has drifted", async () => {
     const database = await createDatabase();
-    database.revisions[0]!.content_sha256 = "0".repeat(64);
+    database.revisions[1]!.content_sha256 = "0".repeat(64);
     const bucket = new FakeBucket();
 
     await expect(
@@ -251,37 +314,12 @@ describe("Cloudflare projection publisher", () => {
         projectId: "project-1",
         projectVersion: 9
       })
-    ).rejects.toThrow("D1 content checksum mismatch: revision-1");
+    ).rejects.toThrow("D1 content checksum mismatch: revision-2");
     expect(bucket.objects.size).toBe(0);
     expect(database.batchCalls).toEqual([]);
   });
 
-  it("rejects inconsistent authoritative evidence and head relationships", async () => {
-    const unknownEvidence = await createDatabase();
-    unknownEvidence.evidence.push({
-      revision_id: "missing-revision",
-      evidence_id: "evidence-x"
-    });
-    await expect(
-      publishProjectProjection({
-        memoryDb: unknownEvidence,
-        projections: new FakeBucket(),
-        projectId: "project-1",
-        projectVersion: 9
-      })
-    ).rejects.toThrow("Evidence references an unknown revision: missing-revision");
-
-    const missingHead = await createDatabase();
-    missingHead.heads[0]!.current_revision_id = null;
-    await expect(
-      publishProjectProjection({
-        memoryDb: missingHead,
-        projections: new FakeBucket(),
-        projectId: "project-1",
-        projectVersion: 9
-      })
-    ).rejects.toThrow("Formal memory has no current revision: memory-1");
-
+  it("rejects a head whose authoritative current revision is missing", async () => {
     const missingRevision = await createDatabase();
     missingRevision.heads[0]!.current_revision_id = "missing-revision";
     await expect(
@@ -402,14 +440,42 @@ class FakeDatabase implements ProjectionDatabaseLike<FakeStatement> {
 
   all(query: string): unknown[] {
     this.allQueries.push(query);
+    const currentRevisionIds = new Set(
+      this.heads
+        .filter(
+          (head) =>
+            (head.status === "active" || head.status === "contested") &&
+            head.current_revision_id !== null
+        )
+        .map((head) => head.current_revision_id)
+    );
     if (query.includes("FROM memories m") && query.includes("current_revision_id")) {
-      return this.heads;
+      return this.heads.filter(
+        (head) =>
+          (head.status === "active" || head.status === "contested") &&
+          head.current_revision_id !== null
+      );
     }
     if (query.includes("FROM memory_versions v")) {
-      return this.revisions;
+      return this.revisions.filter(
+        (revision) =>
+          (revision.status === "active" || revision.status === "contested") &&
+          currentRevisionIds.has(revision.revision_id)
+      );
     }
     if (query.includes("FROM version_evidence ve")) {
-      return this.evidence;
+      const projectedRevisionIds = new Set(
+        this.revisions
+          .filter(
+            (revision) =>
+              (revision.status === "active" || revision.status === "contested") &&
+              currentRevisionIds.has(revision.revision_id)
+          )
+          .map((revision) => revision.revision_id)
+      );
+      return this.evidence.filter((evidence) =>
+        projectedRevisionIds.has(evidence.revision_id)
+      );
     }
     throw new Error(`Unexpected synthetic all query: ${query}`);
   }

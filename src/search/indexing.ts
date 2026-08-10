@@ -12,6 +12,7 @@ import {
   vectorizeValidFromEpochMs,
   vectorizeValidUntilEpochMs
 } from "./vector-metadata";
+import { chunkMemoryContent } from "./chunking";
 
 interface SearchProjectionEnv {
   memoryDb: D1Database;
@@ -118,7 +119,6 @@ export interface SearchVectorCleanupPageResult {
   pageIdentity: string;
 }
 
-const MAX_CHUNK_TOKEN_BUDGET = 4_000;
 const EMBEDDING_DIMENSIONS = 1_024;
 const MAX_INDEX_TOKENS = 512;
 const MAX_INDEX_SYMBOLS = 256;
@@ -194,11 +194,34 @@ export async function publishMemorySearchProjection(
   if (!Number.isSafeInteger(head.project_version) || head.project_version < 0) {
     throw new Error("The authoritative project version is invalid.");
   }
+  const status = requireTaxonomyValue(head.status, MEMORY_STATUSES, "memory status");
+  if (status === "invalidated") {
+    const projectedHead = await readProjectionHead(
+      env.searchDb,
+      generation.id,
+      env.projectId,
+      env.memoryId
+    );
+    if (projectedHead === null) {
+      return true;
+    }
+    if (projectedHead.project_version > head.project_version) {
+      return false;
+    }
+    return deleteMemorySearchProjection({
+      searchDb: env.searchDb,
+      vectors: env.vectors,
+      generationId: generation.id,
+      projectId: env.projectId,
+      memoryId: env.memoryId,
+      revisionId: projectedHead.revision_id,
+      projectVersion: projectedHead.project_version
+    });
+  }
   const repositoryPartition =
     head.scope === "project" && head.scope_id === env.projectId
       ? "*"
       : requireRepositoryPartition(head.repository_id);
-  const status = requireTaxonomyValue(head.status, MEMORY_STATUSES, "memory status");
   const kind = requireTaxonomyValue(head.kind, MEMORY_KINDS, "memory kind");
   const memoryClass = requireTaxonomyValue(
     head.memory_class,
@@ -1532,29 +1555,6 @@ function hasAuthoritativeVectorMetadata(
   );
 }
 
-export function chunkMemoryContent(content: string): string[] {
-  if (content.length === 0) {
-    throw new TypeError("Memory content cannot be empty.");
-  }
-  const chunks: string[] = [];
-  let chunk = "";
-  let estimatedTokens = 0;
-  for (const codePoint of content) {
-    const tokenCost = utf8ByteLength(codePoint);
-    if (chunk !== "" && estimatedTokens + tokenCost > MAX_CHUNK_TOKEN_BUDGET) {
-      chunks.push(chunk);
-      chunk = "";
-      estimatedTokens = 0;
-    }
-    chunk += codePoint;
-    estimatedTokens += tokenCost;
-  }
-  if (chunk !== "") {
-    chunks.push(chunk);
-  }
-  return chunks;
-}
-
 export function parseQwenEmbedding(value: unknown): number[] {
   if (
     typeof value !== "object" ||
@@ -1729,23 +1729,6 @@ function braceDelta(value: string): number {
     }
   }
   return delta;
-}
-
-function utf8ByteLength(codePoint: string): number {
-  const value = codePoint.codePointAt(0);
-  if (value === undefined) {
-    return 0;
-  }
-  if (value <= 0x7f) {
-    return 1;
-  }
-  if (value <= 0x7ff) {
-    return 2;
-  }
-  if (value <= 0xffff) {
-    return 3;
-  }
-  return 4;
 }
 
 function defaultDelay(milliseconds: number): Promise<void> {

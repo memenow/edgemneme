@@ -57,7 +57,7 @@ describe("ordinary memory projection publication", () => {
 
     expect(database.reads).toContainEqual({
       sql: expect.stringContaining("AS memory_count"),
-      bindings: ["", PROJECT_ID, PROJECT_VERSION]
+      bindings: [PROJECT_ID, "", "", "", PROJECT_ID, PROJECT_VERSION]
     });
     expect(mocks.publishProjectProjection).toHaveBeenCalledWith({
       memoryDb: database,

@@ -227,6 +227,7 @@ async function requireSnapshotAuthority(
          ON memory_context.project_id = m.project_id
         AND memory_context.memory_id = m.memory_id
        WHERE m.project_id = ? AND m.current_revision_id IS NOT NULL
+         AND m.status IN ('active', 'contested')
        ORDER BY m.memory_id ASC`
     )
     .bind(projectId)
@@ -252,7 +253,7 @@ async function requireSnapshotAuthority(
     authority.content_bytes !== request.contentBytes ||
     !exactHeadSet ||
     !Number.isSafeInteger(authority.revision_count) ||
-    authority.revision_count < authority.memory_count ||
+    authority.revision_count !== authority.memory_count ||
     !Number.isSafeInteger(authority.scope_count) ||
     authority.scope_count < 0 ||
     authority.scope_count > authority.memory_count ||
@@ -280,6 +281,7 @@ async function requireSearchAuthority(
        FROM projects p
        LEFT JOIN memories m
          ON m.project_id = p.project_id AND m.memory_id = ?
+        AND m.status IN ('active', 'contested')
        LEFT JOIN memory_repository_contexts memory_context
          ON memory_context.project_id = m.project_id
         AND memory_context.memory_id = m.memory_id
@@ -327,7 +329,7 @@ export function calculateProjectionRebuildSnapshotCapacity(
   requireCapacityCount(input.revisionCount, "revision");
   requireCapacityCount(input.scopeCount, "scope");
   requireCapacityCount(input.contentBytes, "content byte");
-  if (input.revisionCount < input.memoryCount || input.scopeCount > input.memoryCount) {
+  if (input.revisionCount !== input.memoryCount || input.scopeCount > input.memoryCount) {
     throw new TypeError("The projection rebuild snapshot capacity authority is invalid.");
   }
   const writeCount =
@@ -371,34 +373,54 @@ export async function readProjectionSnapshotAuthority(
   database: Pick<D1Database, "prepare">,
   projectId: string,
   expectedProjectVersion: number,
-  scopeId: string | null = null
+  scopeId: string | null = null,
+  excludedMemoryId: string | null = null
 ): Promise<ProjectionSnapshotAuthority | null> {
+  const excludedId = excludedMemoryId ?? "";
   return database
     .prepare(
-      `SELECT p.project_version,
-              (SELECT COUNT(*) FROM memories m
-               WHERE m.project_id = p.project_id
-                 AND m.current_revision_id IS NOT NULL) AS memory_count,
-              (SELECT COUNT(*) FROM memory_versions v
-               WHERE v.project_id = p.project_id) AS revision_count,
-              (SELECT COUNT(DISTINCT m.scope_id) FROM memories m
-               WHERE m.project_id = p.project_id
-                 AND m.current_revision_id IS NOT NULL) AS scope_count,
+      `WITH projected_memories AS (
+         SELECT m.project_id, m.memory_id, m.current_revision_id, m.scope_id
+         FROM memories m
+         WHERE m.project_id = ?
+           AND m.current_revision_id IS NOT NULL
+           AND m.status IN ('active', 'contested')
+           AND (? = '' OR m.memory_id <> ?)
+       )
+       SELECT p.project_version,
+              (SELECT COUNT(*) FROM projected_memories) AS memory_count,
+              (SELECT COUNT(*)
+               FROM memory_versions v
+               JOIN projected_memories m
+                 ON m.project_id = v.project_id
+                AND m.memory_id = v.memory_id
+                AND m.current_revision_id = v.revision_id
+              ) AS revision_count,
+              (SELECT COUNT(DISTINCT m.scope_id)
+               FROM projected_memories m) AS scope_count,
               COALESCE((
                 SELECT SUM(length(CAST(v.content AS BLOB)))
                 FROM memory_versions v
-                WHERE v.project_id = p.project_id
+                JOIN projected_memories m
+                  ON m.project_id = v.project_id
+                 AND m.memory_id = v.memory_id
+                 AND m.current_revision_id = v.revision_id
               ), 0) AS content_bytes,
               EXISTS(
-                SELECT 1 FROM memories m
-                WHERE m.project_id = p.project_id
-                  AND m.current_revision_id IS NOT NULL
-                  AND m.scope_id = ?
+                SELECT 1 FROM projected_memories m
+                WHERE m.scope_id = ?
               ) AS scope_exists
        FROM projects p
        WHERE p.project_id = ? AND p.project_version = ?`
     )
-    .bind(scopeId ?? "", projectId, expectedProjectVersion)
+    .bind(
+      projectId,
+      excludedId,
+      excludedId,
+      scopeId ?? "",
+      projectId,
+      expectedProjectVersion
+    )
     .first<ProjectionSnapshotAuthority>();
 }
 

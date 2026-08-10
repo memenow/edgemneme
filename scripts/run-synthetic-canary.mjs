@@ -30,6 +30,13 @@ import {
   vectorIdsFromProjectionRows
 } from "./synthetic-canary-support.mjs";
 import {
+  assertSyntheticSearchCleanup,
+  mergeSyntheticCleanupLedgers,
+  syntheticCleanupVectorIds,
+  syntheticSearchCleanupSql,
+  syntheticSearchCleanupVerificationSql
+} from "./synthetic-canary-search-cleanup.mjs";
+import {
   canaryUuid,
   clientEnvironment,
   delay,
@@ -376,12 +383,33 @@ async function verifyFormalProjection(syntheticProjectId) {
 
 function prepareSearchCleanup(syntheticProjectId) {
   const project = sqlLiteral(syntheticProjectId);
-  const projectedRows = runD1Query(
+  const ftsRows = runD1Query(
     "SEARCH_DB",
-    `SELECT generation_id, revision_id, chunk_id
+    `SELECT generation_id, project_id, revision_id, chunk_id
      FROM memory_fts WHERE project_id = ${project}
      ORDER BY generation_id, revision_id, chunk_id`,
     "Synthetic search projection lookup"
+  );
+  const ledgerRows = runD1Query(
+    "SEARCH_DB",
+    `SELECT generation_id, project_id, revision_id, chunk_id, vector_id
+     FROM memory_fts_chunk_ledger WHERE project_id = ${project}
+     ORDER BY generation_id, revision_id, chunk_id`,
+    "Synthetic search chunk ledger lookup"
+  );
+  const cleanupReceiptRows = runD1Query(
+    "SEARCH_DB",
+    `SELECT generation_id, project_id, revision_id, chunk_id, vector_id
+     FROM memory_search_vector_cleanup_receipts WHERE project_id = ${project}
+     ORDER BY generation_id, revision_id, chunk_id`,
+    "Synthetic search vector cleanup receipt lookup"
+  );
+  const projectionDeletionRows = runD1Query(
+    "SEARCH_DB",
+    `SELECT generation_id, project_id, revision_id, chunk_count
+     FROM memory_search_projection_deletions WHERE project_id = ${project}
+     ORDER BY generation_id, revision_id`,
+    "Synthetic search projection deletion receipt lookup"
   );
   const generations = runD1Query(
     "SEARCH_DB",
@@ -397,19 +425,19 @@ function prepareSearchCleanup(syntheticProjectId) {
   const fallbackRows = generations.flatMap((generation) =>
     authoritativeRevisions.map((revision) => ({
       generation_id: generation.generation_id,
+      project_id: syntheticProjectId,
       revision_id: revision.revision_id,
       chunk_id: "chunk-0"
     }))
   );
-  const vectorIds = [
-    ...new Set(
-      vectorIdsFromProjectionRows(syntheticProjectId, [...projectedRows, ...fallbackRows])
-    )
-  ];
-  return vectorIds;
+  return syntheticCleanupVectorIds(
+    syntheticProjectId,
+    [...ftsRows, ...ledgerRows, ...cleanupReceiptRows, ...fallbackRows],
+    projectionDeletionRows
+  );
 }
 
-function deleteSearchProjection(syntheticProjectId, vectorIds) {
+function deleteSearchVectors(vectorIds) {
   if (vectorIds.length > 0) {
     runProcess(
       "pnpm",
@@ -429,16 +457,13 @@ function deleteSearchProjection(syntheticProjectId, vectorIds) {
       "ignore"
     );
   }
+}
+
+function deleteSearchState(syntheticProjectId) {
   runD1Query(
     "SEARCH_DB",
-    `DELETE FROM memory_fts WHERE project_id = ${sqlLiteral(syntheticProjectId)}`,
-    "Synthetic FTS cleanup"
-  );
-  runD1Query(
-    "SEARCH_DB",
-    `DELETE FROM memory_projection_heads
-     WHERE project_id = ${sqlLiteral(syntheticProjectId)}`,
-    "Synthetic projection head cleanup"
+    syntheticSearchCleanupSql(syntheticProjectId),
+    "Synthetic search state cleanup"
   );
 }
 
@@ -552,24 +577,38 @@ async function cleanupSyntheticProject(
   memoryCleanupPath,
   ledgerPath
 ) {
+  const discoverLedger = () => ({
+    project_id: syntheticProjectId,
+    principal_id: syntheticPrincipalId,
+    vector_ids: prepareSearchCleanup(syntheticProjectId),
+    r2_keys: prepareR2Cleanup(syntheticProjectId)
+  });
   await executeSyntheticCleanup({
     claimAdmissionFence: () =>
       claimSyntheticCleanupFence(syntheticProjectId, syntheticPrincipalId),
     waitForQuiescence: () => waitForSyntheticQuiescence(syntheticProjectId),
-    loadLedger: () =>
-      loadCleanupLedger(ledgerPath, syntheticProjectId, syntheticPrincipalId),
-    createLedger: () => ({
-      project_id: syntheticProjectId,
-      principal_id: syntheticPrincipalId,
-      vector_ids: prepareSearchCleanup(syntheticProjectId),
-      r2_keys: prepareR2Cleanup(syntheticProjectId)
-    }),
+    loadLedger: () => {
+      const persisted = loadCleanupLedger(
+        ledgerPath,
+        syntheticProjectId,
+        syntheticPrincipalId
+      );
+      return persisted === null
+        ? null
+        : mergeSyntheticCleanupLedgers(
+            syntheticProjectId,
+            syntheticPrincipalId,
+            [persisted, discoverLedger()]
+          );
+    },
+    createLedger: discoverLedger,
     writeLedger: (ledger) => writeCleanupLedger(ledgerPath, ledger),
-    deleteSearchProjection: (ledger) =>
-      deleteSearchProjection(syntheticProjectId, ledger.vector_ids),
+    deleteSearchVectors: (ledger) => deleteSearchVectors(ledger.vector_ids),
+    verifySearchVectors: (ledger) => waitForVectorizeAbsence(ledger.vector_ids),
+    deleteSearchState: () => deleteSearchState(syntheticProjectId),
     deleteR2Projections: (ledger) => deleteR2Projections(ledger.r2_keys),
     verifyProjectionCleanup: (ledger) =>
-      verifyProjectionCleanup(syntheticProjectId, ledger.vector_ids, ledger.r2_keys),
+      verifyProjectionCleanup(syntheticProjectId, ledger.r2_keys),
     deleteAuthority: () => runD1File(memoryCleanupPath, "Synthetic authority cleanup"),
     verifyAuthorityCleanup: () =>
       verifySyntheticCleanup(syntheticProjectId, syntheticPrincipalId),
@@ -657,24 +696,13 @@ function writeCleanupLedger(ledgerPath, ledger) {
   chmodSync(ledgerPath, 0o600);
 }
 
-async function verifyProjectionCleanup(syntheticProjectId, vectorIds, r2Keys) {
-  const project = sqlLiteral(syntheticProjectId);
+async function verifyProjectionCleanup(syntheticProjectId, r2Keys) {
   const search = runD1Query(
     "SEARCH_DB",
-    `SELECT
-       (SELECT COUNT(*) FROM memory_fts WHERE project_id = ${project}) AS fts_remaining,
-       (SELECT COUNT(*) FROM memory_projection_heads
-        WHERE project_id = ${project}) AS heads_remaining`,
+    syntheticSearchCleanupVerificationSql(syntheticProjectId),
     "Synthetic search cleanup verification"
   );
-  if (
-    search.length !== 1 ||
-    search[0]?.fts_remaining !== 0 ||
-    search[0]?.heads_remaining !== 0
-  ) {
-    throw new Error("Synthetic search cleanup left projected rows behind.");
-  }
-  await waitForVectorizeAbsence(vectorIds);
+  assertSyntheticSearchCleanup(search);
   await verifyR2Absence(r2Keys);
 }
 
@@ -884,18 +912,13 @@ function verifySyntheticCleanup(syntheticProjectId, syntheticPrincipalId) {
   );
   const search = runD1Query(
     "SEARCH_DB",
-    `SELECT
-       (SELECT COUNT(*) FROM memory_fts WHERE project_id = ${project}) AS fts_remaining,
-       (SELECT COUNT(*) FROM memory_projection_heads
-        WHERE project_id = ${project}) AS heads_remaining`,
+    syntheticSearchCleanupVerificationSql(syntheticProjectId),
     "Synthetic search cleanup verification"
   );
+  assertSyntheticSearchCleanup(search);
   if (
     authority.length !== 1 ||
-    Object.values(authority[0]).some((remaining) => remaining !== 0) ||
-    search.length !== 1 ||
-    search[0]?.fts_remaining !== 0 ||
-    search[0]?.heads_remaining !== 0
+    Object.values(authority[0]).some((remaining) => remaining !== 0)
   ) {
     throw new Error("Synthetic cleanup left authoritative or search rows behind.");
   }

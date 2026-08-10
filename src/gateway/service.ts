@@ -96,6 +96,7 @@ export type MemoryEvent =
       externalRepositoryId: number;
       ref: string;
       observedSha: string;
+      manifestId: string;
       idempotencyKey: string;
     }
   | {

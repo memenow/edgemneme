@@ -55,6 +55,10 @@ describe("production workflow safety", () => {
     const rollbackJob = workflowJob(deploy, "rollback_workers");
     const durableCapture = workflowStep(captureJob, "Capture production Worker state");
     const driftGate = workflowStep(deploy, "Reject deployment state drift");
+    const preMutationDriftGate = workflowStep(
+      deploy,
+      "Reject pre-mutation deployment state drift"
+    );
 
     expect(rollbackChannelJob).toContain("    environment: production-rollback\n");
     expect(rollbackChannelJob).toContain("    needs: capture_production_state\n");
@@ -70,6 +74,8 @@ describe("production workflow safety", () => {
     expect(captureJob).not.toContain("    needs:");
     expect(captureJob).toContain("    timeout-minutes: 20\n");
     expect(captureJob).toContain("    environment: production\n");
+    expect(captureJob).toContain("gateway_previous_trigger_state");
+    expect(captureJob).toContain("gateway_previous_trigger_fingerprint");
     expect(durableCapture).toContain("node scripts/capture-deployment-state.mjs");
     expect(deployJob).toContain(
       "    needs: [capture_production_state, validate_rollback_channel]\n"
@@ -77,7 +83,20 @@ describe("production workflow safety", () => {
     expect(deployJob).not.toContain("    outputs:\n");
     expect(driftGate).toContain("CAPTURED_ORCHESTRATOR_VERSION");
     expect(driftGate).toContain("OBSERVED_ORCHESTRATOR_VERSION");
+    expect(driftGate).toContain("secrets.CLOUDFLARE_API_TOKEN");
+    expect(driftGate).toContain("secrets.CLOUDFLARE_ACCOUNT_ID");
+    expect(driftGate).toContain("EXPECTED_GATEWAY_TRIGGER_STATE");
+    expect(driftGate).toContain("EXPECTED_GATEWAY_TRIGGER_FINGERPRINT");
+    expect(driftGate).toContain("gateway_trigger_state");
+    expect(driftGate).toContain("gateway_trigger_fingerprint");
+    expect(driftGate).toContain("node scripts/capture-deployment-state.mjs verify");
     expect(driftGate).toContain("state changed after the rollback snapshot");
+    expect(preMutationDriftGate).toContain(
+      "node scripts/capture-deployment-state.mjs verify-configuration"
+    );
+    expect(preMutationDriftGate).toContain("gateway_trigger_state");
+    expect(preMutationDriftGate).toContain("gateway_trigger_fingerprint");
+    expect(preMutationDriftGate).toContain("gateway-deployment-target.mjs verify-predeploy");
     expect(rollbackJob).toContain("    needs: [capture_production_state, deploy]\n");
     expect(rollbackJob).toContain("needs.deploy.result == 'failure'");
     expect(rollbackJob).toContain("needs.deploy.result == 'cancelled'");
@@ -87,6 +106,29 @@ describe("production workflow safety", () => {
       "EXPECTED_CONFIGURATION_FINGERPRINT: ${{ needs.capture_production_state.outputs.configuration_fingerprint }}"
     );
     expect(rollbackJob).toContain("secrets.CLOUDFLARE_ROLLBACK_API_TOKEN");
+    expect(rollbackJob).toContain("EXPECTED_GATEWAY_TRIGGER_STATE");
+    expect(rollbackJob).toContain("EXPECTED_GATEWAY_CURRENT_TRIGGER_STATE");
+    expect(rollbackJob).toContain("EXPECTED_GATEWAY_CURRENT_TRIGGER_FINGERPRINT");
+    expect(rollbackJob).toContain("EDGEMNEME_GATEWAY_ADVANCED_BY_RUN");
+    expect(rollbackJob).toContain("gateway_advanced_by_run=false");
+    expect(rollbackJob).toContain("gateway_advanced_by_run=true");
+    expect(rollbackJob).toContain("did not reach its captured version after rollback");
+    expect(rollbackJob).toContain("capture-rollback-current");
+    expect(rollbackJob).toContain("EDGEMNEME_GATEWAY_ALLOW_DETACHED_ABSENT=true");
+    expect(rollbackJob).toContain("capture belongs to a different tagged version");
+    expect(rollbackJob).toContain("verify-active-tag");
+    expect(rollbackJob.indexOf("capture-rollback-current")).toBeLessThan(
+      rollbackJob.indexOf("pnpm exec wrangler delete --config")
+    );
+    const bootstrapDetach = rollbackJob.indexOf(
+      "EDGEMNEME_GATEWAY_ALLOW_DETACHED_ABSENT=true"
+    );
+    const bootstrapTagRecheck = rollbackJob.indexOf("verify-active-tag");
+    const bootstrapDelete = rollbackJob.indexOf("pnpm exec wrangler delete --config");
+    expect(bootstrapTagRecheck).toBeGreaterThan(bootstrapDetach);
+    expect(bootstrapDelete).toBeGreaterThan(bootstrapTagRecheck);
+    expect(rollbackJob).toContain("gateway-deployment-target.mjs restore");
+    expect(rollbackJob).toContain("gateway_trigger_fingerprint");
     expect(rollbackJob).not.toContain("secrets.CLOUDFLARE_API_TOKEN");
     expect(rollbackJob).not.toContain("needs.deploy.outputs");
   });
@@ -124,18 +166,24 @@ describe("production workflow safety", () => {
       "node scripts/verify-github-main-head.mjs"
     );
 
-    const immediateMutationPairs = [
-      ["Revalidate Vectorize metadata admission", "Ensure semantic Vectorize metadata indexes"]
-    ] as const;
-    for (const [admission, mutation] of immediateMutationPairs) {
-      const admissionStart = deployJob.indexOf(`      - name: ${admission}\n`);
-      const mutationStart = deployJob.indexOf(`      - name: ${mutation}\n`);
-      expect(admissionStart).toBeGreaterThanOrEqual(0);
-      expect(mutationStart).toBeGreaterThan(admissionStart);
-      expect(deployJob.slice(admissionStart, mutationStart)).not.toMatch(
-        /\n      - name: /u
-      );
-    }
+    const vectorAdmissionStart = deployJob.indexOf(
+      "      - name: Revalidate Vectorize metadata admission\n"
+    );
+    const preMutationDriftGateStart = deployJob.indexOf(
+      "      - name: Reject pre-mutation deployment state drift\n"
+    );
+    const vectorMutationStart = deployJob.indexOf(
+      "      - name: Ensure semantic Vectorize metadata indexes\n"
+    );
+    expect(vectorAdmissionStart).toBeGreaterThanOrEqual(0);
+    expect(preMutationDriftGateStart).toBeGreaterThan(vectorAdmissionStart);
+    expect(vectorMutationStart).toBeGreaterThan(preMutationDriftGateStart);
+    expect(deployJob.slice(vectorAdmissionStart, preMutationDriftGateStart)).not.toMatch(
+      /\n      - name: /u
+    );
+    expect(deployJob.slice(preMutationDriftGateStart, vectorMutationStart)).not.toMatch(
+      /\n      - name: /u
+    );
 
     const lifecycleAdmissions = [
       [
@@ -181,15 +229,47 @@ describe("production workflow safety", () => {
       "node scripts/verify-github-main-head.mjs"
     );
 
+    const firstRemoteMutation = deployJob.indexOf("vectorize create-metadata-index");
+    expect(preMutationDriftGateStart).toBeGreaterThanOrEqual(0);
+    expect(firstRemoteMutation).toBeGreaterThan(preMutationDriftGateStart);
+
+    const driftGateStart = deployJob.indexOf(
+      "      - name: Reject deployment state drift\n"
+    );
+    const firstWorkerLifecycleMutation = deployJob.indexOf(
+      "      - name: Reconcile disabled GitHub sync\n"
+    );
+    expect(driftGateStart).toBeGreaterThanOrEqual(0);
+    expect(firstWorkerLifecycleMutation).toBeGreaterThan(driftGateStart);
+
     const migrationAdmission = migrateJob.indexOf(
       "      - name: Revalidate current main migration admission\n"
+    );
+    const searchAdmission = migrateJob.indexOf(
+      "      - name: Revalidate greenfield maintenance immediately before search apply\n"
+    );
+    const searchMigration = migrateJob.indexOf(
+      "      - name: Apply search database migrations\n"
+    );
+    const searchValidation = migrateJob.indexOf(
+      "      - name: Validate search database before memory migration\n"
+    );
+    const memoryAdmission = migrateJob.indexOf(
+      "      - name: Revalidate greenfield maintenance immediately before memory apply\n"
     );
     const memoryMigration = migrateJob.indexOf(
       "      - name: Apply memory database migrations\n"
     );
     expect(migrationAdmission).toBeGreaterThanOrEqual(0);
-    expect(memoryMigration).toBeGreaterThan(migrationAdmission);
-    expect(migrateJob.slice(migrationAdmission, memoryMigration)).not.toMatch(
+    expect(searchAdmission).toBeGreaterThan(migrationAdmission);
+    expect(searchMigration).toBeGreaterThan(searchAdmission);
+    expect(migrateJob.slice(searchAdmission, searchMigration)).not.toMatch(
+      /\n      - name: /u
+    );
+    expect(searchValidation).toBeGreaterThan(searchMigration);
+    expect(memoryAdmission).toBeGreaterThan(searchValidation);
+    expect(memoryMigration).toBeGreaterThan(memoryAdmission);
+    expect(migrateJob.slice(memoryAdmission, memoryMigration)).not.toMatch(
       /\n      - name: /u
     );
   });
@@ -211,6 +291,7 @@ describe("production workflow safety", () => {
       ["Verify current main deployment head", 2],
       ["Verify captured production configuration", 2],
       ["Revalidate Vectorize metadata admission", 2],
+      ["Reject pre-mutation deployment state drift", 2],
       ["Ensure semantic Vectorize metadata indexes", 5],
       ["Check projection rebuild deployment budget", 5],
       ["Reject deployment state drift", 2],
@@ -222,24 +303,29 @@ describe("production workflow safety", () => {
       ["Rebuild and verify projections", 65],
       ["Revalidate gateway deployment main", 2],
       ["Revalidate gateway deployment state", 2],
+      ["Capture deployed gateway canary target", 2],
       ["Run isolated production canary", 20],
       ["Recover isolated production canary", 12],
+      ["Reverify deployed gateway canary target", 2],
       ["Revalidate GitHub sync deployment main", 2],
       ["Revalidate GitHub sync deployment state", 2],
       ["Deploy GitHub sync", 35]
     ]);
     expect(timedSteps(workflowJob(migrate, "migrate"))).toEqual([
       ["Verify current main migration head", 2],
-      ["Require quiescent GitHub sync before migration", 7],
+      ["Capture greenfield maintenance admission before backups", 10],
       ["Capture and verify private pre-migration backups", 25],
-      ["Revalidate quiescent GitHub sync before migration apply", 7],
-      ["Revalidate current main migration admission", 2]
+      ["Revalidate current main migration admission", 2],
+      ["Revalidate greenfield maintenance immediately before search apply", 10],
+      ["Validate search database before memory migration", 5],
+      ["Revalidate greenfield maintenance immediately before memory apply", 10]
     ]);
 
     const boundedFailurePath = [
       "Verify current main deployment head",
       "Verify captured production configuration",
       "Revalidate Vectorize metadata admission",
+      "Reject pre-mutation deployment state drift",
       "Ensure semantic Vectorize metadata indexes",
       "Check projection rebuild deployment budget",
       "Reject deployment state drift",
@@ -251,18 +337,69 @@ describe("production workflow safety", () => {
       "Rebuild and verify projections",
       "Revalidate gateway deployment main",
       "Revalidate gateway deployment state",
+      "Capture deployed gateway canary target",
       "Run isolated production canary",
-      "Recover isolated production canary"
+      "Recover isolated production canary",
+      "Reverify deployed gateway canary target"
     ].reduce((total, name) => total + timeoutMinutes(workflowStep(deploy, name)), 0);
-    expect(boundedFailurePath).toBe(162);
+    expect(boundedFailurePath).toBe(168);
     expect(timeoutMinutes(workflowJob(deploy, "deploy")))
       .toBeGreaterThanOrEqual(boundedFailurePath + 30);
     const boundedMigrationPath = timedSteps(workflowJob(migrate, "migrate")).reduce(
       (total, [, timeout]) => total + timeout,
       0
     );
-    expect(boundedMigrationPath).toBe(43);
+    expect(boundedMigrationPath).toBe(64);
     expect(timeoutMinutes(workflowJob(migrate, "migrate")))
       .toBeGreaterThanOrEqual(boundedMigrationPath + 10);
+  });
+
+  it("keeps migration maintenance read-only and applies SEARCH_DB before MEMORY_DB", () => {
+    const migrateJob = workflowJob(migrate, "migrate");
+    const initial = workflowStep(
+      migrateJob,
+      "Capture greenfield maintenance admission before backups"
+    );
+    const finalSearch = workflowStep(
+      migrateJob,
+      "Revalidate greenfield maintenance immediately before search apply"
+    );
+    const finalMemory = workflowStep(
+      migrateJob,
+      "Revalidate greenfield maintenance immediately before memory apply"
+    );
+    for (const gate of [initial, finalSearch, finalMemory]) {
+      expect(gate).toContain("node scripts/d1-maintenance-admission.mjs");
+      expect(gate).toContain(
+        "D1_MIGRATION_BACKUP_R2_BUCKET: ${{ vars.D1_MIGRATION_BACKUP_R2_BUCKET }}"
+      );
+      expect(gate).not.toMatch(/\b(?:reconcile|PUT|DELETE|purge|terminate|restore)\b/iu);
+    }
+    expect(migrateJob).not.toContain("github-sync-quiescence.mjs reconcile");
+    const backup = migrateJob.indexOf(
+      "      - name: Capture and verify private pre-migration backups\n"
+    );
+    const searchGate = migrateJob.indexOf(
+      "      - name: Revalidate greenfield maintenance immediately before search apply\n"
+    );
+    const searchApply = migrateJob.indexOf(
+      "      - name: Apply search database migrations\n"
+    );
+    const searchValidation = migrateJob.indexOf(
+      "      - name: Validate search database before memory migration\n"
+    );
+    const memoryGate = migrateJob.indexOf(
+      "      - name: Revalidate greenfield maintenance immediately before memory apply\n"
+    );
+    const memoryApply = migrateJob.indexOf(
+      "      - name: Apply memory database migrations\n"
+    );
+    expect(initial).toContain("capture");
+    expect(backup).toBeGreaterThan(migrateJob.indexOf("Capture greenfield maintenance"));
+    expect(searchGate).toBeGreaterThan(backup);
+    expect(searchApply).toBeGreaterThan(searchGate);
+    expect(searchValidation).toBeGreaterThan(searchApply);
+    expect(memoryGate).toBeGreaterThan(searchValidation);
+    expect(memoryApply).toBeGreaterThan(memoryGate);
   });
 });

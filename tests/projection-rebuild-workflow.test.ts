@@ -240,6 +240,27 @@ describe("fanout projection rebuild Workflows", () => {
     expect(mocks.publishMemorySearchProjection).not.toHaveBeenCalled();
   });
 
+  it("treats an invalidated D1 head as absent when deleting its old Search projection", async () => {
+    const database = new ProjectionRebuildMemoryDb({ memoryStatus: "invalidated" });
+
+    await runProjectionRebuild(
+      environment(database),
+      deletePayload(),
+      new RetryingWorkflowStep() as never
+    );
+
+    expect(mocks.deleteMemorySearchProjection).toHaveBeenCalledWith(
+      expect.objectContaining({
+        generationId: GENERATION_ID,
+        projectId: PROJECT_ID,
+        memoryId: MEMORY_ID,
+        revisionId: REVISION_ID,
+        projectVersion: PROJECT_VERSION - 1
+      })
+    );
+    expect(mocks.publishMemorySearchProjection).not.toHaveBeenCalled();
+  });
+
   it("fails closed when the exact orphan search head cannot be deleted", async () => {
     mocks.deleteMemorySearchProjection.mockResolvedValue(false);
 
@@ -368,7 +389,7 @@ describe("fanout projection rebuild Workflows", () => {
     expect(mocks.deleteMemorySearchProjection).not.toHaveBeenCalled();
   });
 
-  it("rejects oversized snapshots by content and retry-aware subrequest estimates", async () => {
+  it("rejects oversized content and non-current snapshot revision authority", async () => {
     await expect(
       runProjectionRebuild(
         environment(
@@ -390,14 +411,10 @@ describe("fanout projection rebuild Workflows", () => {
         environment(
           new ProjectionRebuildMemoryDb({ revisionCount: 20_000, contentBytes: 0 })
         ),
-        snapshotPayload(2, {
-          revisionCount: 20_000,
-          scopeCount: 2,
-          contentBytes: 0
-        }),
+        snapshotPayload(2),
         new RetryingWorkflowStep(1) as never
       )
-    ).rejects.toThrow(/subrequests/iu);
+    ).rejects.toThrow(/authority changed/iu);
     expect(mocks.publishProjectProjection).not.toHaveBeenCalled();
   });
 });
@@ -481,6 +498,7 @@ class ProjectionRebuildMemoryDb {
   repositoryId: string | null;
   scope: string;
   scopeId: string;
+  memoryStatus: string;
 
   constructor(options: {
     projectVersion?: number;
@@ -499,6 +517,7 @@ class ProjectionRebuildMemoryDb {
     repositoryId?: string | null;
     scope?: string;
     scopeId?: string;
+    memoryStatus?: string;
   } = {}) {
     this.projectVersion = options.projectVersion ?? PROJECT_VERSION;
     this.currentRevisionId =
@@ -511,6 +530,7 @@ class ProjectionRebuildMemoryDb {
     this.repositoryId = options.repositoryId ?? null;
     this.scope = options.scope ?? "project";
     this.scopeId = options.scopeId ?? PROJECT_ID;
+    this.memoryStatus = options.memoryStatus ?? "active";
   }
 
   withSession(_constraint: "first-primary") {
@@ -534,12 +554,17 @@ class ProjectionRebuildMemoryDb {
           };
         }
         if (sql.includes("LEFT JOIN memories")) {
+          const projectedRevisionId =
+            sql.includes("m.status IN ('active', 'contested')") &&
+            database.memoryStatus === "invalidated"
+              ? null
+              : database.currentRevisionId;
           return {
             project_version: database.projectVersion,
-            revision_id: database.currentRevisionId,
-            scope: database.currentRevisionId === null ? null : database.scope,
-            scope_id: database.currentRevisionId === null ? null : database.scopeId,
-            repository_id: database.currentRevisionId === null ? null : database.repositoryId
+            revision_id: projectedRevisionId,
+            scope: projectedRevisionId === null ? null : database.scope,
+            scope_id: projectedRevisionId === null ? null : database.scopeId,
+            repository_id: projectedRevisionId === null ? null : database.repositoryId
           };
         }
         throw new Error(`Unexpected projection rebuild query: ${sql}`);

@@ -145,7 +145,7 @@ export function calculateProjectionRebuildSnapshotCapacity(input) {
   const revisionCount = requireNonNegativeCount(input.revisionCount, "snapshot revision");
   const scopeCount = requireNonNegativeCount(input.scopeCount, "snapshot scope");
   const contentBytes = requireNonNegativeCount(input.contentBytes, "snapshot content byte");
-  if (revisionCount < memoryCount || scopeCount > memoryCount) {
+  if (revisionCount !== memoryCount || scopeCount > memoryCount) {
     throw new TypeError("The projection rebuild snapshot capacity authority is invalid.");
   }
   const writeCount = memoryCount + revisionCount + scopeCount +
@@ -557,20 +557,31 @@ function eventAuthorityGuard(descriptor) {
               SELECT COUNT(*) FROM memories m
               WHERE m.project_id = p.project_id
                 AND m.current_revision_id IS NOT NULL
+                AND m.status IN ('active', 'contested')
             ) = ${descriptor.memoryCount}
             AND (
-              SELECT COUNT(*) FROM memory_versions v
+              SELECT COUNT(*)
+              FROM memory_versions v
+              JOIN memories m
+                ON m.project_id = v.project_id AND m.memory_id = v.memory_id
+               AND m.current_revision_id = v.revision_id
               WHERE v.project_id = p.project_id
+                AND m.status IN ('active', 'contested')
             ) = ${descriptor.revisionCount}
             AND (
               SELECT COUNT(DISTINCT m.scope_id) FROM memories m
               WHERE m.project_id = p.project_id
                 AND m.current_revision_id IS NOT NULL
+                AND m.status IN ('active', 'contested')
             ) = ${descriptor.scopeCount}
             AND COALESCE((
               SELECT SUM(length(CAST(v.content AS BLOB)))
               FROM memory_versions v
+              JOIN memories m
+                ON m.project_id = v.project_id AND m.memory_id = v.memory_id
+               AND m.current_revision_id = v.revision_id
               WHERE v.project_id = p.project_id
+                AND m.status IN ('active', 'contested')
             ), 0) = ${descriptor.contentBytes}
         )`;
   }
@@ -581,6 +592,7 @@ function eventAuthorityGuard(descriptor) {
               WHERE m.project_id = p.project_id
                 AND m.memory_id = ${sqlLiteral(descriptor.memoryId)}
                 AND m.current_revision_id = ${sqlLiteral(descriptor.revisionId)}
+                AND m.status IN ('active', 'contested')
                 AND (
                   (
                     m.scope = 'project'
@@ -607,6 +619,7 @@ function eventAuthorityGuard(descriptor) {
               WHERE m.project_id = p.project_id
                 AND m.memory_id = ${sqlLiteral(descriptor.memoryId)}
                 AND m.current_revision_id IS NOT NULL
+                AND m.status IN ('active', 'contested')
             )
         )`;
 }

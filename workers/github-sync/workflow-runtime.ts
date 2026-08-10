@@ -38,6 +38,8 @@ export const SYNC_STEP = {
 export const LANE_LEASE_SAFETY_MARGIN_MS = 5_000;
 export const MAX_PRIOR_RECONCILIATION_PAGES = 64;
 export const MAX_PRIOR_RECONCILIATION_SUBREQUESTS = 7_200;
+export const MAX_PRIOR_RECONCILIATION_STEPS =
+  1 + MAX_PRIOR_RECONCILIATION_PAGES * 2;
 export const MAX_LIST_RECONCILIATION_SUBREQUESTS = 3;
 export const MAX_PENDING_RECONCILIATION_SUBREQUESTS_PER_ROW = 9;
 export const MAX_ORPHAN_RECONCILIATION_SUBREQUESTS_PER_ROW = 6;
@@ -46,7 +48,22 @@ export const MAX_DISPATCH_RECONCILIATION_SUBREQUESTS_PER_ROW = 6;
 export const MAX_RUNNING_RECONCILIATION_ROWS = 40;
 // D1 query quota counts both statements in finishDispatchItem's batch.
 export const MAX_RUNNING_RECONCILIATION_QUERIES_PER_INVOCATION_ROW = 21;
+const GITHUB_WORKFLOW_STEP_RESULT_LIMIT_BYTES = 2 ** 20;
+const GITHUB_WORKFLOW_STEP_RESULT_RESERVE_BYTES = 8 * 1024;
 const GITHUB_SYNC_ERROR_CODE_SET = new Set<string>(GITHUB_SYNC_ERROR_CODES);
+
+function assertPersistableReconciliationStepResult<T>(value: T): T {
+  const serialized = JSON.stringify(value);
+  if (
+    serialized !== undefined &&
+    new TextEncoder().encode(serialized).byteLength >
+      GITHUB_WORKFLOW_STEP_RESULT_LIMIT_BYTES -
+        GITHUB_WORKFLOW_STEP_RESULT_RESERVE_BYTES
+  ) {
+    throw new GitHubSyncError("GITHUB_RECONCILIATION_REQUIRED");
+  }
+  return value;
+}
 
 export function createPriorReconciliationBudget(): {
   reservePage(): void;
@@ -84,6 +101,13 @@ export function createPriorReconciliationBudget(): {
       return subrequests;
     }
   };
+}
+
+export interface PriorReconciliationUsage {
+  pageCount: number;
+  mutationPageCount: number;
+  subrequestCount: number;
+  workflowStepCount: number;
 }
 
 export interface SerializedSyncAttempt {
@@ -151,14 +175,23 @@ export async function acquireCredentialLane(
   env: ActiveGitHubSyncEnv,
   holderKind: "dispatch" | "ref",
   holderId: string,
-  absoluteDeadlineMs: number
+  absoluteDeadlineMs: number,
+  options: { maxAttempts?: number } = {}
 ): Promise<GitHubCredentialLaneToken> {
+  const maxAttempts = options.maxAttempts ?? 1_024;
+  if (
+    !Number.isSafeInteger(maxAttempts) ||
+    maxAttempts < 1 ||
+    maxAttempts > 1_024
+  ) {
+    throw new TypeError("The GitHub credential lane attempt limit is invalid.");
+  }
   const claimId = await credentialLaneClaimId({
     credentialVersion: env.GITHUB_CREDENTIAL_VERSION,
     holderKind,
     holderId
   });
-  for (let attempt = 0; attempt < 1_024; attempt += 1) {
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     const claimNowMs = await step.do(
       `establish credential lane clock ${attempt + 1}`,
       () => Promise.resolve(Date.now())
@@ -526,7 +559,7 @@ async function listPendingDispatchItems(
        AND item.run_id IS NULL
      ORDER BY item.item_id LIMIT 100`
   ).bind(dispatchId).all<DispatchItemIdentityRow>();
-  return rows.results;
+  return assertPersistableReconciliationStepResult(rows.results);
 }
 
 async function rejectPendingDispatchItems(
@@ -602,7 +635,7 @@ async function listPriorPendingDispatchItems(
        AND (item.scheduled_for < ? OR dispatch.credential_version <> ?)
      ORDER BY item.scheduled_for, item.item_id LIMIT 100`
   ).bind(scheduledFor, credentialVersion).all<DispatchItemIdentityRow>();
-  return rows.results;
+  return assertPersistableReconciliationStepResult(rows.results);
 }
 
 async function listPriorRecoverableRunningItems(
@@ -639,7 +672,7 @@ async function listPriorRecoverableRunningItems(
     scheduledFor,
     reconciliationNow
   ).all<PriorRunningDispatchItem>();
-  return rows.results;
+  return assertPersistableReconciliationStepResult(rows.results);
 }
 
 async function listPriorRecoverableUnboundRuns(
@@ -697,7 +730,7 @@ async function listPriorRecoverableUnboundRuns(
     afterRunId,
     afterItemId
   ).all<PriorUnboundRepositoryRun>();
-  return rows.results;
+  return assertPersistableReconciliationStepResult(rows.results);
 }
 
 async function listPriorClosableDispatches(
@@ -731,7 +764,7 @@ async function listPriorClosableDispatches(
     dispatch_id: string;
     status: "complete" | "failed";
   }>();
-  return rows.results;
+  return assertPersistableReconciliationStepResult(rows.results);
 }
 
 async function readCurrentPriorRunningItem(
@@ -826,17 +859,18 @@ async function settlePriorRunningDispatchItem(
   throw new GitHubSyncError("GITHUB_RECONCILIATION_REQUIRED");
 }
 
-export async function reconcilePriorDispatchState(
+async function reconcilePriorDispatchStateWithBudget(
   step: WorkflowStep,
   database: D1Database,
   scheduledFor: string,
   credentialVersion: string
-): Promise<void> {
+): Promise<PriorReconciliationUsage> {
   const reconciliationNow = await step.do(
     "establish prior dispatch reconciliation time",
     () => Promise.resolve(new Date().toISOString())
   );
   const budget = createPriorReconciliationBudget();
+  let mutationPageCount = 0;
   for (let page = 0; ; page += 1) {
     budget.reservePage();
     const pending = await step.do(
@@ -848,6 +882,7 @@ export async function reconcilePriorDispatchState(
     budget.reserveSubrequests(
       pending.length * MAX_PENDING_RECONCILIATION_SUBREQUESTS_PER_ROW
     );
+    mutationPageCount += 1;
     await step.do(`reject prior pending dispatch items ${page + 1}`, STEP_RETRY, async () => {
       for (const item of pending) {
         await rejectPendingDispatchItem(
@@ -879,6 +914,7 @@ export async function reconcilePriorDispatchState(
     budget.reserveSubrequests(
       orphanRuns.length * MAX_ORPHAN_RECONCILIATION_SUBREQUESTS_PER_ROW
     );
+    mutationPageCount += 1;
     await step.do(
       `finish prior unbound repository runs ${page + 1}`,
       STEP_RETRY,
@@ -914,6 +950,7 @@ export async function reconcilePriorDispatchState(
     budget.reserveSubrequests(
       running.length * MAX_RUNNING_RECONCILIATION_SUBREQUESTS_PER_ROW
     );
+    mutationPageCount += 1;
     await step.do(`finish prior running dispatch items ${page + 1}`, STEP_RETRY, async () => {
       for (const item of running) {
         await settlePriorRunningDispatchItem(
@@ -937,6 +974,7 @@ export async function reconcilePriorDispatchState(
     budget.reserveSubrequests(
       dispatches.length * MAX_DISPATCH_RECONCILIATION_SUBREQUESTS_PER_ROW
     );
+    mutationPageCount += 1;
     await step.do(`close prior dispatches ${page + 1}`, STEP_RETRY, async () => {
       for (const dispatch of dispatches) {
         await markGitHubDispatchStatus(
@@ -949,4 +987,38 @@ export async function reconcilePriorDispatchState(
       }
     });
   }
+  return {
+    pageCount: budget.pageCount,
+    mutationPageCount,
+    subrequestCount: budget.subrequestCount,
+    workflowStepCount: 1 + budget.pageCount + mutationPageCount
+  };
+}
+
+export async function reconcilePriorDispatchState(
+  step: WorkflowStep,
+  database: D1Database,
+  scheduledFor: string,
+  credentialVersion: string
+): Promise<void> {
+  await reconcilePriorDispatchStateWithBudget(
+    step,
+    database,
+    scheduledFor,
+    credentialVersion
+  );
+}
+
+export async function reconcilePriorDispatchStateWithUsage(
+  step: WorkflowStep,
+  database: D1Database,
+  scheduledFor: string,
+  credentialVersion: string
+): Promise<PriorReconciliationUsage> {
+  return reconcilePriorDispatchStateWithBudget(
+    step,
+    database,
+    scheduledFor,
+    credentialVersion
+  );
 }

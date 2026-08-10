@@ -12,7 +12,12 @@ import {
   deletionEvidenceSql,
   deletionObservationEvidenceSql,
   deletionObservationSql,
-  deletionReviewRequestSql
+  deletionReviewRequestSql,
+  withdrawalEvidenceSql,
+  withdrawalObservationEvidenceSql,
+  withdrawalObservationSql,
+  withdrawalReviewRequestSql,
+  withdrawnDeltaSql
 } from "./tree-manifest-sql";
 import {
   pendingGitHubSyncActivationGuardBindings,
@@ -584,6 +589,30 @@ export async function activateGitHubTreeManifest(input: {
           ...guardBindings
         ),
       database
+        .prepare(withdrawnDeltaSql())
+        .bind(
+          expectedManifestId,
+          descriptor.manifestId,
+          descriptor.projectId,
+          descriptor.repositoryId,
+          descriptor.ref,
+          expectedManifestId,
+          descriptor.manifestId,
+          descriptor.projectId,
+          descriptor.repositoryId,
+          descriptor.ref,
+          descriptor.projectId,
+          descriptor.repositoryId,
+          descriptor.ref,
+          expectedManifestId,
+          descriptor.manifestId,
+          activationAt,
+          expectedManifestId,
+          descriptor.projectId,
+          descriptor.manifestId,
+          ...guardBindings
+        ),
+      database
         .prepare(deletedDeltaSql())
         .bind(
           expectedManifestId,
@@ -644,6 +673,48 @@ export async function activateGitHubTreeManifest(input: {
       ),
     database
       .prepare(deletionReviewRequestSql())
+      .bind(
+        activationAt,
+        activationAt,
+        descriptor.projectId,
+        descriptor.repositoryId,
+        descriptor.ref,
+        descriptor.manifestId,
+        ...guardBindings
+      ),
+    database
+      .prepare(withdrawalEvidenceSql())
+      .bind(
+        activationAt,
+        descriptor.projectId,
+        descriptor.repositoryId,
+        descriptor.ref,
+        descriptor.manifestId,
+        ...guardBindings
+      ),
+    database
+      .prepare(withdrawalObservationSql())
+      .bind(
+        activationAt,
+        activationAt,
+        descriptor.projectId,
+        descriptor.repositoryId,
+        descriptor.ref,
+        descriptor.manifestId,
+        ...guardBindings
+      ),
+    database
+      .prepare(withdrawalObservationEvidenceSql())
+      .bind(
+        activationAt,
+        descriptor.projectId,
+        descriptor.repositoryId,
+        descriptor.ref,
+        descriptor.manifestId,
+        ...guardBindings
+      ),
+    database
+      .prepare(withdrawalReviewRequestSql())
       .bind(
         activationAt,
         activationAt,

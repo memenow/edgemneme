@@ -53,11 +53,11 @@ The initial migration drain may reconcile before backup; the final post-backup
 gate is read-only. GitHub environment-secret deletion and PAT revocation remain
 explicit operator actions after reconciliation.
 
-The protected `MEMORY_GATEWAY_EXPECTED_HOST` deployment variable contains only
-the exact public hostname. Before any deployment write, the workflow requires
-the public URL to be an HTTPS `/mcp` endpoint on that host. The same pin is
-passed to the bearer-bearing canary but not to the Wrangler renderer or custom
-route configuration, including when the gateway uses `workers.dev`.
+Before the bearer-bearing production canary, the workflow derives the exact
+HTTPS `/mcp` endpoint and hostname from the gateway's verified Cloudflare
+workers.dev or custom-domain trigger. It also binds that target to this run's
+tagged 100-percent active version and rechecks both version and trigger after
+cleanup. A separately configured URL or hostname is not deployment authority.
 
 ## MCP ingress boundary
 
@@ -117,8 +117,8 @@ The GitHub client:
 - constructs URLs internally;
 - fixes the origin to `https://api.github.com`;
 - sets API version `2026-03-10`;
-- accepts only allowlisted repository metadata, ref, commit, tree, and blob
-  paths;
+- accepts only allowlisted repository metadata, ref, annotated-tag object,
+  commit, tree, and blob paths;
 - uses `redirect: "manual"` and rejects every redirect;
 - verifies both repository and owner numeric IDs before accessing refs or
   content; owner/name are routing labels only;
@@ -133,9 +133,9 @@ The GitHub client:
   byte limit, cancels an oversized body, and reports a partial sync without
   advancing the cursor or selected head;
 - gives access-baseline discovery its own 900-request internal budget;
-- gives every ref Workflow a new 2,005-request client, a 2,000-text-file limit,
-  a 16 MiB retrieval limit, per-fetch cancellation, and an absolute run
-  deadline;
+- gives every ref Workflow a new 2,013-request client, including at most eight
+  cycle-checked annotated-tag peel requests, a 2,000-text-file limit, a 16 MiB
+  retrieval limit, per-fetch cancellation, and an absolute run deadline;
 - materializes every due ref as a durable item instead of imposing a per-Cron
   two-ref rotation; and
 - routes dispatcher and ref access through one D1 credential lane that fences
@@ -239,6 +239,17 @@ tombstone; only its path digest, blob SHA, byte size, and disposition remain.
 Binary and generated blobs keep explicit excluded dispositions so the complete
 tree can be reconciled without sending their bodies to a model.
 
+A text source that becomes binary, generated, or sensitive is recorded as a
+`withdrawn` delta rather than being disguised as a deletion or ordinary change.
+The withdrawal evidence has an independent deterministic identity, a null
+`repository_path`, no content, and a locator containing only repository,
+commit, manifest, and path digests. The old clear evidence is never converted to
+a tombstone or overwritten. Only active or contested memories whose current
+revision still cites that clear source receive a bodyless pending maintainer
+review. A same-SHA recovery to text reuses the stable clear identity; sensitive
+tombstones use a separate classification identity, so both records remain
+immutable.
+
 Size rejection is not a tombstone path. Text from 16 KiB plus one byte through
 64 KiB fails the run with `GITHUB_PARTIAL_SYNC` after retrieval. A text tree
 entry larger than 64 KiB fails with the same code before the blob is fetched.
@@ -265,6 +276,11 @@ connector creates bodyless `repository_path_absent` evidence and a pending
 maintainer review whose structured analysis lists any affected memory IDs. The
 atomic manifest activation batch never changes a formal memory revision or
 status directly.
+
+The post-sync `pending_review` cursor transition is also fenced by the exact
+active manifest ID in addition to project, repository, ref, and observed commit.
+An older event for a different manifest at the same commit is therefore a
+no-op and cannot regress a completed newer cursor.
 
 GitHub provenance records the verified repository ID, ref, normalized path, and
 one authority value: `default_branch` for the configured default branch or

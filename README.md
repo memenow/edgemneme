@@ -49,13 +49,18 @@ of the default deployment path.
   protocol and immutable execution history.
 - `github-sync` exposes no public route. Its six-hour UTC Scheduled Trigger only
   creates or recovers stable dispatch and retention Workflow instances. The
-  dispatcher validates the credential and repository-access baseline,
-  materializes every due ref as a durable D1 item, and creates bounded per-ref
-  Workflow children in batches of at most 100. A D1 credential lane serializes
-  PAT access across Workflow isolates with claim and epoch fencing. Access
+  dispatcher first counts and fingerprints every enabled repository row and
+  parsed ref, then rejects any batch whose retry-aware D1, GitHub, Workflow
+  binding, step, fan-out, or failure-cleanup reservation cannot fit. Rejection
+  occurs before any current-batch cursor, item, or materialization receipt. An
+  admitted batch validates the credential and repository-access baseline,
+  materializes every admitted due ref as a durable D1 item, and creates bounded
+  per-ref Workflow children in batches of at most 100. A D1 credential lane
+  serializes PAT access across Workflow isolates with claim and epoch fencing. Access
   discovery is bounded to 900 GitHub requests; each ref attempt is independently
-  bounded to 2,005 requests, 2,000 inspected text files, and 16 MiB of retrieved
-  content. Every due ref is durably scheduled, but GitHub's shared PAT limits mean
+  bounded to 2,013 requests, including at most eight annotated-tag peel requests,
+  2,000 inspected text files, and 16 MiB of retrieved content. Every admitted
+  due ref is durably scheduled, but GitHub's shared PAT limits mean
   completion within the same six-hour slot is not guaranteed. The first due item
   for each ref on a UTC day performs a complete current-tree reconciliation, even
   when its child starts later or the midnight trigger was missed. Each successful
@@ -193,19 +198,37 @@ Never replace them in tracked files. `scripts/render-wrangler-config.mjs`
 creates ignored, mode-`0600` configuration under `wrangler/.wrangler/` from the
 GitHub `production` environment.
 
-Configure these environment variables for deployment:
+Configure these environment variables for deployment and production migration:
 
 - `CF_D1_MEMORY_DATABASE_ID`
 - `CF_D1_SEARCH_DATABASE_ID`
 - `CF_RATE_LIMIT_NAMESPACE_EDGE`
 - `CF_RATE_LIMIT_NAMESPACE_CLIENT`
 - `CF_RATE_LIMIT_NAMESPACE_PRINCIPAL`
+- `D1_MIGRATION_BACKUP_R2_BUCKET` (dedicated private, backup-only R2 bucket)
+- `D1_MIGRATION_BACKUP_RETENTION_DAYS` (integer from 30 through 365)
 - `ENABLE_GITHUB_SYNC` (`false` until explicitly approved)
-- `MEMORY_GATEWAY_PUBLIC_URL` (required HTTPS `/mcp` endpoint for the production canary)
-- `MEMORY_GATEWAY_EXPECTED_HOST` (required hostname-only pin for the production canary)
 - `MEMORY_GATEWAY_ALLOWED_ORIGINS` (optional comma-separated HTTPS origins)
 - `MEMORY_GATEWAY_CUSTOM_DOMAIN` (optional route only; an empty value uses `workers.dev`)
 - `SYNC_CREDENTIAL_VERSION` (required only when GitHub sync is enabled)
+
+The deployment workflow derives the production canary URL and hostname from
+the verified remote gateway trigger. Do not configure a separate canary URL or
+host as deployment authority.
+
+The D1 migration backup bucket must use the default R2 jurisdiction, have no
+custom domain registration or enabled `r2.dev` URL, and must never appear in a
+tracked or generated Worker `r2_buckets` binding. Configure exactly one enabled
+object-deletion lifecycle rule for `system/backups/d1-migrations/` with ID
+`edgemneme-d1-migration-backups-retention`; its age in seconds must equal
+`D1_MIGRATION_BACKUP_RETENTION_DAYS * 86400`. The migration workflow validates
+the bucket and lifecycle through the Cloudflare API before exporting and again
+immediately before uploading production data. It never creates or repairs this
+control-plane configuration. The maintenance gate also resolves every live
+Worker's exact 100% active version and rejects the backup bucket when it appears
+in that immutable version's resource bindings; the checked-out Wrangler scan is
+not treated as proof that a renamed or unrelated live Worker is isolated. See
+[Operations](docs/operations.md#provisioning-order) for the exact rule shape.
 
 Create a separate `production-rollback` environment for unattended recovery.
 Restrict it to `main`, configure no required reviewers or wait timer, copy the
@@ -219,10 +242,10 @@ capture emits only a SHA-256 configuration fingerprint. The rollback preflight
 must match that fingerprint and read the captured Worker state with the
 dedicated credential before deployment can continue.
 
-The public URL and expected host must identify the same endpoint. The expected
-host remains required when `MEMORY_GATEWAY_CUSTOM_DOMAIN` is empty and the
-gateway uses its `workers.dev` hostname. It is passed only to deployment
-validation and the canary; the Wrangler renderer never treats it as a route.
+The production canary URL and host are derived from the gateway's verified
+Cloudflare trigger after the workflow proves this run's exact active version
+and tag. Separately configured URL and host values are not accepted as
+deployment authority.
 
 Configure `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`,
 `TOKEN_DIGEST_PEPPER`, and `PAGE_TOKEN_HMAC_KEY` as protected environment
@@ -259,7 +282,19 @@ every pass and requires two all-zero observations 60 seconds apart before
 deleting the Worker secret. This operational writer cannot change formal memory.
 Unknown, malformed, rate-limited, or drifting control-plane state fails closed.
 Production D1 migrations use the separate manual workflow and require the exact
-confirmation value `APPLY`.
+confirmation value `APPLY`. The current admission is intentionally
+greenfield-only: it performs two stable, read-only observations before backup,
+repeats them against the captured fingerprint immediately before the first D1
+write, and fails with `MISSING_DURABLE_MAINTENANCE_FENCE` if any core Worker,
+core Workflow definition, production data, or live Worker binding to either
+generated D1 UUID exists. Any live binding to the backup-only R2 bucket also
+blocks the migration. Service, D1, and R2 checks use immutable active-version
+resources, and the full normalized account binding inventory participates in
+the maintenance fingerprint. Queue metrics are approximate corroboration, not
+a drain proof. The workflow applies and validates SEARCH_DB before MEMORY_DB; a
+partial success remains in maintenance and is recovered only by roll-forward.
+See the operations runbook for the complete control-plane, SEARCH `0005`,
+backup, and future in-place-upgrade boundary.
 
 The deployment and migration workflows share the workflow-level
 `production-cloudflare` concurrency group with `queue: max`, so queued

@@ -30,6 +30,7 @@ const RELEASE_SHA = "2".repeat(40);
 const RELEASE_TREE_SHA = "3".repeat(40);
 const SECOND_REPOSITORY_SHA = "4".repeat(40);
 const SECOND_REPOSITORY_TREE_SHA = "5".repeat(40);
+const ANNOTATED_TAG_SHA = "6".repeat(40);
 const TOKEN_EXPIRATION_HEADER = "2099-10-26 00:00:00 UTC";
 const TOKEN_EXPIRATION_ISO = "2099-10-26T00:00:00.000Z";
 
@@ -516,19 +517,33 @@ describe("GitHub sync policy", () => {
       repositoryId: "repository-1",
       externalRepositoryId: 42,
       ref: "refs/heads/main",
-      observedSha: OBSERVED_SHA
+      observedSha: OBSERVED_SHA,
+      manifestId: "7".repeat(64)
     });
     const second = await buildStableSyncEvent({
       projectId: "project-1",
       repositoryId: "repository-1",
       externalRepositoryId: 42,
       ref: "refs/heads/main",
-      observedSha: OBSERVED_SHA
+      observedSha: OBSERVED_SHA,
+      manifestId: "7".repeat(64)
+    });
+    const reclassifiedManifest = await buildStableSyncEvent({
+      projectId: "project-1",
+      repositoryId: "repository-1",
+      externalRepositoryId: 42,
+      ref: "refs/heads/main",
+      observedSha: OBSERVED_SHA,
+      manifestId: "8".repeat(64)
     });
 
     expect(second).toEqual(first);
     expect(first.eventId).toMatch(/^[a-f0-9]{64}$/u);
-    expect(first.idempotencyKey).toBe(`github:42:refs/heads/main:${OBSERVED_SHA}`);
+    expect(first.manifestId).toBe("7".repeat(64));
+    expect(first.idempotencyKey).toBe(`github:42:${"7".repeat(64)}`);
+    expect(reclassifiedManifest.eventId).not.toBe(first.eventId);
+    expect(reclassifiedManifest.idempotencyKey).not.toBe(first.idempotencyKey);
+    expect(reclassifiedManifest.observedSha).toBe(first.observedSha);
   });
 
   it("builds a stable queued candidate plan with safe repository provenance", async () => {
@@ -1054,6 +1069,89 @@ describe("GitHub sync policy", () => {
         .flat()
         .some((statement) => statement.sql.includes("INSERT INTO github_tree_ref_heads"))
     ).toBe(true);
+  });
+
+  it("peels an annotated tracked tag before synchronizing its commit tree", async () => {
+    const batches: CapturedStatement[][] = [];
+    const failures: unknown[][] = [];
+    const selectedRef = "refs/tags/release";
+    const database = createFullSyncDatabase(
+      batches,
+      failures,
+      { tracked_refs_json: JSON.stringify([selectedRef]) },
+      [],
+      null,
+      [],
+      new Set([`repository-1:${selectedRef}`])
+    );
+    const fetcher = createFullSyncFetcher([], {
+      ref: selectedRef,
+      refObject: { sha: ANNOTATED_TAG_SHA, type: "tag" },
+      tagObjects: {
+        [ANNOTATED_TAG_SHA]: {
+          sha: ANNOTATED_TAG_SHA,
+          object: { sha: OBSERVED_SHA, type: "commit" }
+        }
+      }
+    });
+
+    await runScheduledWorker(database, fetcher);
+
+    expect(failures).toEqual([]);
+    expect(requestCount(fetcher, `/git/tags/${ANNOTATED_TAG_SHA}`)).toBe(1);
+    expect(requestCount(fetcher, `/commits/${OBSERVED_SHA}`)).toBe(1);
+    expect(
+      batches
+        .flat()
+        .some(
+          (statement) =>
+            statement.sql.includes("INSERT INTO github_tree_ref_heads") &&
+            statement.bindings[2] === selectedRef
+        )
+    ).toBe(true);
+  });
+
+  it("keeps a lightweight tracked tag on its direct commit", async () => {
+    const batches: CapturedStatement[][] = [];
+    const failures: unknown[][] = [];
+    const selectedRef = "refs/tags/release";
+    const database = createFullSyncDatabase(
+      batches,
+      failures,
+      { tracked_refs_json: JSON.stringify([selectedRef]) },
+      [],
+      null,
+      [],
+      new Set([`repository-1:${selectedRef}`])
+    );
+    const fetcher = createFullSyncFetcher([], { ref: selectedRef });
+
+    await runScheduledWorker(database, fetcher);
+
+    expect(failures).toEqual([]);
+    expect(requestCount(fetcher, "/git/tags/")).toBe(0);
+    expect(requestCount(fetcher, `/commits/${OBSERVED_SHA}`)).toBe(1);
+  });
+
+  it("does not peel a head that GitHub reports as a tag object", async () => {
+    const batches: CapturedStatement[][] = [];
+    const failures: unknown[][] = [];
+    const database = createFullSyncDatabase(batches, failures);
+    const fetcher = createFullSyncFetcher([], {
+      refObject: { sha: ANNOTATED_TAG_SHA, type: "tag" },
+      tagObjects: {
+        [ANNOTATED_TAG_SHA]: {
+          sha: ANNOTATED_TAG_SHA,
+          object: { sha: OBSERVED_SHA, type: "commit" }
+        }
+      }
+    });
+
+    await runScheduledWorker(database, fetcher);
+
+    expect(requestCount(fetcher, "/git/tags/")).toBe(0);
+    expect(failures).toHaveLength(1);
+    expect(failures[0]?.[5]).toBe("GITHUB_REPOSITORY_UNAVAILABLE");
   });
 
   it("completes a 2,000-blob ref with compare overhead without starving another repository", async () => {
@@ -1612,7 +1710,26 @@ function createFullSyncDatabase(
             })
           };
         }
+        if (sql.includes("WITH requested(path_digest)")) {
+          const requested = new Set(
+            JSON.parse(String(statement.bindings[0])) as string[]
+          );
+          return {
+            results: manifestEntries.filter(
+              (entry) =>
+                entry.disposition === "text" &&
+                requested.has(entry.path_digest)
+            )
+          };
+        }
         if (sql.includes("FROM github_tree_manifest_entries")) {
+          if (sql.includes("disposition = 'text'")) {
+            return {
+              results: manifestEntries.filter(
+                (entry) => entry.disposition === "text"
+              )
+            };
+          }
           const after = String(statement.bindings[2] ?? "");
           const limit = Number(statement.bindings[3] ?? 500);
           return {
@@ -1727,6 +1844,11 @@ function createFullSyncFetcher(
   options: {
     defaultBranch?: string;
     ref?: string;
+    refObject?: { sha: string; type: string };
+    tagObjects?: Record<
+      string,
+      { sha: string; object: { sha: string; type: string } }
+    >;
     refStatus?: number;
     untrustedProvenance?: Record<string, string>;
     truncated?: boolean;
@@ -1779,9 +1901,17 @@ function createFullSyncFetcher(
       }
       return Response.json({
         ref: requestedRef,
-        object: { sha: OBSERVED_SHA, type: "commit" },
+        object: options.refObject ?? { sha: OBSERVED_SHA, type: "commit" },
         ...options.untrustedProvenance
       });
+    }
+    if (url.pathname.includes("/git/tags/")) {
+      const tagSha = url.pathname.split("/git/tags/")[1] ?? "";
+      const tag = options.tagObjects?.[tagSha];
+      if (tag === undefined) {
+        throw new Error(`unexpected GitHub tag request: ${tagSha}`);
+      }
+      return Response.json(tag);
     }
     if (url.pathname.endsWith(`/commits/${OBSERVED_SHA}`)) {
       return Response.json({ sha: OBSERVED_SHA, tree: { sha: TREE_SHA } });

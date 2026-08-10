@@ -181,7 +181,7 @@ function candidateSimilarity(
   ) {
     return cosineSimilarity(left.embedding, right.embedding);
   }
-  return lexicalSimilarity(left.content, right.content);
+  return lexicalSimilarity(left.chunkContent, right.chunkContent);
 }
 
 function cosineSimilarity(left: readonly number[], right: readonly number[]): number {

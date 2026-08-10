@@ -248,7 +248,7 @@ export class WorkersAiBgeReranker implements Reranker {
     );
     const contexts = input.candidates.map((candidate) => ({
       text: requireModelText(
-        candidate.content,
+        candidate.chunkContent,
         "reranker context",
         MAX_RERANK_CONTEXT_CHARACTERS
       )

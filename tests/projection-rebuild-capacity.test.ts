@@ -106,6 +106,21 @@ describe("projection rebuild snapshot capacity preflight", () => {
     });
   });
 
+  it("rejects historical revision counts that exceed the current head count", () => {
+    const historicalAuthority = {
+      memoryCount: 1,
+      revisionCount: 2,
+      scopeCount: 1,
+      contentBytes: 128
+    };
+    expect(() => calculateWorkflowCapacity(historicalAuthority)).toThrow(
+      "snapshot capacity authority is invalid"
+    );
+    expect(() => calculateCliCapacity(historicalAuthority)).toThrow(
+      "snapshot capacity authority is invalid"
+    );
+  });
+
   it("rejects a 10,000-memory project after bounded enumeration and before history", () => {
     const project = {
       project_id: "project:oversized",

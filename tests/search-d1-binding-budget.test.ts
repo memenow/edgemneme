@@ -102,7 +102,7 @@ function fused(memoryId: string, revisionId: string): FusedRecallHit {
     projectId: "project-1",
     memoryId,
     revisionId,
-    chunkId: `chunk-${memoryId}`,
+    chunkId: "chunk-0",
     indexGeneration: GENERATION,
     retrievalScore: 0.5,
     channels: ["semantic"]

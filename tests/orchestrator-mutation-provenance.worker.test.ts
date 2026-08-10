@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { ProjectCoordinator } from "../workers/memory-orchestrator/index";
+import { projectionScopeIndexKey } from "../src/projection/markdown";
 
 const PROJECT_ID = "project-1";
 const TARGET_MEMORY_ID = "00000000-0000-4000-8000-000000000010";
@@ -131,6 +132,53 @@ describe("formal memory mutation repository provenance", () => {
     );
   });
 
+  it("rejects correction but allows invalidation of a legacy oversized scope", async () => {
+    const scopeId = `${asciiScopeIdForProjectionKeyBytes(1_024)}a`;
+    const correctionDatabase = new MutationProvenanceDatabase(scopeId);
+    const correctionResponse = await invoke(
+      correctionDatabase,
+      mutationRequest("correct", scopeId, undefined, "mutation-oversized-scope")
+    );
+
+    expect(correctionResponse.status).toBe(400);
+    await expect(correctionResponse.json()).resolves.toMatchObject({
+      code: "VALIDATION_FAILED",
+      message: expect.stringMatching(/R2 allows at most 1024 bytes/u)
+    });
+    expect(correctionDatabase.batches).toHaveLength(0);
+    expect(correctionDatabase.runCalls).toHaveLength(0);
+
+    const invalidationDatabase = new MutationProvenanceDatabase(scopeId);
+    const invalidationResponse = await invoke(
+      invalidationDatabase,
+      mutationRequest("invalidate", scopeId, undefined, "invalidate-oversized-scope")
+    );
+
+    expect(invalidationResponse.status).toBe(200);
+    expect(
+      requiredStatement(invalidationDatabase, "INSERT INTO memory_versions").bindings[4]
+    ).toBe("Memory invalidated.");
+    expect(
+      requiredStatement(
+        invalidationDatabase,
+        "UPDATE memories SET current_revision_id"
+      ).bindings[2]
+    ).toBe("invalidated");
+    expect(invalidationDatabase.reads).toContainEqual({
+      sql: expect.stringMatching(
+        /m\.status IN \('active', 'contested'\)[\s\S]*m\.memory_id <> \?/u
+      ),
+      bindings: [
+        PROJECT_ID,
+        TARGET_MEMORY_ID,
+        TARGET_MEMORY_ID,
+        scopeId,
+        PROJECT_ID,
+        7
+      ]
+    });
+  });
+
   it.each([
     {
       name: "commit",
@@ -208,7 +256,8 @@ async function invoke(
 function mutationRequest(
   operation: Operation,
   repositoryId: string | null,
-  commitSha?: string
+  commitSha?: string,
+  idempotencyKey?: string
 ): Request {
   const projectScope = repositoryId === null;
   return new Request("https://project-coordinator/mutate", {
@@ -244,9 +293,16 @@ function mutationRequest(
         session_id: null,
         worktree_id: null
       },
-      idempotency_key: `mutation-provenance-${operation}-${repositoryId ?? "project"}`
+      idempotency_key:
+        idempotencyKey ?? `mutation-provenance-${operation}-${repositoryId ?? "project"}`
     })
   });
+}
+
+function asciiScopeIdForProjectionKeyBytes(targetBytes: number): string {
+  const oneByteScopeKey = projectionScopeIndexKey(PROJECT_ID, "8", "a");
+  const fixedKeyBytes = new TextEncoder().encode(oneByteScopeKey).byteLength - 1;
+  return "a".repeat(targetBytes - fixedKeyBytes);
 }
 
 interface CapturedStatement {
@@ -319,19 +375,39 @@ class MutationProvenanceDatabase {
             memory_version: 2,
             content: "Current repository policy.",
             valid_from: null,
-            valid_until: null
+            valid_until: null,
+            history_revision_count: 2,
+            history_content_bytes: 55
           };
         }
         if (sql.includes("AS memory_count")) {
-          expect(statement.bindings).toEqual(["", PROJECT_ID, 7]);
-          return {
-            project_version: 7,
-            memory_count: 1,
-            revision_count: 2,
-            scope_count: 1,
-            content_bytes: 64,
-            scope_exists: 0
-          };
+          const excludesTarget = statement.bindings[1] === TARGET_MEMORY_ID;
+          expect(statement.bindings.slice(0, 3)).toEqual(
+            excludesTarget
+              ? [PROJECT_ID, TARGET_MEMORY_ID, TARGET_MEMORY_ID]
+              : [PROJECT_ID, "", ""]
+          );
+          expect(["", database.targetRepositoryId ?? PROJECT_ID]).toContain(
+            statement.bindings[3]
+          );
+          expect(statement.bindings.slice(4)).toEqual([PROJECT_ID, 7]);
+          return excludesTarget
+            ? {
+                project_version: 7,
+                memory_count: 1,
+                revision_count: 1,
+                scope_count: 1,
+                content_bytes: 64,
+                scope_exists: 0
+              }
+            : {
+                project_version: 7,
+                memory_count: 2,
+                revision_count: 2,
+                scope_count: 2,
+                content_bytes: 90,
+                scope_exists: 1
+              };
         }
         if (sql.includes("FROM memory_versions")) {
           expect(statement.bindings).toEqual([PROJECT_ID, TARGET_MEMORY_ID, 1]);

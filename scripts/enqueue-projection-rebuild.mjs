@@ -58,16 +58,27 @@ export function projectionRebuildTargetQuery(options = {}) {
   return `SELECT p.project_id, p.project_version,
                  (SELECT COUNT(*) FROM memories m
                   WHERE m.project_id = p.project_id
-                    AND m.current_revision_id IS NOT NULL) AS memory_count,
-                 (SELECT COUNT(*) FROM memory_versions v
-                  WHERE v.project_id = p.project_id) AS revision_count,
+                    AND m.current_revision_id IS NOT NULL
+                    AND m.status IN ('active', 'contested')) AS memory_count,
+                 (SELECT COUNT(*)
+                  FROM memory_versions v
+                  JOIN memories m
+                    ON m.project_id = v.project_id AND m.memory_id = v.memory_id
+                   AND m.current_revision_id = v.revision_id
+                  WHERE v.project_id = p.project_id
+                    AND m.status IN ('active', 'contested')) AS revision_count,
                  (SELECT COUNT(DISTINCT m.scope_id) FROM memories m
                   WHERE m.project_id = p.project_id
-                    AND m.current_revision_id IS NOT NULL) AS scope_count,
+                    AND m.current_revision_id IS NOT NULL
+                    AND m.status IN ('active', 'contested')) AS scope_count,
                  COALESCE((
                    SELECT SUM(length(CAST(v.content AS BLOB)))
                    FROM memory_versions v
+                   JOIN memories m
+                     ON m.project_id = v.project_id AND m.memory_id = v.memory_id
+                    AND m.current_revision_id = v.revision_id
                    WHERE v.project_id = p.project_id
+                     AND m.status IN ('active', 'contested')
                  ), 0) AS content_bytes
           FROM projects p
           WHERE ${clauses.join(" AND ")}
@@ -79,7 +90,8 @@ export function projectionRebuildHeadQuery(options) {
   const limit = requirePageLimit(options?.limit);
   const clauses = [
     admittedProjectPredicate("p"),
-    "m.current_revision_id IS NOT NULL"
+    "m.current_revision_id IS NOT NULL",
+    "m.status IN ('active', 'contested')"
   ];
   if (options?.projectId !== undefined) {
     clauses.push(

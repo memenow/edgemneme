@@ -107,7 +107,7 @@ function fused(memoryId = "memory-1", revisionId = "revision-1"): FusedRecallHit
     projectId: "project-1",
     memoryId,
     revisionId,
-    chunkId: `chunk-${memoryId}`,
+    chunkId: "chunk-0",
     indexGeneration: generation,
     retrievalScore: 0.5,
     channels: ["semantic"]
@@ -120,8 +120,8 @@ function validated(memoryId: string): ValidatedSearchCandidate {
     memoryId,
     revisionId: `revision-${memoryId}`,
     memoryVersion: 1,
-    chunkId: `chunk-${memoryId}`,
-    content: `Content for ${memoryId}`,
+    chunkId: "chunk-0",
+    chunkContent: `Content for ${memoryId}`,
     contentSha256: `sha-${memoryId}`,
     kind: "fact",
     memoryClass: "semantic",
@@ -915,7 +915,7 @@ describe("Cloudflare search adapters", () => {
         projectId: "project-1",
         memoryId: "memory-1",
         revisionId: "revision-1",
-        chunkId: "chunk-memory-1",
+        chunkId: "chunk-0",
         evidenceIds: ["evidence-1", "evidence-2"],
         retrievalScore: 0.5
       })

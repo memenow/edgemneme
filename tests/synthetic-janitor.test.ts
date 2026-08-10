@@ -1000,8 +1000,10 @@ function seedRepositoryScopedRows(
     `INSERT INTO github_tree_manifest_deltas
      (delta_id, project_id, repository_id, ref, old_manifest_id, new_manifest_id,
       path_digest, safe_path, change_kind, old_blob_sha, new_blob_sha,
-      affected_memory_ids_json, idempotency_key, created_at)
-     VALUES (?, ?, ?, ?, NULL, ?, ?, 'README.md', 'added', NULL, ?, '[]', ?, ?)`
+      old_disposition, new_disposition, affected_memory_ids_json,
+      idempotency_key, created_at)
+     VALUES (?, ?, ?, ?, NULL, ?, ?, 'README.md', 'added', NULL, ?, NULL,
+             'text', '[]', ?, ?)`
   ).run(
     `${projectId}-tree-delta`,
     projectId,

@@ -39,6 +39,8 @@ export interface ProjectionMemoryWrite extends ProjectionWrite {
   contentSha256: string;
 }
 
+const R2_OBJECT_KEY_MAX_UTF8_BYTES = 1_024;
+
 export async function buildProjectionObject(
   memory: ProjectionMemory
 ): Promise<ProjectionMemoryWrite> {
@@ -68,6 +70,24 @@ export function projectionPrefix(
   snapshotId: string
 ): string {
   return `projects/${pathSegment(projectId)}/projections/${pathSegment(snapshotId)}/`;
+}
+
+export function projectionScopeIndexKey(
+  projectId: string,
+  snapshotId: string,
+  scopeId: string
+): string {
+  const key =
+    `${projectionPrefix(projectId, snapshotId)}indexes/by-scope/` +
+    `${pathSegment(scopeId)}/index.json`;
+  const keyBytes = new TextEncoder().encode(key).byteLength;
+  if (keyBytes > R2_OBJECT_KEY_MAX_UTF8_BYTES) {
+    throw new RangeError(
+      `Projection scope index key is ${keyBytes} UTF-8 bytes; ` +
+        `R2 allows at most ${R2_OBJECT_KEY_MAX_UTF8_BYTES} bytes.`
+    );
+  }
+  return key;
 }
 
 export function pathSegment(value: string): string {

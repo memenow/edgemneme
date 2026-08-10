@@ -1178,10 +1178,11 @@ describe("GitHub tree manifest failure retention", () => {
           `INSERT INTO github_tree_manifest_deltas
            (delta_id, project_id, repository_id, ref, old_manifest_id,
             new_manifest_id, path_digest, safe_path, change_kind,
-            old_blob_sha, new_blob_sha, affected_memory_ids_json,
-            idempotency_key, created_at)
+            old_blob_sha, new_blob_sha, old_disposition, new_disposition,
+            affected_memory_ids_json, idempotency_key, created_at)
            VALUES ('forged-delta', 'project-a', 'repository-a', ?, ?, ?, ?,
-                   'docs/failed.md', 'changed', ?, ?, '[]', 'forged-delta', ?)`
+                   'docs/failed.md', 'changed', ?, ?, 'text', 'text', '[]',
+                   'forged-delta', ?)`
         )
         .run(
           REF,
@@ -1192,17 +1193,17 @@ describe("GitHub tree manifest failure retention", () => {
           "f".repeat(40),
           "2026-07-28T00:00:00.000Z"
         )
-    ).toThrow(/deltas require complete manifests/iu);
+    ).toThrow(/delta provenance is invalid/iu);
     expect(() =>
       fixture.database
         .prepare(
           `INSERT INTO github_tree_manifest_deltas
            (delta_id, project_id, repository_id, ref, old_manifest_id,
             new_manifest_id, path_digest, safe_path, change_kind,
-            old_blob_sha, new_blob_sha, affected_memory_ids_json,
-            idempotency_key, created_at)
+            old_blob_sha, new_blob_sha, old_disposition, new_disposition,
+            affected_memory_ids_json, idempotency_key, created_at)
            VALUES ('forged-new-delta', 'project-a', 'repository-a', ?, ?, ?, ?,
-                   'docs/failed.md', 'changed', ?, ?, '[]',
+                   'docs/failed.md', 'changed', ?, ?, 'text', 'text', '[]',
                    'forged-new-delta', ?)`
         )
         .run(
@@ -1214,7 +1215,7 @@ describe("GitHub tree manifest failure retention", () => {
           "2".repeat(40),
           "2026-07-28T00:00:00.000Z"
         )
-    ).toThrow(/deltas require complete manifests/iu);
+    ).toThrow(/delta provenance is invalid/iu);
     expect(() =>
       fixture.database
         .prepare(

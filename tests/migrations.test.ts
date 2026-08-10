@@ -22,7 +22,8 @@ const AUTHORITY_MIGRATIONS = [
   "migrations/0017_github_sync_activation_receipts.sql",
   "migrations/0018_consolidation_batch_receipts.sql",
   "migrations/0019_github_sync_workflows.sql",
-  "migrations/0020_consolidation_input_shape.sql"
+  "migrations/0020_consolidation_input_shape.sql",
+  "migrations/0021_github_annotated_tag_request_budget.sql"
 ] as const;
 
 const SEARCH_MIGRATIONS = [

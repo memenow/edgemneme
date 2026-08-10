@@ -1,7 +1,10 @@
 import { readFileSync } from "node:fs";
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import { describe, expect, it } from "vitest";
-import { GitHubSyncError } from "../src/github/client";
+import {
+  GitHubSyncError,
+  MAX_GITHUB_ANNOTATED_TAG_PEEL_REQUESTS
+} from "../src/github/client";
 import {
   GITHUB_SYNC_REQUEST_INTERVAL_MS,
   GITHUB_SYNC_REQUEST_BUDGET,
@@ -805,17 +808,26 @@ describe("GitHub ref scheduling", () => {
   it("bounds each Workflow while dispatching every due ref", () => {
     expect(GITHUB_SYNC_REQUEST_BUDGET).toEqual({
       accessBaseline: 900,
-      perRef: 2_005,
+      perRef: 2_013,
       maxRefsPerSchedule: null,
-      maxTotalPerWorkflow: 2_005
+      maxTotalPerWorkflow: 2_013
     });
+    expect(GITHUB_SYNC_REQUEST_BUDGET.perRef).toBe(
+      2_005 + MAX_GITHUB_ANNOTATED_TAG_PEEL_REQUESTS
+    );
     expect(GITHUB_SYNC_REQUEST_BUDGET.perRef).toBeLessThan(10_000);
     expect(GITHUB_SYNC_REQUEST_INTERVAL_MS).toBe(80);
   });
 
   it("configures bounded GitHub Workflows without a Queue", () => {
     const configuration = readFileSync("wrangler/github-sync.jsonc", "utf8");
+    const parsed = JSON.parse(configuration) as {
+      limits: { subrequests: number };
+    };
     expect(configuration).toContain('"subrequests": 10000');
+    expect(GITHUB_SYNC_REQUEST_BUDGET.perRef).toBeLessThan(
+      parsed.limits.subrequests
+    );
     expect(configuration.match(/"class_name": "GitHub/g)).toHaveLength(3);
     expect(configuration).not.toContain('"queues"');
   });

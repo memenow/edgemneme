@@ -14,8 +14,9 @@
 5. A project Durable Object reduces contention but is not the transaction
    authority. D1 guards stale project and memory heads inside one atomic batch.
 6. Queries never trust Vectorize or FTS metadata. Every hit must be reloaded from
-   the authoritative project, ACL, head, and status rows before it can enter a
-   context pack.
+   the authoritative project, ACL, head, and status rows, and its recalled chunk
+   must be recomputed from the current D1 content before it can enter reranking
+   or a context pack.
 7. A project is a hard authorization boundary and may contain multiple
    repositories. Project memory is shared inside that project; non-project
    memory belongs to exactly one normalized repository context.
@@ -112,7 +113,8 @@ GitHubRefSyncWorkflow (one bounded ref attempt)
   -> secret, PII, prompt, log, and path gate
   -> evidence-linked candidate or bodyless sensitive-content tombstone
   -> atomic manifest-head/cursor CAS and stable path delta
-     -> deletion evidence plus pending maintainer review, never a formal-memory write
+     -> deletion or withdrawal evidence plus pending maintainer review,
+        never a formal-memory write
   -> immutable terminal receipt and durable D1 review outbox event
      -> later memory-orchestrator Queue dispatch
 
@@ -140,10 +142,17 @@ transaction appends a count/digest-only chunk event and removes exactly that
 chunk of at most 500 entries. The final D1
 transaction writes the `purged` manifest tombstone and terminal event only after
 every entry is gone. The active ref head, synchronization cursor,
-added/changed/deleted deltas, deletion evidence, deletion observations, review
-requests, and synchronization outbox event commit in one D1 batch. A truncated
-tree, content-policy partial result, request-budget failure, checksum mismatch,
-stale head, or failed batch leaves the previous head and cursor intact.
+added/changed/deleted/withdrawn deltas, deletion or withdrawal evidence and
+observations, review requests, and synchronization outbox event commit in one D1
+batch. A `withdrawn` delta records a text source becoming binary, generated,
+or sensitive without retaining a safe path. Its independent evidence and
+observation are bodyless and path-digest-only; the previously linked clear
+evidence remains immutable. A review is opened only when an active or contested
+current revision still cites the withdrawn source. Restoring the same blob to
+text uses the explicit clear-evidence identity, while the independent tombstone
+identity keeps both records immutable. A truncated tree, content-policy partial
+result, request-budget failure, checksum mismatch, stale head, or failed batch
+leaves the previous head and cursor intact.
 The normalized scheduled slot and each ref's last successful synchronization
 freeze `full_reconciliation` on the dispatch item. The first due item for a ref
 in each UTC day performs a complete current-tree comparison even when its child
@@ -236,12 +245,15 @@ projects/{project_id}/projections/{snapshot_id}/
     └── by-status/{status}/index.json
 ```
 
-The projection writer emits the manifest, README, canonical head objects, every
-immutable revision, and JSON/Markdown classification indexes from one
-authoritative read. It verifies D1 content checksums and rejects an immutable R2
-key collision. Activation is conditional on the project still having the
-Workflow's `project_version`, so a late Workflow cannot replace a newer
-snapshot.
+The projection writer emits the manifest, README, canonical head objects, and
+exactly the authoritative current revision with its current evidence for every
+active or contested memory. D1 retains the immutable full revision history;
+historical revision objects may remain under older immutable prefixes, but they
+are never referenced by the active manifest. The writer emits JSON/Markdown
+classification indexes from the same authoritative read, verifies D1 content
+checksums, and rejects an immutable R2 key collision. Activation is conditional
+on the project still having the Workflow's `project_version`, so a late Workflow
+cannot replace a newer snapshot.
 
 The search projection uses a separately versioned index generation. Formal
 memory changes write Unicode FTS chunks and 1,024-dimensional Qwen embeddings;
@@ -249,9 +261,14 @@ each projected head and vector carries `repository_partition`. Project memory
 uses `*`; all other memory uses its normalized repository ID. Vectorize applies
 the project namespace and repository partition filter before recall, while FTS
 joins the matching projection head. Query results are then fused, reloaded from
-current D1 heads with hierarchical ACL checks, diversified, reranked, and
-returned only with evidence. Search abstains when it cannot produce an
-authorized context pack.
+current D1 heads with hierarchical ACL checks, and mapped back to the exact
+chunk through the same deterministic chunker used by projection publication. A
+missing, malformed, or out-of-range recalled chunk ID fails closed. Only that
+authoritative chunk is diversified and reranked. The response exposes a
+budgeted `excerpt` plus `excerptTruncated`; context packing truncates only on
+Unicode code-point boundaries and retains memory, revision, chunk, and evidence
+citations. The authorized individual-memory resource remains the path for full
+content. Search abstains when it cannot produce an authorized context pack.
 
 R2 snapshots, manifests, and classification indexes describe the complete
 project. They therefore require a project-wide reader grant. Repository-scoped

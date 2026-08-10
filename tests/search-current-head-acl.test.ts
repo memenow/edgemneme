@@ -214,7 +214,7 @@ function hit(memoryId: string): FusedRecallHit {
     projectId: memoryId === "memory-x" ? "project-2" : "project-1",
     memoryId,
     revisionId: `revision-${memoryId}`,
-    chunkId: `chunk-${memoryId}`,
+    chunkId: "chunk-0",
     indexGeneration: GENERATION,
     retrievalScore: 0.5,
     channels: ["semantic"]

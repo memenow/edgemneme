@@ -467,7 +467,9 @@ describe("synthetic production canary support", () => {
         loadLedger: () => null,
         createLedger: () => ({ vector_ids: [], r2_keys: [] }),
         writeLedger: () => calls.push("ledger"),
-        deleteSearchProjection: () => calls.push("search"),
+        deleteSearchVectors: () => calls.push("delete vectors"),
+        verifySearchVectors: () => calls.push("verify vectors"),
+        deleteSearchState: () => calls.push("search state"),
         deleteR2Projections: () => {
           calls.push("r2");
           throw new Error("R2 unavailable");
@@ -478,7 +480,15 @@ describe("synthetic production canary support", () => {
         removeLedger: () => calls.push("remove ledger")
       })
     ).rejects.toThrow(/R2 unavailable/iu);
-    expect(calls).toEqual(["fence", "quiescence", "ledger", "search", "r2"]);
+    expect(calls).toEqual([
+      "fence",
+      "quiescence",
+      "ledger",
+      "delete vectors",
+      "verify vectors",
+      "search state",
+      "r2"
+    ]);
   });
 
   it("does not inspect or delete projections when the admission fence cannot be claimed", async () => {
@@ -493,7 +503,9 @@ describe("synthetic production canary support", () => {
         loadLedger: () => null,
         createLedger: () => ({ vector_ids: [], r2_keys: [] }),
         writeLedger: () => calls.push("ledger"),
-        deleteSearchProjection: () => calls.push("search"),
+        deleteSearchVectors: () => calls.push("delete vectors"),
+        verifySearchVectors: () => calls.push("verify vectors"),
+        deleteSearchState: () => calls.push("search state"),
         deleteR2Projections: () => calls.push("r2"),
         verifyProjectionCleanup: () => calls.push("verify projection"),
         deleteAuthority: () => calls.push("authority"),

@@ -28,6 +28,8 @@ jobs:
     outputs:
       orchestrator_previous_version: ${{ steps.capture_state.outputs.orchestrator_version }}
       gateway_previous_version: ${{ steps.capture_state.outputs.gateway_version }}
+      gateway_previous_trigger_state: ${{ steps.capture_state.outputs.gateway_trigger_state }}
+      gateway_previous_trigger_fingerprint: ${{ steps.capture_state.outputs.gateway_trigger_fingerprint }}
       github_sync_previous_version: ${{ steps.capture_state.outputs.github_sync_version }}
       github_sync_previous_state: ${{ steps.capture_state.outputs.github_sync_state }}
       github_sync_previous_schedule_state: ${{ steps.capture_state.outputs.github_sync_schedule_state }}
@@ -117,6 +119,8 @@ jobs:
           EXPECTED_CONFIGURATION_FINGERPRINT: ${{ needs.capture_production_state.outputs.configuration_fingerprint }}
           EXPECTED_ORCHESTRATOR_VERSION: ${{ needs.capture_production_state.outputs.orchestrator_previous_version }}
           EXPECTED_GATEWAY_VERSION: ${{ needs.capture_production_state.outputs.gateway_previous_version }}
+          EXPECTED_GATEWAY_TRIGGER_STATE: ${{ needs.capture_production_state.outputs.gateway_previous_trigger_state }}
+          EXPECTED_GATEWAY_TRIGGER_FINGERPRINT: ${{ needs.capture_production_state.outputs.gateway_previous_trigger_fingerprint }}
           EXPECTED_GITHUB_SYNC_VERSION: ${{ needs.capture_production_state.outputs.github_sync_previous_version }}
           EXPECTED_GITHUB_SYNC_STATE: ${{ needs.capture_production_state.outputs.github_sync_previous_state }}
           EXPECTED_GITHUB_SYNC_SCHEDULE_STATE: ${{ needs.capture_production_state.outputs.github_sync_previous_schedule_state }}
@@ -132,6 +136,8 @@ jobs:
           node scripts/capture-deployment-state.mjs verify \
             orchestrator_version \
             gateway_version \
+            gateway_trigger_state \
+            gateway_trigger_fingerprint \
             github_sync_version \
             github_sync_state \
             github_sync_schedule_state \
@@ -192,8 +198,6 @@ jobs:
           CF_RATE_LIMIT_NAMESPACE_EDGE: ${{ vars.CF_RATE_LIMIT_NAMESPACE_EDGE }}
           CF_RATE_LIMIT_NAMESPACE_CLIENT: ${{ vars.CF_RATE_LIMIT_NAMESPACE_CLIENT }}
           CF_RATE_LIMIT_NAMESPACE_PRINCIPAL: ${{ vars.CF_RATE_LIMIT_NAMESPACE_PRINCIPAL }}
-          EDGEMNEME_GATEWAY_URL: ${{ vars.MEMORY_GATEWAY_PUBLIC_URL }}
-          EDGEMNEME_GATEWAY_EXPECTED_HOST: ${{ vars.MEMORY_GATEWAY_EXPECTED_HOST }}
           ENABLE_GITHUB_SYNC: ${{ vars.ENABLE_GITHUB_SYNC }}
           GITHUB_CREDENTIAL_VERSION: ${{ vars.SYNC_CREDENTIAL_VERSION }}
         shell: bash
@@ -205,8 +209,6 @@ jobs:
             CF_RATE_LIMIT_NAMESPACE_EDGE
             CF_RATE_LIMIT_NAMESPACE_CLIENT
             CF_RATE_LIMIT_NAMESPACE_PRINCIPAL
-            EDGEMNEME_GATEWAY_URL
-            EDGEMNEME_GATEWAY_EXPECTED_HOST
           )
           if [[ "${ENABLE_GITHUB_SYNC:-}" != "true" && "${ENABLE_GITHUB_SYNC:-}" != "false" ]]; then
             echo "ENABLE_GITHUB_SYNC must be explicitly set to true or false." >&2
@@ -225,11 +227,6 @@ jobs:
             echo "Missing required production settings: ${missing[*]}" >&2
             exit 1
           fi
-          node --input-type=module <<'NODE'
-          import { requireGatewayUrl } from "./scripts/canary-process.mjs";
-
-          requireGatewayUrl("EDGEMNEME_GATEWAY_URL");
-          NODE
           for name in \
             CF_D1_MEMORY_DATABASE_ID \
             CF_D1_SEARCH_DATABASE_ID \
@@ -319,6 +316,48 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: node scripts/verify-github-main-head.mjs
+
+      - name: Reject pre-mutation deployment state drift
+        timeout-minutes: 2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CF_D1_MEMORY_DATABASE_ID: ${{ vars.CF_D1_MEMORY_DATABASE_ID }}
+          CF_D1_SEARCH_DATABASE_ID: ${{ vars.CF_D1_SEARCH_DATABASE_ID }}
+          CF_RATE_LIMIT_NAMESPACE_EDGE: ${{ vars.CF_RATE_LIMIT_NAMESPACE_EDGE }}
+          CF_RATE_LIMIT_NAMESPACE_CLIENT: ${{ vars.CF_RATE_LIMIT_NAMESPACE_CLIENT }}
+          CF_RATE_LIMIT_NAMESPACE_PRINCIPAL: ${{ vars.CF_RATE_LIMIT_NAMESPACE_PRINCIPAL }}
+          ENABLE_GITHUB_SYNC: ${{ vars.ENABLE_GITHUB_SYNC }}
+          GITHUB_CREDENTIAL_VERSION: ${{ vars.SYNC_CREDENTIAL_VERSION }}
+          MEMORY_GATEWAY_ALLOWED_ORIGINS: ${{ vars.MEMORY_GATEWAY_ALLOWED_ORIGINS }}
+          MEMORY_GATEWAY_CUSTOM_DOMAIN: ${{ vars.MEMORY_GATEWAY_CUSTOM_DOMAIN }}
+          EXPECTED_CONFIGURATION_FINGERPRINT: ${{ needs.capture_production_state.outputs.configuration_fingerprint }}
+          EXPECTED_ORCHESTRATOR_VERSION: ${{ needs.capture_production_state.outputs.orchestrator_previous_version }}
+          EXPECTED_GATEWAY_VERSION: ${{ needs.capture_production_state.outputs.gateway_previous_version }}
+          EXPECTED_GATEWAY_TRIGGER_STATE: ${{ needs.capture_production_state.outputs.gateway_previous_trigger_state }}
+          EXPECTED_GATEWAY_TRIGGER_FINGERPRINT: ${{ needs.capture_production_state.outputs.gateway_previous_trigger_fingerprint }}
+          EXPECTED_GITHUB_SYNC_VERSION: ${{ needs.capture_production_state.outputs.github_sync_previous_version }}
+          EXPECTED_GITHUB_SYNC_STATE: ${{ needs.capture_production_state.outputs.github_sync_previous_state }}
+          EXPECTED_GITHUB_SYNC_SCHEDULE_STATE: ${{ needs.capture_production_state.outputs.github_sync_previous_schedule_state }}
+          EXPECTED_GITHUB_SYNC_SECRET_STATE: ${{ needs.capture_production_state.outputs.github_sync_previous_secret_state }}
+          EDGEMNEME_BOOTSTRAP_MODE: ${{ needs.capture_production_state.outputs.bootstrap_mode }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/verify-github-main-head.mjs
+          node scripts/capture-deployment-state.mjs verify-configuration
+          node scripts/capture-deployment-state.mjs verify \
+            orchestrator_version \
+            gateway_version \
+            gateway_trigger_state \
+            gateway_trigger_fingerprint \
+            github_sync_version \
+            github_sync_state \
+            github_sync_schedule_state \
+            github_sync_secret_state
+          node scripts/gateway-deployment-target.mjs verify-predeploy \
+            wrangler/.wrangler/memory-gateway.generated.jsonc
 
       - name: Ensure semantic Vectorize metadata indexes
         timeout-minutes: 5
@@ -696,6 +735,10 @@ jobs:
         timeout-minutes: 2
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          EXPECTED_GATEWAY_TRIGGER_STATE: ${{ needs.capture_production_state.outputs.gateway_previous_trigger_state }}
+          EXPECTED_GATEWAY_TRIGGER_FINGERPRINT: ${{ needs.capture_production_state.outputs.gateway_previous_trigger_fingerprint }}
           CAPTURED_ORCHESTRATOR_VERSION: ${{ needs.capture_production_state.outputs.orchestrator_previous_version }}
           CAPTURED_GATEWAY_VERSION: ${{ needs.capture_production_state.outputs.gateway_previous_version }}
           CAPTURED_GITHUB_SYNC_VERSION: ${{ needs.capture_production_state.outputs.github_sync_previous_version }}
@@ -714,6 +757,9 @@ jobs:
         run: |
           set -euo pipefail
           node scripts/verify-github-main-head.mjs
+          node scripts/capture-deployment-state.mjs verify \
+            gateway_trigger_state \
+            gateway_trigger_fingerprint
           fields=(
             ORCHESTRATOR_VERSION
             GATEWAY_VERSION
@@ -1599,7 +1645,16 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           EXPECTED_GATEWAY_VERSION: ${{ needs.capture_production_state.outputs.gateway_previous_version }}
-        run: node scripts/capture-deployment-state.mjs verify gateway_version
+          EXPECTED_GATEWAY_TRIGGER_STATE: ${{ needs.capture_production_state.outputs.gateway_previous_trigger_state }}
+          EXPECTED_GATEWAY_TRIGGER_FINGERPRINT: ${{ needs.capture_production_state.outputs.gateway_previous_trigger_fingerprint }}
+          EDGEMNEME_BOOTSTRAP_MODE: ${{ needs.capture_production_state.outputs.bootstrap_mode }}
+        run: |
+          node scripts/capture-deployment-state.mjs verify \
+            gateway_version \
+            gateway_trigger_state \
+            gateway_trigger_fingerprint
+          node scripts/gateway-deployment-target.mjs verify-predeploy \
+            wrangler/.wrangler/memory-gateway.generated.jsonc
 
       - name: Deploy memory gateway
         env:
@@ -1615,6 +1670,20 @@ jobs:
         if: always()
         run: rm -f -- wrangler/.wrangler/memory-gateway.secrets.json
 
+      - name: Capture deployed gateway canary target
+        id: gateway_canary_target
+        timeout-minutes: 2
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          EXPECTED_GATEWAY_TRIGGER_STATE: ${{ needs.capture_production_state.outputs.gateway_previous_trigger_state }}
+          EXPECTED_GATEWAY_TRIGGER_FINGERPRINT: ${{ needs.capture_production_state.outputs.gateway_previous_trigger_fingerprint }}
+          EXPECTED_GATEWAY_DEPLOYMENT_TAG: github-${{ github.run_id }}-${{ github.run_attempt }}-gateway
+          EDGEMNEME_BOOTSTRAP_MODE: ${{ needs.capture_production_state.outputs.bootstrap_mode }}
+        run: >-
+          node scripts/gateway-deployment-target.mjs capture-canary-target
+          wrangler/.wrangler/memory-gateway.generated.jsonc
+
       - name: Run isolated production canary
         id: isolated_production_canary
         timeout-minutes: 20
@@ -1622,14 +1691,17 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           TOKEN_DIGEST_PEPPER: ${{ secrets.TOKEN_DIGEST_PEPPER }}
-          EDGEMNEME_GATEWAY_URL: ${{ vars.MEMORY_GATEWAY_PUBLIC_URL }}
-          EDGEMNEME_GATEWAY_EXPECTED_HOST: ${{ vars.MEMORY_GATEWAY_EXPECTED_HOST }}
+          EDGEMNEME_GATEWAY_URL: ${{ steps.gateway_canary_target.outputs.gateway_url }}
+          EDGEMNEME_GATEWAY_EXPECTED_HOST: ${{ steps.gateway_canary_target.outputs.gateway_host }}
         run: node scripts/run-synthetic-canary.mjs
 
       - name: Recover isolated production canary
         # A successful canary already completed cleanup. Recovery remains fail-closed
         # because a missing project alone cannot prove Vectorize and R2 cleanup.
-        if: failure() && steps.isolated_production_canary.outcome == 'failure'
+        if: >-
+          always() &&
+          steps.isolated_production_canary.outcome != 'success' &&
+          steps.isolated_production_canary.outcome != 'skipped'
         timeout-minutes: 12
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -1642,6 +1714,20 @@ jobs:
             exit 0
           fi
           node scripts/run-synthetic-canary.mjs --cleanup-only
+
+      - name: Reverify deployed gateway canary target
+        if: always() && steps.gateway_canary_target.outcome == 'success'
+        timeout-minutes: 2
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          EXPECTED_GATEWAY_ACTIVE_VERSION: ${{ steps.gateway_canary_target.outputs.gateway_active_version }}
+          EXPECTED_GATEWAY_TRIGGER_STATE: ${{ steps.gateway_canary_target.outputs.gateway_trigger_state }}
+          EXPECTED_GATEWAY_TRIGGER_FINGERPRINT: ${{ steps.gateway_canary_target.outputs.gateway_trigger_fingerprint }}
+          EXPECTED_GATEWAY_DEPLOYMENT_TAG: github-${{ github.run_id }}-${{ github.run_attempt }}-gateway
+        run: >-
+          node scripts/gateway-deployment-target.mjs verify-canary-target
+          wrangler/.wrangler/memory-gateway.generated.jsonc
 
       - name: Create ephemeral GitHub sync secret file
         if: vars.ENABLE_GITHUB_SYNC == 'true'
@@ -2232,6 +2318,10 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CF_ROLLBACK_ACCOUNT_ID }}
           EDGEMNEME_ORCHESTRATOR_PREVIOUS_VERSION: ${{ needs.capture_production_state.outputs.orchestrator_previous_version }}
           EDGEMNEME_GATEWAY_PREVIOUS_VERSION: ${{ needs.capture_production_state.outputs.gateway_previous_version }}
+          EXPECTED_GATEWAY_TRIGGER_STATE: ${{ needs.capture_production_state.outputs.gateway_previous_trigger_state }}
+          EXPECTED_GATEWAY_TRIGGER_FINGERPRINT: ${{ needs.capture_production_state.outputs.gateway_previous_trigger_fingerprint }}
+          EXPECTED_GATEWAY_CURRENT_TRIGGER_STATE: ${{ needs.capture_production_state.outputs.gateway_previous_trigger_state }}
+          EXPECTED_GATEWAY_CURRENT_TRIGGER_FINGERPRINT: ${{ needs.capture_production_state.outputs.gateway_previous_trigger_fingerprint }}
           EDGEMNEME_GITHUB_SYNC_PREVIOUS_VERSION: ${{ needs.capture_production_state.outputs.github_sync_previous_version }}
           EDGEMNEME_GITHUB_SYNC_PREVIOUS_STATE: ${{ needs.capture_production_state.outputs.github_sync_previous_state }}
           EDGEMNEME_GITHUB_SYNC_PREVIOUS_SCHEDULE_STATE: ${{ needs.capture_production_state.outputs.github_sync_previous_schedule_state }}
@@ -3175,6 +3265,57 @@ jobs:
           }
           NODE
           }
+          capture_gateway_run_trigger() {
+            local config="$1"
+            local tag="$2"
+            local expected_version="$3"
+            local capture_json
+            local parsed
+            local captured_version
+            capture_json="$(
+              EXPECTED_GATEWAY_DEPLOYMENT_TAG="$tag" \
+                node scripts/gateway-deployment-target.mjs \
+                  capture-rollback-current "$config"
+            )" || return 1
+            parsed="$(CAPTURE_JSON="$capture_json" node --input-type=module <<'NODE'
+          const capture = JSON.parse(process.env.CAPTURE_JSON ?? "");
+          const keys = Object.keys(capture).sort();
+          if (
+            keys.join(",") !== [
+              "gateway_active_version",
+              "gateway_trigger_fingerprint",
+              "gateway_trigger_state"
+            ].sort().join(",") ||
+            typeof capture.gateway_trigger_state !== "string" ||
+            !/^[A-Za-z0-9_-]+$/u.test(capture.gateway_trigger_state) ||
+            typeof capture.gateway_trigger_fingerprint !== "string" ||
+            !/^[0-9a-f]{64}$/u.test(capture.gateway_trigger_fingerprint) ||
+            typeof capture.gateway_active_version !== "string" ||
+            !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu.test(
+              capture.gateway_active_version
+            )
+          ) {
+            throw new Error("The rollback gateway trigger capture is invalid.");
+          }
+          process.stdout.write(
+            `${capture.gateway_trigger_state}\t${capture.gateway_trigger_fingerprint}` +
+              `\t${capture.gateway_active_version}`
+          );
+          NODE
+            )" || return 1
+            IFS=$'\t' read -r \
+              gateway_restore_current_state \
+              gateway_restore_current_fingerprint \
+              captured_version <<< "$parsed"
+            if [[ -z "$gateway_restore_current_state" || -z "$gateway_restore_current_fingerprint" || -z "$captured_version" ]]; then
+              echo "::error::The rollback gateway trigger capture is incomplete." >&2
+              return 1
+            fi
+            if [[ "$captured_version" != "$expected_version" ]]; then
+              echo "::error::The rollback gateway trigger capture belongs to a different tagged version." >&2
+              return 1
+            fi
+          }
           rollback_if_advanced() {
             local label="$1"
             local config="$2"
@@ -3222,11 +3363,29 @@ jobs:
                 return 1
               fi
               if [[ "$label" == "gateway" ]]; then
-                pnpm exec wrangler delete --config "$config" --force
+                capture_gateway_run_trigger \
+                  "$config" "$tag" "$deployed_version" || return 1
+                gateway_advanced_by_run=true
+                EDGEMNEME_GATEWAY_ADVANCED_BY_RUN=true \
+                  EDGEMNEME_GATEWAY_ALLOW_DETACHED_ABSENT=true \
+                  EXPECTED_GATEWAY_CURRENT_TRIGGER_STATE="$gateway_restore_current_state" \
+                  EXPECTED_GATEWAY_CURRENT_TRIGGER_FINGERPRINT="$gateway_restore_current_fingerprint" \
+                  node scripts/gateway-deployment-target.mjs restore || return 1
+                confirmed_version="$(
+                  EXPECTED_GATEWAY_DEPLOYMENT_TAG="$tag" \
+                    node scripts/gateway-deployment-target.mjs \
+                      verify-active-tag "$config"
+                )" || return 1
+                if [[ "$confirmed_version" != "$deployed_version" ]]; then
+                  echo "::error::The bootstrap gateway changed after trigger detachment; refusing deletion." >&2
+                  return 1
+                fi
+                pnpm exec wrangler delete --config "$config" --force || return 1
                 if [[ "$(worker_presence "$worker_name")" != "absent" ]]; then
                   echo "::error::The failed expected-absent $label Worker still exists after deletion." >&2
                   return 1
                 fi
+                gateway_restore_completed=true
                 return 0
               fi
               echo "::warning::Retaining the bootstrap orchestrator and its Durable Object state; no prior version exists. Manual roll-forward is required." >&2
@@ -3264,10 +3423,20 @@ jobs:
               echo "::error::The $label deployment changed after rollback guards; refusing rollback." >&2
               return 1
             fi
+            if [[ "$label" == "gateway" ]]; then
+              capture_gateway_run_trigger \
+                "$config" "$tag" "$deployed_version" || return 1
+              gateway_advanced_by_run=true
+            fi
             pnpm exec wrangler rollback "$previous_version" \
               --config "$config" \
               --message "Automated rollback after failed deployment gate for GitHub run ${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}." \
-              --yes
+              --yes || return 1
+            confirmed_version="$(active_version "$config")" || return 1
+            if [[ "$confirmed_version" != "$previous_version" ]]; then
+              echo "::error::The $label Worker did not reach its captured version after rollback." >&2
+              return 1
+            fi
           }
           rollback_github_sync() {
             local config="wrangler/.wrangler/github-sync.generated.jsonc"
@@ -3444,6 +3613,10 @@ jobs:
           }
           set +e
           github_sync_status=0
+          gateway_advanced_by_run=false
+          gateway_restore_completed=false
+          gateway_restore_current_state="${EXPECTED_GATEWAY_CURRENT_TRIGGER_STATE:-}"
+          gateway_restore_current_fingerprint="${EXPECTED_GATEWAY_CURRENT_TRIGGER_FINGERPRINT:-}"
           if [[ "${EDGEMNEME_GITHUB_SYNC_ENABLED:-false}" == "true" ]]; then
             rollback_github_sync
             github_sync_status=$?
@@ -3455,6 +3628,22 @@ jobs:
             edgemneme-memory-gateway \
             "${EDGEMNEME_BOOTSTRAP_MODE:-false}"
           gateway_status=$?
+          if (( gateway_status == 0 )) && [[ "$gateway_restore_completed" != "true" ]]; then
+            EXPECTED_GATEWAY_CURRENT_TRIGGER_STATE="$gateway_restore_current_state" \
+              EXPECTED_GATEWAY_CURRENT_TRIGGER_FINGERPRINT="$gateway_restore_current_fingerprint" \
+              EDGEMNEME_GATEWAY_ADVANCED_BY_RUN="$gateway_advanced_by_run" \
+              EDGEMNEME_GATEWAY_ALLOW_DETACHED_ABSENT=false \
+              node scripts/gateway-deployment-target.mjs restore
+            gateway_status=$?
+          fi
+          if (( gateway_status == 0 )); then
+            EXPECTED_GATEWAY_VERSION="${EDGEMNEME_GATEWAY_PREVIOUS_VERSION:-}" \
+              node scripts/capture-deployment-state.mjs verify \
+                gateway_version \
+                gateway_trigger_state \
+                gateway_trigger_fingerprint
+            gateway_status=$?
+          fi
           rollback_if_advanced orchestrator \
             wrangler/.wrangler/memory-orchestrator.generated.jsonc \
             "${EDGEMNEME_ORCHESTRATOR_PREVIOUS_VERSION:-}" \

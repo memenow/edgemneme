@@ -102,7 +102,9 @@ export interface ValidatedSearchCandidate {
   revisionId: string;
   memoryVersion: number;
   chunkId: string;
-  content: string;
+  /** The exact chunk recomputed from the authoritative current revision. */
+  chunkContent: string;
+  /** SHA-256 of the complete authoritative revision, not the chunk or excerpt. */
   contentSha256: string;
   kind: MemoryKind;
   memoryClass: MemoryClass;
@@ -154,7 +156,14 @@ export interface SearchPipelineInput extends HardFilterInput {
   now?: string;
 }
 
-export type SearchResultMemory = Omit<ValidatedSearchCandidate, "embedding"> & {
+export type SearchResultMemory = Omit<
+  ValidatedSearchCandidate,
+  "embedding" | "chunkContent"
+> & {
+  /** An authoritative chunk excerpt sized for this response's context budget. */
+  excerpt: string;
+  /** True when the authoritative chunk was shortened to fit the context budget. */
+  excerptTruncated: boolean;
   relevance: number;
 };
 

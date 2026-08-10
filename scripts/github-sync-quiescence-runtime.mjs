@@ -21,8 +21,11 @@ const ALLOWED_CONFIG_PATHS = Object.freeze([
 ]);
 
 export function createD1RestRuntime(configPath) {
-  const resolvedConfigPath = requireGeneratedConfigPath(configPath);
-  const databaseId = readMemoryDatabaseId(resolvedConfigPath);
+  return createD1BindingRestRuntime(configPath, "MEMORY_DB");
+}
+
+export function createD1BindingRestRuntime(configPath, bindingName) {
+  const databaseId = readGeneratedD1DatabaseId(configPath, bindingName);
   const accountId = requireAccountId(process.env.CLOUDFLARE_ACCOUNT_ID);
   const token = requireApiToken(process.env.CLOUDFLARE_API_TOKEN);
   const endpoint =
@@ -84,10 +87,14 @@ function requireGeneratedConfigPath(configPath) {
   return candidate;
 }
 
-function readMemoryDatabaseId(configPath) {
+export function readGeneratedD1DatabaseId(configPath, bindingName) {
+  if (bindingName !== "MEMORY_DB" && bindingName !== "SEARCH_DB") {
+    throw new Error("Only an approved D1 binding may be queried.");
+  }
+  const resolvedConfigPath = requireGeneratedConfigPath(configPath);
   let config;
   try {
-    config = JSON.parse(readFileSync(configPath, "utf8"));
+    config = JSON.parse(readFileSync(resolvedConfigPath, "utf8"));
   } catch {
     throw new Error("The generated Wrangler config is missing or invalid.");
   }
@@ -95,9 +102,11 @@ function readMemoryDatabaseId(configPath) {
   if (!Array.isArray(databases)) {
     throw new Error("The generated Wrangler config has no D1 binding inventory.");
   }
-  const matches = databases.filter((database) => database?.binding === "MEMORY_DB");
+  const matches = databases.filter((database) => database?.binding === bindingName);
   if (matches.length !== 1) {
-    throw new Error("The generated Wrangler config must contain exactly one MEMORY_DB binding.");
+    throw new Error(
+      `The generated Wrangler config must contain exactly one ${bindingName} binding.`
+    );
   }
   const databaseId = matches[0]?.database_id;
   if (
@@ -105,7 +114,9 @@ function readMemoryDatabaseId(configPath) {
     !UUID_PATTERN.test(databaseId) ||
     PLACEHOLDER_UUIDS.has(databaseId.toLowerCase())
   ) {
-    throw new Error("The generated MEMORY_DB binding must contain a non-placeholder UUID.");
+    throw new Error(
+      `The generated ${bindingName} binding must contain a non-placeholder UUID.`
+    );
   }
   return databaseId.toLowerCase();
 }

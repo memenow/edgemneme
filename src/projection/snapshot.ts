@@ -14,6 +14,7 @@ import {
   normalizeEvidenceIds,
   pathSegment,
   projectionPrefix,
+  projectionScopeIndexKey,
   revisionMemoryUri,
   validateProjectionMemory,
   type ProjectionMemory,
@@ -108,7 +109,7 @@ export async function buildProjectionSnapshotPlan(
     )
   );
   await appendTaxonomyIndexes(writes, prefix, input, sortedHeads, indexEntries);
-  await appendScopeIndexes(writes, prefix, input, sortedHeads, indexEntries);
+  await appendScopeIndexes(writes, input, sortedHeads, indexEntries);
 
   writes.sort(compareWrites);
   assertUniqueWriteKeys(writes);
@@ -170,11 +171,14 @@ function validateSnapshotInput(input: ProjectionSnapshotInput): void {
     if (head === undefined) {
       throw new Error(`Revision has no canonical head: ${revision.revisionId}`);
     }
-    if (revision.memoryVersion > head.memoryVersion) {
-      throw new Error(`Revision is newer than its canonical head: ${revision.revisionId}`);
+    if (revision.revisionId !== head.revisionId) {
+      throw new Error(`Revision is not the canonical current head: ${revision.revisionId}`);
     }
     revisionById.set(revision.revisionId, revision);
     revisionVersionKeys.add(versionKey);
+  }
+  if (input.revisions.length !== input.heads.length) {
+    throw new Error("Each projected head must have exactly one current revision.");
   }
   for (const head of input.heads) {
     const matchingRevision = revisionById.get(head.revisionId);
@@ -247,7 +251,6 @@ async function appendTaxonomyIndexes(
 
 async function appendScopeIndexes(
   writes: ProjectionWrite[],
-  prefix: string,
   input: ProjectionSnapshotInput,
   sortedHeads: readonly ProjectionMemory[],
   entries: readonly ProjectionIndexEntry[]
@@ -260,7 +263,7 @@ async function appendScopeIndexes(
       .map(({ entry }) => entry);
     writes.push(
       await buildJsonIndexWrite(
-        `${prefix}indexes/by-scope/${pathSegment(scopeId)}/index.json`,
+        projectionScopeIndexKey(input.projectId, input.snapshotId, scopeId),
         input,
         "scope",
         scopeId,
@@ -385,7 +388,7 @@ function buildReadme(
     "",
     `Canonical memories: \`${memories.length}\``,
     "",
-    `Immutable revisions: \`${revisions.length}\``,
+    `Current revisions: \`${revisions.length}\``,
     "",
     "## Kinds",
     "",

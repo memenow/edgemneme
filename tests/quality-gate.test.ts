@@ -33,6 +33,9 @@ describe("candidate sensitive-content gate", () => {
     ["payment card number", "4111 1111 1111 1111"],
     ["international phone number", "+1 (212) 555-0198"],
     ["labeled phone number", "联系电话：010-5555-0198"],
+    ["unlabeled Chinese mobile number without separators", "13800138000"],
+    ["unlabeled NANP number without separators", "2125550198"],
+    ["unlabeled NANP number with a country code", "12125550198"],
     ["unlabeled Chinese mobile number", "199-0000-0000"],
     ["unlabeled UK London number", "020 7946 0958"],
     ["unlabeled UK regional number", "0161 496 0123"],
@@ -54,6 +57,40 @@ describe("candidate sensitive-content gate", () => {
       accepted: false,
       reason: "CONTENT_TOO_LARGE"
     });
+  });
+
+  it.each([
+    ["Chinese mobile", "13800138000"],
+    ["NANP national", "2125550198"],
+    ["formatted international", "+44 20 7946 0958"]
+  ])("preserves the shared model-gate contract for a %s number", (_label, content) => {
+    expect(inspectMemoryModelInput(content)).toEqual({
+      accepted: false,
+      disposition: "tombstone",
+      reason: "SENSITIVE_CONTENT",
+      detector: "phone-number"
+    });
+  });
+
+  it.each([
+    ["email address", "alice＠example．com"],
+    ["provider token", "ｓｋ－AbCdEfGhIjKlMnOpQrStUvWx"],
+    ["bearer token", "Ｂｅａｒｅｒ AbCdEfGhIjKlMnOpQrStUvWx"],
+    ["AWS access key", "ＡＫＩＡIOSFODNN7EXAMPLE"]
+  ])("rejects NFKC-obfuscated %s before model normalization", (_label, content) => {
+    expect(inspectModelInput(content, { maxBytes: 4096 })).toMatchObject({
+      accepted: false,
+      disposition: "tombstone",
+      reason: "SENSITIVE_CONTENT"
+    });
+  });
+
+  it("allows ordinary Unicode technical prose after NFKC inspection", () => {
+    expect(
+      inspectModelInput("Use ＴｙｐｅＳｃｒｉｐｔ for the 日本語 tokenizer.", {
+        maxBytes: 4096
+      })
+    ).toEqual({ accepted: true });
   });
 
   it("rejects high-entropy opaque tokens while allowing commit hashes", () => {
@@ -78,6 +115,13 @@ describe("candidate sensitive-content gate", () => {
       "Numeric repository ID 123456789012345",
       "Numeric commit-like identifier 0123456789012345678901234567890123456789",
       "Grouped build identifier 123-4567-8901",
+      "Build ID 13800138000",
+      "Numeric hash: 13800138000",
+      "Retry count: 2125550198",
+      "Unix timestamp: 2125550198",
+      "Compact UTC timestamp 20260810123045",
+      "Monotonic event sequence 202608101234567890",
+      "UUID 123e4567-e89b-12d3-a456-426614174000",
       "Synthetic resident ID with a bad checksum 999999200001010012",
       "Synthetic resident ID with an invalid date 999999200002300010",
       "Release timestamp 2026-07-28T12:00:00.000Z"

@@ -1,4 +1,5 @@
 import { sha256 } from "../security/crypto";
+import { MAX_GITHUB_ANNOTATED_TAG_PEEL_REQUESTS } from "./client";
 
 export const GITHUB_CREDENTIAL_LANE_LEASE_MS = 14 * 60 * 1_000;
 export const GITHUB_CREDENTIAL_LANE_INTERVAL_MS = 80;
@@ -402,7 +403,12 @@ export async function reserveGitHubRefRequest(
     requiredStatus: "running",
     token,
     maxRequests,
-    blockSize
+    blockSize,
+    overflow: {
+      column: "github_request_overflow_count",
+      primaryLimit: 2_005,
+      overflowLimit: MAX_GITHUB_ANNOTATED_TAG_PEEL_REQUESTS
+    }
   });
 }
 
@@ -416,6 +422,11 @@ async function reserveGitHubWorkflowRequest(
     token: GitHubCredentialLaneToken;
     maxRequests: number;
     blockSize: number;
+    overflow?: {
+      column: "github_request_overflow_count";
+      primaryLimit: number;
+      overflowLimit: number;
+    };
   }
 ): Promise<number | null> {
   if (
@@ -423,7 +434,10 @@ async function reserveGitHubWorkflowRequest(
     input.maxRequests < 1 ||
     !Number.isSafeInteger(input.blockSize) ||
     input.blockSize < 1 ||
-    input.blockSize > 100
+    input.blockSize > 100 ||
+    (input.overflow !== undefined &&
+      input.maxRequests >
+        input.overflow.primaryLimit + input.overflow.overflowLimit)
   ) {
     throw new TypeError("The GitHub Workflow request budget is invalid.");
   }
@@ -434,12 +448,40 @@ async function reserveGitHubWorkflowRequest(
   if (current >= input.maxRequests) {
     return null;
   }
-  const reserved = Math.min(input.blockSize, input.maxRequests - current);
+  const usesOverflow =
+    input.overflow !== undefined && current >= input.overflow.primaryLimit;
+  const countColumn = usesOverflow
+    ? input.overflow?.column ?? "github_request_count"
+    : "github_request_count";
+  const currentSegmentCount = usesOverflow
+    ? current - (input.overflow?.primaryLimit ?? 0)
+    : current;
+  const segmentLimit = usesOverflow
+    ? Math.min(
+        input.maxRequests - (input.overflow?.primaryLimit ?? 0),
+        input.overflow?.overflowLimit ?? 0
+      )
+    : Math.min(input.maxRequests, input.overflow?.primaryLimit ?? input.maxRequests);
+  const reserved = Math.min(
+    input.blockSize,
+    input.maxRequests - current,
+    segmentLimit - currentSegmentCount
+  );
+  if (reserved < 1) {
+    throw new Error("The GitHub Workflow request budget segment is invalid.");
+  }
+  const segmentBoundary =
+    input.overflow === undefined
+      ? ""
+      : usesOverflow
+        ? `AND github_request_count = ${input.overflow.primaryLimit}`
+        : `AND ${input.overflow.column} = 0`;
   const statement = database.withSession("first-primary").prepare(
     `UPDATE ${input.table}
-     SET github_request_count = github_request_count + ?
+     SET ${countColumn} = ${countColumn} + ?
      WHERE ${input.idColumn} = ? AND status = ?
-       AND github_request_count = ? AND github_request_count < ?
+       AND ${countColumn} = ? AND ${countColumn} < ?
+       ${segmentBoundary}
        AND EXISTS (
          SELECT 1 FROM github_credential_sync_lane AS lane
          WHERE lane.credential_version = ? AND lane.holder_kind = ?
@@ -451,8 +493,8 @@ async function reserveGitHubWorkflowRequest(
     reserved,
     input.id,
     input.requiredStatus,
-    current,
-    input.maxRequests,
+    currentSegmentCount,
+    segmentLimit,
     input.token.credentialVersion,
     input.token.holderKind,
     input.token.holderId,
@@ -487,10 +529,19 @@ async function readGitHubWorkflowRequestCount(
     id: string;
     requiredStatus: "materialized" | "running";
     token: GitHubCredentialLaneToken;
+    overflow?: {
+      column: "github_request_overflow_count";
+      primaryLimit: number;
+      overflowLimit: number;
+    };
   }
 ): Promise<number | null> {
+  const countExpression =
+    input.overflow === undefined
+      ? "github_request_count"
+      : `github_request_count + ${input.overflow.column}`;
   const row = await database.withSession("first-primary").prepare(
-    `SELECT github_request_count
+    `SELECT ${countExpression} AS github_request_count
      FROM ${input.table}
      WHERE ${input.idColumn} = ? AND status = ?
        AND EXISTS (

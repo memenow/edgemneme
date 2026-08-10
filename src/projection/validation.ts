@@ -7,6 +7,7 @@ import { sha256 } from "../security/crypto";
 import {
   pathSegment,
   projectionPrefix,
+  projectionScopeIndexKey,
   type ProjectionWrite
 } from "./markdown";
 import type { ProjectionSnapshotWritePlan } from "./types";
@@ -122,7 +123,14 @@ function validateManifestReferences(
   errors: string[]
 ): void {
   const keys = new Set(plan.writes.map((write) => write.key));
-  for (const entry of Array.isArray(memories) ? memories : []) {
+  const memoryEntries = Array.isArray(memories) ? memories : [];
+  const revisionEntries = Array.isArray(revisions) ? revisions : [];
+  if (memoryEntries.length !== revisionEntries.length) {
+    errors.push("Manifest must contain exactly one current revision per memory.");
+  }
+  const memoryIds = new Set<string>();
+  const revisionIds = new Set<string>();
+  for (const entry of memoryEntries) {
     if (!isRecord(entry)) {
       errors.push("Manifest contains an invalid memory entry.");
       continue;
@@ -135,14 +143,39 @@ function validateManifestReferences(
     ) {
       errors.push("Manifest memory entry references a missing object.");
     }
+    if (typeof entry.memory_id !== "string" || typeof entry.revision_id !== "string") {
+      errors.push("Manifest memory entry has an invalid current revision identity.");
+    } else if (memoryIds.has(entry.memory_id)) {
+      errors.push("Manifest contains a duplicate memory entry.");
+    } else {
+      memoryIds.add(entry.memory_id);
+    }
+    const currentRevision = revisionEntries.find(
+      (revision) =>
+        isRecord(revision) &&
+        revision.memory_id === entry.memory_id &&
+        revision.revision_id === entry.revision_id &&
+        revision.revision_key === entry.revision_key
+    );
+    if (currentRevision === undefined) {
+      errors.push("Manifest memory entry has no matching current revision.");
+    }
   }
-  for (const entry of Array.isArray(revisions) ? revisions : []) {
+  for (const entry of revisionEntries) {
     if (
       !isRecord(entry) ||
       typeof entry.revision_key !== "string" ||
       !keys.has(entry.revision_key)
     ) {
       errors.push("Manifest revision entry references a missing object.");
+    }
+    if (!isRecord(entry) || typeof entry.revision_id !== "string") {
+      continue;
+    }
+    if (revisionIds.has(entry.revision_id)) {
+      errors.push("Manifest contains a duplicate revision entry.");
+    } else {
+      revisionIds.add(entry.revision_id);
     }
   }
 }
@@ -174,9 +207,17 @@ function validateRequiredIndexes(
       }
     }
     for (const scopeId of [...scopeIds].sort(compareText)) {
-      requiredKeys.push(
-        `${plan.prefix}indexes/by-scope/${pathSegment(scopeId)}/index.json`
-      );
+      try {
+        requiredKeys.push(
+          projectionScopeIndexKey(plan.projectId, plan.snapshotId, scopeId)
+        );
+      } catch (error) {
+        errors.push(
+          error instanceof Error
+            ? error.message
+            : "The projection scope index key is invalid."
+        );
+      }
     }
   }
   for (const key of requiredKeys) {

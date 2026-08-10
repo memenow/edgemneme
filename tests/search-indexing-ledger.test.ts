@@ -89,6 +89,52 @@ describe("search projection chunk ledger publication", () => {
     expect(search.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
     expect(search.prepare("PRAGMA quick_check").get()).toEqual({ quick_check: "ok" });
   });
+
+  it("deletes the prior Search head when D1 advances to an invalidated tombstone", async () => {
+    const search = createSearchDatabase();
+    const memory = createMemoryDatabase();
+    const vectors = new FakeVectors();
+    let aiCalls = 0;
+    const input = {
+      memoryDb: new SqliteD1(memory) as unknown as D1Database,
+      searchDb: new SqliteD1(search) as unknown as D1Database,
+      vectors: vectors as unknown as VectorizeIndex,
+      ai: {
+        async run() {
+          aiCalls += 1;
+          return { data: [Array.from({ length: 1_024 }, () => 0.25)] };
+        }
+      } as unknown as Ai,
+      projectId: "project-1",
+      memoryId: "memory-1",
+      projectVersion: 7
+    };
+
+    await expect(publishMemorySearchProjection(input)).resolves.toBe(true);
+    expect(aiCalls).toBe(1);
+    expect(count(search, "memory_projection_heads")).toBe(1);
+
+    memory.exec(`
+      INSERT INTO memory_versions
+        (project_id, memory_id, revision_id, valid_from, valid_until, content)
+      VALUES ('project-1', 'memory-1', 'revision-invalidated', NULL, NULL,
+              'Memory invalidated.');
+      UPDATE memories
+       SET current_revision_id = 'revision-invalidated', status = 'invalidated'
+       WHERE project_id = 'project-1' AND memory_id = 'memory-1';
+      UPDATE projects SET project_version = 8 WHERE project_id = 'project-1';
+    `);
+
+    await expect(
+      publishMemorySearchProjection({ ...input, projectVersion: 8 })
+    ).resolves.toBe(true);
+    expect(aiCalls).toBe(1);
+    expect(vectors.ids).toEqual(new Set());
+    expect(count(search, "memory_projection_heads")).toBe(0);
+    expect(count(search, "memory_fts_chunk_ledger")).toBe(0);
+    expect(count(search, "memory_fts")).toBe(0);
+    expect(count(search, "memory_search_projection_deletions")).toBe(0);
+  });
 });
 
 describe("search projection chunk ledger deletion", () => {

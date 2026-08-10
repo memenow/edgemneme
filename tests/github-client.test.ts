@@ -56,6 +56,18 @@ describe("GitHubReadOnlyClient", () => {
     expect(
       GitHubReadOnlyClient.isAllowedEndpoint(
         "GET",
+        `/repos/a/b/git/tags/${SHA}`
+      )
+    ).toBe(true);
+    expect(
+      GitHubReadOnlyClient.isAllowedEndpoint(
+        "GET",
+        `/repos/a/b/git/tags/${SHA}/unexpected`
+      )
+    ).toBe(false);
+    expect(
+      GitHubReadOnlyClient.isAllowedEndpoint(
+        "GET",
         `/repos/a/b/git/blobs/${"a".repeat(39)}/../user`
       )
     ).toBe(false);

@@ -8,8 +8,14 @@ gates. Normal source deployment can then run from the protected GitHub
 
 1. Create `MEMORY_DB` and `SEARCH_DB`; store their UUIDs as protected GitHub
    environment variables. Never edit the tracked Wrangler placeholders.
-2. Create the private projection R2 bucket.
-3. Create the Vectorize index with 1,024 dimensions and cosine distance. Before
+2. Create the private projection R2 bucket used by the runtime Workers.
+3. Create a separate default-jurisdiction, backup-only R2 bucket for production
+   D1 migration exports. Do not bind it to any Worker. Give it no custom domain,
+   keep `r2.dev` disabled, and configure the exact lifecycle contract below.
+   Store its name as the protected `production` environment variable
+   `D1_MIGRATION_BACKUP_R2_BUCKET`; store an integer retention from 30 through
+   365 days as `D1_MIGRATION_BACKUP_RETENTION_DAYS`.
+4. Create the Vectorize index with 1,024 dimensions and cosine distance. Before
    inserting any vector, create String metadata indexes for `model_generation`,
    `status`, `repository_partition`, `kind`, `memory_class`, and `scope_key`,
    plus Number metadata indexes for `valid_from_epoch_ms` and
@@ -41,20 +47,119 @@ gates. Normal source deployment can then run from the protected GitHub
      --property-name=valid_until_epoch_ms --type=number
    pnpm exec wrangler vectorize list-metadata-index edgemneme-memory
    ```
-4. Create the main Queue and dead-letter Queue.
-5. Allocate three distinct positive rate-limit namespace IDs and store them as
+5. Create the main Queue and dead-letter Queue.
+6. Allocate three distinct positive rate-limit namespace IDs and store them as
    protected environment variables.
-6. Configure the Cloudflare CI credential, account ID, gateway runtime secrets,
+7. Configure the Cloudflare CI credential, account ID, gateway runtime secrets,
    and an explicit `ENABLE_GITHUB_SYNC=false` in the `production` environment.
-7. Apply D1 migrations after creating a Time Travel bookmark and private export.
+8. Apply D1 migrations after creating a Time Travel bookmark and private export.
    Use the manual `Apply D1 Migrations` workflow and type `APPLY` exactly.
-8. Deploy `memory-orchestrator`, then `memory-gateway`. Keep `github-sync`
+9. Deploy `memory-orchestrator`, then `memory-gateway`. Keep `github-sync`
    disabled and without a Cron until its three Workflow entrypoints, credential,
    and repository-access baseline are separately verified.
-9. Insert an approved project, principals, grants, repositories, and GitHub
+10. Insert an approved project, principals, grants, repositories, and GitHub
    access baseline.
-10. Run one isolated `system.synthetic.<uuid>` canary before enabling real
+11. Run one isolated `system.synthetic.<uuid>` canary before enabling real
     traffic.
+
+For a 90-day policy, set the bucket lifecycle from a reviewed temporary JSON
+file with this exact deletion rule. For another admitted value, replace
+`7776000` with `D1_MIGRATION_BACKUP_RETENTION_DAYS * 86400` before applying it.
+
+```json
+{
+  "rules": [
+    {
+      "id": "edgemneme-d1-migration-backups-retention",
+      "enabled": true,
+      "conditions": {
+        "prefix": "system/backups/d1-migrations/"
+      },
+      "deleteObjectsTransition": {
+        "condition": {
+          "type": "Age",
+          "maxAge": 7776000
+        }
+      }
+    }
+  ]
+}
+```
+
+Apply the complete lifecycle file with `wrangler r2 bucket lifecycle set` and
+then inspect it with `wrangler r2 bucket lifecycle list`. The admission gate
+allows non-deletion rules such as multipart-upload cleanup, but requires exactly
+one enabled object-deletion rule and requires it to match the protected prefix,
+ID, and retention exactly. It also queries the bucket, custom-domain list,
+managed `r2.dev` state, and lifecycle through the Cloudflare API. Unknown,
+malformed, inaccessible, public, missing, or drifting state blocks the migration
+before the D1 export, and the same gate runs again immediately before the first
+R2 upload. The gate scans every tracked Wrangler runtime template plus generated
+runtime configs and rejects the backup bucket if any `r2_buckets` binding
+references it. The maintenance admission separately enumerates every live
+Worker script in the account, resolves the exact single 100% active deployment,
+and reads that immutable version's `resources.bindings`. Any live R2 binding to
+the backup bucket also blocks admission, including a renamed or otherwise
+unrelated Worker that is not represented by the checked-out Wrangler files.
+The workflow does not create the bucket, change public access, or repair
+lifecycle state.
+
+## Production D1 migration admission
+
+The current production migration path is intentionally greenfield-only. This
+revision has no durable maintenance epoch that every previously deployed
+gateway request, Durable Object call, Queue delivery, Cron invocation, and
+Workflow step reads and enforces before writing D1. Control-plane trigger removal
+and two zero observations cannot close that gap: an old invocation can outlive
+the observation window, and Queue metrics are documented as best-effort and
+approximate. An account with any core Worker, core Workflow definition, or
+production D1 rows therefore fails with
+`MISSING_DURABLE_MAINTENANCE_FENCE`. Do not bypass that error by deleting a
+trigger, terminating a Workflow, purging a Queue, or clearing a ledger.
+
+The read-only admission CLI permits initial migration only when all three core
+Workers are absent and exhaustive control-plane enumeration proves no gateway
+workers.dev/preview URL, custom domain, zone route, or immutable active-version
+service binding; no live Worker binding to the generated `MEMORY_DB` or
+`SEARCH_DB` UUID; no live Worker binding to the protected backup R2 bucket; no
+orchestrator or GitHub Cron; no Queue consumer or producer for the memory Queues;
+no nonterminal core Workflow; zero approximate main/DLQ backlog; and no
+MEMORY_DB or SEARCH_DB in-flight state. It validates paginated inventories,
+cursor termination, unique identities, exact active versions, immutable version
+resource shapes, primary D1 results, response-size bounds, and complete
+consecutive `d1_migrations` prefixes. Worker settings are not binding authority:
+the gate reads `result.resources.bindings` from the active immutable version and
+revalidates the complete Worker inventory and active-version map after the
+scan. For every application table, view, trigger, and named index, it also
+compares canonical `sqlite_master.sql` against a local database built from the
+checked-out migration prefix. Table columns, foreign keys, explicit index
+columns, and structurally normalized SQLite automatic indexes must match that
+reference exactly. A same-name object with changed DDL is not accepted. A 404
+is accepted as absence only when the authoritative inventories also prove the
+resource absent. Unknown, malformed, inaccessible, redirected, rate-limited,
+duplicated, partially paginated, unresolved inherited, or drifting state fails
+closed.
+
+Each gate takes two identical observations 60 seconds apart. The pre-backup
+gate records a canonical SHA-256 fingerprint; the post-backup gate repeats both
+observations and requires the same fingerprint immediately before the first D1
+write. The fingerprint includes every observed live Worker, its active version,
+and the normalized binding inventory, including non-target bindings. SEARCH_DB
+must be exact fresh or have the exact `0001` through `0004` schema and migration
+records. If `0005_memory_fts_chunk_ledger.sql` is not yet installed, both
+`memory_fts` and `memory_projection_heads` must be empty. The workflow reports
+the required controlled projection cleanup and stops; it never deletes those
+rebuildable rows.
+
+The workflow applies SEARCH_DB first, verifies no pending Search migration,
+`PRAGMA quick_check`, foreign keys, and the exact checked-out schema, then runs
+two fresh stable maintenance observations before applying MEMORY_DB. It finally
+validates both databases. If Search succeeds and Memory fails, or any later
+validation fails, keep every ingress and producer disabled and roll forward;
+never reopen an old writer or attempt an automatic paired Time Travel restore.
+Supporting an in-place production upgrade requires a separate reviewed design
+for a durable cross-version write fence and Queue generation or drain receipts.
+The migration workflow never creates that fence or changes Cloudflare triggers.
 
 The eight metadata indexes are query prefilters, not authority. The namespace
 provides the project filter. `repository_partition` narrows authorization;
@@ -93,14 +198,23 @@ through the Cloudflare dashboard or API. Each workflow therefore verifies that
 its immutable source is still the current `main` commit before production work.
 Deployment repeats that check with the captured Worker state immediately before
 each Worker lifecycle mutation. Migration repeats it immediately before the
-paired D1 apply sequence; after the first database apply begins, the compatible
-two-database sequence finishes as one logical operation.
+SEARCH_DB apply and again before MEMORY_DB apply. The databases cannot share an
+atomic transaction: after the first apply begins, any failure leaves the system
+in maintenance and permits only the documented roll-forward sequence.
 
 Deployment captures the current core and GitHub synchronization Worker state
-in an independent, read-only job before the deploy job starts. The deploy job
-observes the same state again and rejects drift before changing Worker lifecycle
-state. The independent capture remains available to the rollback job if the
-deploy job fails or is ordinarily canceled. The deploy job has a 240-minute
+in an independent, read-only job before the deploy job starts. After rendering
+the private configuration, the deploy job revalidates the current `main` commit,
+the captured configuration fingerprint, every captured Worker version and
+trigger, and the rendered gateway trigger contract before the first remote
+mutation, including Vectorize metadata-index creation. Bootstrap still requires
+the captured and remote gateway to be absent, but it also validates the complete
+rendered desired trigger contract at this gate. The workflow repeats narrower
+admission checks immediately before later Worker lifecycle mutations. For the
+gateway, the snapshot includes its exact workers.dev setting, custom-domain
+ownership, and the absence of zone routes. The independent capture remains
+available to the rollback job if the deploy job fails or is ordinarily
+canceled. The deploy job has a 240-minute
 ceiling; long-running gates have explicit per-step limits whose compatible path
 fits within that ceiling with job-level margin.
 
@@ -142,16 +256,39 @@ rules through the GitHub API or UI after every policy change.
 The deploy workflow runs `scripts/run-synthetic-canary.mjs`. The runner creates
 an exact `system.synthetic.<uuid>` project and one-time principal, invokes
 `scripts/synthetic-canary-client.mjs`, and removes the registered synthetic
-records in a `finally` cleanup path. The canary separately verifies a
+records in a `finally` cleanup path. Its recoverable cleanup ledger is refreshed
+from the project-scoped chunk ledger, projection-deletion receipts, and vector-
+cleanup receipts before every retry. The runner verifies every recorded
+Vectorize ID is absent before deleting the exact project's Search D1 rows, then
+verifies FTS, projection heads, chunk ledgers, write leases, both receipt tables,
+and any janitor cursor contain no reference to that project. The canary
+separately verifies a
 schema-valid GLM-5.2 Workers AI analysis and a deterministic maintainer-approved
 formal revision. It then waits for projection completion, exercises FTS and
 Vectorize through query-mode hybrid search, reads the checksummed R2 manifest,
 and closes the session with CAS. Cleanup first claims a durable D1 admission
 fence, derives exact Vectorize IDs and the exact R2 snapshot object set, removes
-the FTS and per-memory projection head rows, and deletes authoritative D1 rows
-child-first.
+and verifies the external projections, and only then deletes authoritative D1
+rows child-first.
 It fails if authoritative or search rows remain. Never persist or log the
 one-time token.
+
+The canary endpoint is not a separately configured URL. Immediately after the
+gateway deploy, the workflow proves that the active 100-percent version has this
+run's exact tag, re-reads every remote gateway trigger, and derives the HTTPS
+`/mcp` endpoint from that verified workers.dev hostname or custom domain. It
+checks the same active version, tag, and trigger fingerprint again after canary
+cleanup. A self-consistent URL and host variable therefore cannot redirect the
+canary to another Worker or an older deployment.
+
+An ordinary code deployment cannot change gateway routing. The rendered
+`workers_dev`/custom-domain contract must exactly match the independently
+captured remote trigger state, and any zone route, preview URL, additional
+custom domain, wrong Worker service, or routing drift blocks deployment. Perform
+an intentional routing change as a separate reviewed control-plane operation
+with its own captured recovery plan, finish in exactly one supported state, and
+verify the production endpoint before starting a code deployment. Do not use a
+code deployment as an implicit trigger migration.
 
 Before any Worker deployment, the workflow queries both remote D1 bindings with
 `wrangler d1 migrations list`. Deployment continues only when Wrangler confirms
@@ -214,13 +351,55 @@ in the remaining control-plane window. Production change control must prohibit
 external Worker deployments while this workflow is active; treat automatic
 rollback as best effort and inspect any version mismatch before manual recovery.
 
+Worker version rollback does not restore routes, custom domains, or workers.dev
+settings. After the gateway version rollback, the recovery job therefore
+restores the captured gateway trigger snapshot through the Cloudflare APIs and
+then re-reads both the exact active version and trigger fingerprint. It mutates
+only resources whose service or route script is exactly
+`edgemneme-memory-gateway`; resources owned by other scripts are retained. Any
+unknown ownership, unsupported response, incomplete enumeration, or failed
+post-restore comparison fails closed.
+
+Trigger restoration also has a run-owned compare-before-mutate guard. Immediately
+before a normal rollback or bootstrap cleanup, the rollback job proves this
+run's exact active gateway tag and version, validates the complete remote trigger
+against the rendered configuration, reads it a second time without a version
+change, and captures that run-current state and fingerprint. Every restoration
+branch then requires the complete current trigger state and fingerprint to equal
+that expected-current value before its first delete, attach, or subdomain
+request. This comparison is mandatory even after the workflow proved that it
+advanced the gateway. Run-advance proof only authorizes the run-current state to
+differ from the captured pre-deployment target; it never bypasses the comparison.
+If the gateway did not advance, only the original captured state is an admissible
+expected-current value. External dashboard or API drift therefore stops recovery
+without changing any trigger. This is a guarded read-before-write protocol, not
+an atomic Cloudflare API CAS; prohibit concurrent control-plane changes
+throughout recovery.
+
+Gateway trigger discovery exhaustively paginates the account-filtered zone list
+at 50 zones per request. Every page must return exact `page`, `per_page`, `count`,
+`total_count`, and `total_pages` metadata with stable totals and exact page
+sizes; zone IDs and names must be unique across pages, and the final accumulated
+count must equal `total_count`. It then reads the route list for every returned
+zone. Cloudflare documents both Worker domain and route lists as single-page
+endpoints with no page parameters. Their result arrays are therefore treated as
+the complete endpoint response, while optional domain `result_info` fields are
+validated according to their documented filtered-count and unfiltered-total
+semantics. Duplicate domain IDs or hostnames and duplicate route IDs or patterns
+within a zone fail closed.
+
 A failed bootstrap has no prior core version to restore. When the newly created
-gateway is still exactly this run's tagged version, the rollback job deletes it
-and verifies that it is absent. It retains the bootstrap orchestrator and its
-Durable Object state and requires a reviewed manual roll-forward. Do not rerun
-bootstrap against this mixed state: either complete the missing gateway through
-the reviewed deployment path or reconcile the retained orchestrator before
-starting another automated deployment.
+gateway is still exactly this run's tagged version, the rollback job first uses
+the mandatory run-current comparison to remove only gateway-owned custom
+domains and zone routes and disable the workers.dev trigger. It verifies that
+exact detached state, then immediately rechecks that the same tagged version is
+still active before deleting the Worker script. A concurrent version change at
+that boundary prevents the deletion. Finally, it verifies both the script and
+canonical trigger snapshot are absent. It retains the bootstrap orchestrator
+and its Durable Object state and requires a reviewed manual roll-forward. Do
+not rerun bootstrap against this mixed state: either complete the missing
+gateway through the reviewed deployment path or reconcile the retained
+orchestrator before starting another automated deployment.
 
 GitHub synchronization has its own captured deployment state. Before an enabled
 release, the workflow records whether `github-sync` is absent, its exact active
@@ -274,14 +453,11 @@ gate immediately; the lifecycle code does not silently retry a failed API
 request.
 
 After reserving two clear observations, one workflow run can reconcile at most
-560 candidates per phase during normal disable, 460 during rollback, and 60 in
-the initial migration drain. A larger ledger remains durable and blocks the
-relevant next transition: secret deletion, the pre-migration backup, or
-migration apply. Rerun the reviewed workflow to resume from the immutable
-receipts; never raise the limit or claim an early clear. The initial migration
-drain may perform this maintenance before backup. The final
-post-backup migration gate is read-only so the captured backup continues to
-describe the exact state being migrated.
+560 candidates per phase during normal disable and 460 during rollback. A
+larger ledger remains durable and blocks secret deletion or rollback. Rerun the
+reviewed deployment workflow to resume from immutable receipts; never raise the
+limit or claim an early clear. The D1 migration workflow is a separate read-only
+admission path and never invokes this reconciliation writer.
 
 The cleanup plan derives the complete deterministic snapshot key set from D1 in
 addition to reading the manifest. This permits exact-prefix cleanup if a
@@ -325,7 +501,8 @@ admitting new work.
 
 Never deploy `claude-runner` as part of a wildcard command.
 
-The renderer reads these `production` environment variables:
+The deployment renderer and protected workflows read these `production`
+environment variables:
 
 ```text
 CF_D1_MEMORY_DATABASE_ID
@@ -333,11 +510,11 @@ CF_D1_SEARCH_DATABASE_ID
 CF_RATE_LIMIT_NAMESPACE_EDGE
 CF_RATE_LIMIT_NAMESPACE_CLIENT
 CF_RATE_LIMIT_NAMESPACE_PRINCIPAL
+D1_MIGRATION_BACKUP_R2_BUCKET
+D1_MIGRATION_BACKUP_RETENTION_DAYS
 ENABLE_GITHUB_SYNC
 MEMORY_GATEWAY_ALLOWED_ORIGINS
 MEMORY_GATEWAY_CUSTOM_DOMAIN
-MEMORY_GATEWAY_EXPECTED_HOST
-MEMORY_GATEWAY_PUBLIC_URL
 SYNC_CREDENTIAL_VERSION
 ```
 
@@ -346,14 +523,9 @@ The `production-rollback` environment duplicates the five `CF_*` identifiers,
 gateway routing values. It adds the account variable
 `CF_ROLLBACK_ACCOUNT_ID` plus the non-secret attestation
 `UNATTENDED_ROLLBACK_ENABLED=true`. It stores the dedicated environment secret
-`CLOUDFLARE_ROLLBACK_API_TOKEN`. Gateway URL, host, and browser routing
-variables are not required for version rollback.
-
-`MEMORY_GATEWAY_PUBLIC_URL` and the hostname-only
-`MEMORY_GATEWAY_EXPECTED_HOST` are required for the isolated production canary
-and must identify the same endpoint. The host pin remains required for a
-`workers.dev` deployment; it is used only by pre-deployment validation and the
-canary and is never rendered as a Worker route.
+`CLOUDFLARE_ROLLBACK_API_TOKEN`. A gateway URL or host variable is neither read
+nor accepted as canary authority; the workflow derives both values from the
+verified Cloudflare trigger state.
 
 `SYNC_CREDENTIAL_VERSION` is required only when GitHub synchronization is
 enabled. The origin list and custom domain are optional: an empty custom domain
@@ -393,9 +565,15 @@ Cloudflare CI token only the permissions required by these Workers and
 resources. The current `workers.dev` deployment requires an
 [account-owned token](https://developers.cloudflare.com/fundamentals/api/get-started/account-owned-tokens/)
 limited to the target account with Workers Scripts Edit, D1 Edit, Workers R2
-Storage Edit, Vectorize Edit, and Queues Edit. It requires no zone permission
-and no Workers AI permission because model inference runs through a Worker
-binding. The official
+Storage Edit, Vectorize Edit, Queues Edit, Zone Read, and Workers Routes Read.
+The rollback token additionally requires Workers Routes Edit so it can remove
+or restore only gateway-owned route resources after a failed deployment. The
+trigger gate uses the official
+[Workers domains](https://developers.cloudflare.com/api/resources/workers/subresources/domains/),
+[Workers routes](https://developers.cloudflare.com/api/resources/workers/subresources/routes/),
+and [per-script workers.dev](https://developers.cloudflare.com/api/resources/workers/subresources/scripts/subresources/subdomain/)
+APIs. Neither token requires Workers AI permission because model inference runs
+through a Worker binding. The official
 [GitHub Actions deployment path](https://developers.cloudflare.com/workers/ci-cd/external-cicd/github-actions/)
 does not currently provide a Cloudflare OIDC token exchange, and an exported
 interactive Wrangler OAuth access token is not a renewable CI credential.
@@ -492,10 +670,11 @@ Apply the remaining authority migrations in this exact order:
    enabled; never infer it from owner/name text.
 
 5. `0011_github_tree_manifests.sql` adds staged and immutable complete tree
-   manifests, per-path entries, stable deltas, the active ref head, and bodyless
-   immutable failed/purge lifecycle events. Its triggers require staging-first
-   construction, reject partial manifests at completion, and allow entry
-   deletion only for bounded synthetic cleanup or the guarded 30-day
+   manifests, per-path entries, stable added/changed/deleted/withdrawn deltas,
+   the active ref head, and bodyless immutable failed/purge lifecycle events.
+   Its triggers require staging-first construction, prove every delta against
+   its old and new entries, reject partial manifests at completion, and allow
+   entry deletion only for bounded synthetic cleanup or the guarded 30-day
    failed-manifest retention transition.
    Deploy the compatible GitHub sync Worker only after this migration succeeds.
 6. `0012_projection_rebuild_outbox_index.sql` adds the partial expression index
@@ -548,8 +727,13 @@ Apply the remaining authority migrations in this exact order:
     input and requires at most one summary per consolidation. It installs the
     equivalent D1 insert guard and partial unique index. Apply it before relying
     on the bounded consolidation subrequest calculation.
+15. `0021_github_annotated_tag_request_budget.sql` adds a persisted overflow
+    counter that may advance only while a dispatch item remains `running`, only
+    after its base request counter reaches exactly `2,005`, and by at most eight.
+    Apply it before deploying the runtime that performs bounded annotated-tag
+    peeling and enforces the final `2,013` per-ref request ceiling.
 
-Apply `0006` through `0020` before deploying the multi-repository Workers. If
+Apply `0006` through `0021` before deploying the multi-repository Workers. If
 any preflight fails, stop and reconcile the authoritative rows with a reviewed
 forward migration before retrying; later migrations must not be applied out of
 order or used to bypass an earlier failure.
@@ -711,8 +895,9 @@ The rebuild utility emits independent `projection.rebuild.requested` outbox
 events; it does not reuse the ordinary `memory.changed` event identity or
 dispatch path. For each admitted project it derives these stable logical targets:
 
-- one `snapshot` target for the project version, active memory count, total
-  revision count, distinct active scope count, total UTF-8 revision bytes,
+- one `snapshot` target for the project version, active memory count, matching
+  current-revision count, distinct active scope count, total UTF-8 bytes of
+  those current revisions,
   ordered head digest, and active search generation;
 - one `search` target for every current authoritative memory head; and
 - one `delete` target for every active-generation search head whose memory ID no
@@ -759,12 +944,13 @@ the 250-events-per-minute ETA.
 
 Before it reads rebuild history or writes an outbox event, the planner and
 enqueue command reject any project with more than 16 MiB of authoritative
-revision content or an estimated workload above the 45,000-subrequest safety
+current-revision content or an estimated workload above the 45,000-subrequest safety
 budget. The snapshot event identity and enqueue CAS bind all four capacity
 values. The Workflow rereads and compares them before and after publication and
 applies the same capacity calculation again.
 
-The shared calculation is
+The authority requires `revisions = memories`: the active snapshot contains
+exactly one current revision per active or contested memory. The shared calculation is
 `writes = memories + revisions + scopes + 29` and
 `subrequests = 14 + 3 * (14 + 2 * writes)`. The 29 fixed writes are the
 manifest, README, and fixed kind, class, and status indexes. Each write reserves
@@ -1006,13 +1192,13 @@ repositories and 100 pages. A next page beyond that bound becomes
 `GITHUB_PARTIAL_SYNC` before another request, fails every selected ref closed,
 and requires operator review rather than truncating the authorization-risk
 baseline.
-Every ref Workflow has its own persistent 2,005-request budget and re-runs
+Every ref Workflow has its own persistent 2,013-request budget and re-runs
 repository ID, owner ID, and default-branch verification before reading that
 ref. The counter is incremented in D1 before each fetch, so a Workflow retry or
 response-loss recovery cannot reset it. The ref budget covers the fixed
-metadata, ref, compare, commit, and tree path plus at most 2,000 eligible text
-blob reads and 16 MiB of retrieved content. Generated and binary entries are
-represented without blob retrieval.
+metadata, ref, compare, commit, and tree path, up to eight annotated-tag peel
+requests, at most 2,000 eligible text blob reads, and 16 MiB of retrieved
+content. Generated and binary entries are represented without blob retrieval.
 
 There is no fixed aggregate request ceiling per Cron. The Cron performs no
 GitHub fetches; it only creates stable Workflow instances. Dispatcher and ref
@@ -1031,11 +1217,72 @@ three configured tries, and each row reserves its worst-case exact-recovery
 cost before any write. Running settlement reads at most 40 rows per callback;
 its maximum 21 D1 statements per row is 840, below the Paid-plan limit of
 [1,000 queries per Worker invocation](https://developers.cloudflare.com/d1/platform/limits/).
-Each GitHub Workflow explicitly pins 10,000 steps, while the reconciliation
-budget leaves at least 2,800 of the Worker's 10,000 subrequests for access
-baseline, materialization, and fan-out work. Exhaustion preserves durable state
-for a later Workflow or the disabled maintenance drain and never advances a
-repository ref.
+Reconciliation now returns its conservative actual page, mutation-page,
+subrequest, and Workflow-step usage to the dispatcher. The absolute worst-case
+remainder is 2,800 subrequests and 9,871 steps; admission uses the larger actual
+remainder only after reconciliation has completed.
+
+Before a current dispatch writes a sync cursor, dispatch item, or materialization
+receipt, it performs two read-only keyset passes. The first pass reads 16 rows per
+step and counts every enabled row, every successfully parsed ref, every invalid
+row, each 100-ref materialization chunk, and unique external repository IDs. The
+second pass returns one compact row snapshot per step: project and repository
+identity occur once and the snapshot carries only the parsed ref strings. Every
+summary and snapshot result is measured as UTF-8 JSON before it crosses the
+durable step boundary and must retain 8 KiB below Cloudflare's 1 MiB non-stream
+step-result limit; current and prior dispatch list pages enforce the same bound.
+The pass rechecks a SHA-256 fingerprint over every configuration field. Any row,
+ref, ordering, or configuration drift fails
+closed. Immediately before each materialization batch, the dispatcher snapshots
+the complete cursor/head and active-item state. The cursor insert, due-ref
+selection, and a repository-configuration plus state fence then execute in one
+transactional D1 batch. A disable, pause, configuration, tracked-ref, cursor,
+head, or active-item change before that batch therefore writes no current-batch
+cursor from the materialization transaction. Before a pending
+dispatch item is inserted, a second transactional fence compares the frozen
+repository, cursor, head, active-item, and dispatch state. Its compact guarded
+insert has one aggregate admission guard for the complete ref batch, so one ref
+drifting prevents every row in that batch from being inserted. Full-batch
+verification fails with zero new items after any intervening drift; an exact
+committed insert is recoverable after response loss. Because a
+failed item fence prevents the following materialization-receipt step, it also
+writes no current-dispatch receipt. Duplicate external IDs share one
+access-baseline membership entry but retain the full per-project row and ref cost.
+The summary scan itself rejects before requesting page 885, so even an
+unbounded inventory cannot consume the reserved terminalization margin.
+
+The retry-aware admission formula uses `R` enabled rows, `V` valid rows, `I`
+invalid rows, `F` parsed refs, `C = sum(ceil(refs_per_row / 100))`,
+`B = ceil(F / 100)`, `S = floor(R / 16) + 1` summary pages, and `N = R + 1`
+snapshot pages. With prior-reconciliation reservation `P`, the conservative D1
+common cost is `6 + P + 3 + 3S + 3N`; when `V > 0`, it also reserves 480 D1
+subrequests for at most 32 lane attempts, 42 for baseline state and request-
+counter work, and 9 for lane release. It then adds the larger of:
+
+- successful materialization/fan-out followed by worst-case cleanup:
+  `3(7C + V + 2I) + 3 + 9 + 3(B + 1) + 6 + [9F + 3(B + 1) + 6]`; or
+- baseline failure, per-ref cursor failure, and empty-item cleanup:
+  `3(4C + V + F + 2I) + 3 + 3 + 6`.
+
+The `V` term explicitly reserves the retryable repository-identity reread that
+occurs before any valid repository is materialized. The seventh successful-path
+operation per chunk is the exact item-fence recovery read that can follow a lost
+transaction response.
+
+`V > 0` additionally reserves all 900 GitHub access-baseline requests. This does
+not reduce the supported access inventory: `/user/repos` can still enumerate
+10,000 repositories in 100 pages. Child-Workflow binding recovery independently
+reserves `3(1 + 5n_k)` calls for every fan-out page `k` and sums those page
+costs, because every page is its own retryable step and can recover after its
+full per-item binding path. A syntactically valid 513-ref repository is not
+promised admission when its complete retry and recovery topology exceeds the
+hard dispatcher budget. Logical Workflow steps are counted from the same row,
+page, lane, baseline, fan-out, and cleanup shape. Both dimensions retain an
+additional 128-unit control/failure reserve below their pinned 10,000 limits. A
+workload that does not fit is
+`GITHUB_PARTIAL_SYNC`: only its failed dispatch ledger remains; current-batch
+cursors, items, and materialization receipts remain at zero. Exhaustion never
+becomes a successful prefix.
 
 The internal budgets do not promise that all requests will be available. A
 personal classic PAT normally has a 5,000-request-per-hour primary REST limit
@@ -1045,7 +1292,7 @@ scheduled Worker is also bounded by the deployed Cloudflare plan's subrequest
 and execution-time limits. See GitHub's
 [REST rate-limit documentation](https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api)
 and [Cloudflare Workers limits](https://developers.cloudflare.com/workers/platform/limits/).
-Every due ref is durably scheduled, but large multi-ref or multi-repository
+Every admitted due ref is durably scheduled, but large multi-ref or multi-repository
 backlogs can still wait under an external limit. EdgeMneme does not promise that
 an arbitrary number of maximum-cost refs will complete in the same six-hour
 slot, does not claim unbounded progress, and does not introduce a mid-ref
@@ -1157,7 +1404,7 @@ is applied, recovery is roll-forward only to a build that exports
 retention work; it only creates or recovers stable dispatch and retention
 instances. Dispatcher and ref retries consume the persisted request counters,
 so a Workflow retry cannot reset the 900-request access-discovery budget or the
-2,005-request ref budget. A lane release commits the lane CAS and immutable
+2,013-request ref budget. A lane release commits the lane CAS and immutable
 release receipt in one D1 batch, and response-loss recovery accepts only that
 exact receipt. Never restore a pre-`0019` version, manually clear a lane, or
 rewrite a dispatch, activation, release, or finish receipt.
@@ -1214,10 +1461,12 @@ logs or external error text.
   IDs through a reviewed forward migration and rotate to a new credential
   version if its observed expiration changes.
 - Migration `0011_github_tree_manifests.sql` makes complete manifests, entries,
-  deltas, active-head transitions, and bodyless retention lifecycle events
-  authoritative. It retains a bodyless row and terminal event after the guarded
-  30-day cleanup of failed entries. Never edit or delete a real manifest to
-  recover a run; reconcile the current GitHub tree into a new manifest and
+  provenance-checked deltas, active-head transitions, and bodyless retention
+  lifecycle events authoritative. A `withdrawn` delta represents a prior text
+  entry becoming binary, generated, or sensitive and never carries a recoverable
+  path. The migration retains a bodyless row and terminal event after the
+  guarded 30-day cleanup of failed entries. Never edit or delete a real manifest
+  to recover a run; reconcile the current GitHub tree into a new manifest and
   activate it through the normal CAS path.
 - Migration `0012_projection_rebuild_outbox_index.sql` indexes immutable rebuild
   execution history, deterministic ready-event dispatch, and bounded dispatched
@@ -1283,6 +1532,13 @@ logs or external error text.
   then installs an insert guard and partial unique index. Reconcile invalid
   authority data through a reviewed forward migration; never delete or reorder
   frozen inputs to satisfy the preflight.
+- Migration `0021_github_annotated_tag_request_budget.sql` adds a persisted
+  overflow counter that may advance only while a dispatch item remains
+  `running`, only after its base request counter reaches exactly `2,005`, and by
+  at most eight. The compatible runtime uses those eight requests solely for
+  bounded annotated-tag peeling, producing the documented `2,013` maximum.
+  Apply the migration before deploying that runtime; never edit either counter
+  to retry or extend a GitHub run.
 - Search migration `0005_memory_fts_chunk_ledger.sql` fails closed while legacy
   FTS or projection-head rows remain. Clear only the rebuildable search
   projection through a controlled, exact-vector cleanup; never delete
