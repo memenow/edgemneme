@@ -1,0 +1,86 @@
+{
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "edgemneme-memory-orchestrator",
+  "main": "../workers/memory-orchestrator/index.ts",
+  "compatibility_date": "2026-07-25",
+  "workers_dev": false,
+  "preview_urls": false,
+  "limits": {
+    "cpu_ms": 300000,
+    "subrequests": 1500000
+  },
+  "d1_databases": [
+    {
+      "binding": "MEMORY_DB",
+      "database_name": "edgemneme-memory",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "../migrations"
+    },
+    {
+      "binding": "SEARCH_DB",
+      "database_name": "edgemneme-search",
+      "database_id": "11111111-1111-1111-1111-111111111111",
+      "migrations_dir": "../migrations/search"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "PROJECTIONS",
+      "bucket_name": "edgemneme-projections"
+    }
+  ],
+  "vectorize": [
+    {
+      "binding": "MEMORY_VECTORS",
+      "index_name": "edgemneme-memory"
+    }
+  ],
+  "ai": {
+    "binding": "AI"
+  },
+  "queues": {
+    "producers": [
+      {
+        "binding": "MEMORY_OUTBOX",
+        "queue": "edgemneme-memory-events"
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "edgemneme-memory-events",
+        "max_batch_size": 10,
+        "max_batch_timeout": 5,
+        "max_retries": 5,
+        "dead_letter_queue": "edgemneme-memory-events-dlq"
+      }
+    ]
+  },
+  "triggers": {
+    "crons": ["* * * * *"]
+  },
+  "workflows": [
+    {
+      "name": "edgemneme-memory-workflow",
+      "binding": "MEMORY_WORKFLOW",
+      "class_name": "MemoryWorkflow",
+      "limits": {
+        "steps": 10000
+      }
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "PROJECT_COORDINATOR",
+        "class_name": "ProjectCoordinator"
+      }
+    ]
+  },
+  "exports": {
+    "ProjectCoordinator": {
+      "type": "durable-object",
+      "state": "created",
+      "storage": "sqlite"
+    }
+  }
+}

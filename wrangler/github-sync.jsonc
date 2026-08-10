@@ -1,0 +1,53 @@
+{
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "edgemneme-github-sync",
+  "main": "../workers/github-sync/entrypoint.ts",
+  "compatibility_date": "2026-07-25",
+  "workers_dev": false,
+  "preview_urls": false,
+  "limits": {
+    "cpu_ms": 300000,
+    "subrequests": 10000
+  },
+  "vars": {
+    "GITHUB_SYNC_ENABLED": "false",
+    "GITHUB_CREDENTIAL_VERSION": "unconfigured"
+  },
+  "triggers": {
+    "crons": []
+  },
+  "d1_databases": [
+    {
+      "binding": "MEMORY_DB",
+      "database_name": "edgemneme-memory",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "../migrations"
+    }
+  ],
+  "workflows": [
+    {
+      "name": "edgemneme-github-dispatch-workflow",
+      "binding": "GITHUB_DISPATCH_WORKFLOW",
+      "class_name": "GitHubDispatchWorkflow",
+      "limits": {
+        "steps": 10000
+      }
+    },
+    {
+      "name": "edgemneme-github-ref-sync-workflow",
+      "binding": "GITHUB_REF_SYNC_WORKFLOW",
+      "class_name": "GitHubRefSyncWorkflow",
+      "limits": {
+        "steps": 10000
+      }
+    },
+    {
+      "name": "edgemneme-github-retention-workflow",
+      "binding": "GITHUB_RETENTION_WORKFLOW",
+      "class_name": "GitHubRetentionWorkflow",
+      "limits": {
+        "steps": 10000
+      }
+    }
+  ]
+}

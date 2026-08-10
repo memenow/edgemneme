@@ -1,0 +1,3666 @@
+name: Deploy Workers
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      bootstrap_expected_empty:
+        description: Confirm that both core Workers are expected to be absent before this run
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-cloudflare
+  queue: max
+  cancel-in-progress: false
+
+jobs:
+  capture_production_state:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: production
+    outputs:
+      orchestrator_previous_version: ${{ steps.capture_state.outputs.orchestrator_version }}
+      gateway_previous_version: ${{ steps.capture_state.outputs.gateway_version }}
+      gateway_previous_trigger_state: ${{ steps.capture_state.outputs.gateway_trigger_state }}
+      gateway_previous_trigger_fingerprint: ${{ steps.capture_state.outputs.gateway_trigger_fingerprint }}
+      github_sync_previous_version: ${{ steps.capture_state.outputs.github_sync_version }}
+      github_sync_previous_state: ${{ steps.capture_state.outputs.github_sync_state }}
+      github_sync_previous_schedule_state: ${{ steps.capture_state.outputs.github_sync_schedule_state }}
+      github_sync_previous_secret_state: ${{ steps.capture_state.outputs.github_sync_secret_state }}
+      bootstrap_mode: ${{ steps.capture_state.outputs.bootstrap_mode }}
+      configuration_fingerprint: ${{ steps.capture_state.outputs.configuration_fingerprint }}
+    steps:
+      - name: Check out deployment source for state capture
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Verify immutable state capture source
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "Production state capture is allowed only from refs/heads/main." >&2
+            exit 1
+          fi
+          if [[ "$(git rev-parse HEAD)" != "$GITHUB_SHA" ]]; then
+            echo "Checked-out state capture source does not match GITHUB_SHA." >&2
+            exit 1
+          fi
+
+      - name: Set up Node.js for state capture
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+
+      - name: Verify current main state capture head
+        timeout-minutes: 2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/verify-github-main-head.mjs
+
+      - name: Capture production Worker state
+        id: capture_state
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CF_D1_MEMORY_DATABASE_ID: ${{ vars.CF_D1_MEMORY_DATABASE_ID }}
+          CF_D1_SEARCH_DATABASE_ID: ${{ vars.CF_D1_SEARCH_DATABASE_ID }}
+          CF_RATE_LIMIT_NAMESPACE_EDGE: ${{ vars.CF_RATE_LIMIT_NAMESPACE_EDGE }}
+          CF_RATE_LIMIT_NAMESPACE_CLIENT: ${{ vars.CF_RATE_LIMIT_NAMESPACE_CLIENT }}
+          CF_RATE_LIMIT_NAMESPACE_PRINCIPAL: ${{ vars.CF_RATE_LIMIT_NAMESPACE_PRINCIPAL }}
+          EDGEMNEME_BOOTSTRAP_EXPECTED_EMPTY: ${{ inputs.bootstrap_expected_empty }}
+          ENABLE_GITHUB_SYNC: ${{ vars.ENABLE_GITHUB_SYNC }}
+          GITHUB_CREDENTIAL_VERSION: ${{ vars.SYNC_CREDENTIAL_VERSION }}
+          MEMORY_GATEWAY_ALLOWED_ORIGINS: ${{ vars.MEMORY_GATEWAY_ALLOWED_ORIGINS }}
+          MEMORY_GATEWAY_CUSTOM_DOMAIN: ${{ vars.MEMORY_GATEWAY_CUSTOM_DOMAIN }}
+        run: node scripts/capture-deployment-state.mjs
+
+  validate_rollback_channel:
+    if: github.ref == 'refs/heads/main'
+    needs: capture_production_state
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: production-rollback
+    steps:
+      - name: Check out rollback validation source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Set up Node.js for rollback validation
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+
+      - name: Validate unattended rollback channel
+        env:
+          CF_D1_MEMORY_DATABASE_ID: ${{ vars.CF_D1_MEMORY_DATABASE_ID }}
+          CF_D1_SEARCH_DATABASE_ID: ${{ vars.CF_D1_SEARCH_DATABASE_ID }}
+          CF_RATE_LIMIT_NAMESPACE_EDGE: ${{ vars.CF_RATE_LIMIT_NAMESPACE_EDGE }}
+          CF_RATE_LIMIT_NAMESPACE_CLIENT: ${{ vars.CF_RATE_LIMIT_NAMESPACE_CLIENT }}
+          CF_RATE_LIMIT_NAMESPACE_PRINCIPAL: ${{ vars.CF_RATE_LIMIT_NAMESPACE_PRINCIPAL }}
+          ENABLE_GITHUB_SYNC: ${{ vars.ENABLE_GITHUB_SYNC }}
+          GITHUB_CREDENTIAL_VERSION: ${{ vars.SYNC_CREDENTIAL_VERSION }}
+          MEMORY_GATEWAY_ALLOWED_ORIGINS: ${{ vars.MEMORY_GATEWAY_ALLOWED_ORIGINS }}
+          MEMORY_GATEWAY_CUSTOM_DOMAIN: ${{ vars.MEMORY_GATEWAY_CUSTOM_DOMAIN }}
+          UNATTENDED_ROLLBACK_ENABLED: ${{ vars.UNATTENDED_ROLLBACK_ENABLED }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_ROLLBACK_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CF_ROLLBACK_ACCOUNT_ID }}
+          EXPECTED_CONFIGURATION_FINGERPRINT: ${{ needs.capture_production_state.outputs.configuration_fingerprint }}
+          EXPECTED_ORCHESTRATOR_VERSION: ${{ needs.capture_production_state.outputs.orchestrator_previous_version }}
+          EXPECTED_GATEWAY_VERSION: ${{ needs.capture_production_state.outputs.gateway_previous_version }}
+          EXPECTED_GATEWAY_TRIGGER_STATE: ${{ needs.capture_production_state.outputs.gateway_previous_trigger_state }}
+          EXPECTED_GATEWAY_TRIGGER_FINGERPRINT: ${{ needs.capture_production_state.outputs.gateway_previous_trigger_fingerprint }}
+          EXPECTED_GITHUB_SYNC_VERSION: ${{ needs.capture_production_state.outputs.github_sync_previous_version }}
+          EXPECTED_GITHUB_SYNC_STATE: ${{ needs.capture_production_state.outputs.github_sync_previous_state }}
+          EXPECTED_GITHUB_SYNC_SCHEDULE_STATE: ${{ needs.capture_production_state.outputs.github_sync_previous_schedule_state }}
+          EXPECTED_GITHUB_SYNC_SECRET_STATE: ${{ needs.capture_production_state.outputs.github_sync_previous_secret_state }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$UNATTENDED_ROLLBACK_ENABLED" != "true" ]]; then
+            echo "The rollback environment is not attested for unattended recovery." >&2
+            exit 1
+          fi
+          node scripts/capture-deployment-state.mjs verify-configuration
+          node scripts/capture-deployment-state.mjs verify \
+            orchestrator_version \
+            gateway_version \
+            gateway_trigger_state \
+            gateway_trigger_fingerprint \
+            github_sync_version \
+            github_sync_state \
+            github_sync_schedule_state \
+            github_sync_secret_state
+
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    needs: [capture_production_state, validate_rollback_channel]
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    environment: production
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Verify immutable deployment source
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "Production deployment is allowed only from refs/heads/main." >&2
+            exit 1
+          fi
+          if [[ "$(git rev-parse HEAD)" != "$GITHUB_SHA" ]]; then
+            echo "Checked-out deployment source does not match GITHUB_SHA." >&2
+            exit 1
+          fi
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        with:
+          version: 10.18.0
+          run_install: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Verify current main deployment head
+        timeout-minutes: 2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/verify-github-main-head.mjs
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Validate deployment inputs
+        env:
+          CF_D1_MEMORY_DATABASE_ID: ${{ vars.CF_D1_MEMORY_DATABASE_ID }}
+          CF_D1_SEARCH_DATABASE_ID: ${{ vars.CF_D1_SEARCH_DATABASE_ID }}
+          CF_RATE_LIMIT_NAMESPACE_EDGE: ${{ vars.CF_RATE_LIMIT_NAMESPACE_EDGE }}
+          CF_RATE_LIMIT_NAMESPACE_CLIENT: ${{ vars.CF_RATE_LIMIT_NAMESPACE_CLIENT }}
+          CF_RATE_LIMIT_NAMESPACE_PRINCIPAL: ${{ vars.CF_RATE_LIMIT_NAMESPACE_PRINCIPAL }}
+          ENABLE_GITHUB_SYNC: ${{ vars.ENABLE_GITHUB_SYNC }}
+          GITHUB_CREDENTIAL_VERSION: ${{ vars.SYNC_CREDENTIAL_VERSION }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          required=(
+            CF_D1_MEMORY_DATABASE_ID
+            CF_D1_SEARCH_DATABASE_ID
+            CF_RATE_LIMIT_NAMESPACE_EDGE
+            CF_RATE_LIMIT_NAMESPACE_CLIENT
+            CF_RATE_LIMIT_NAMESPACE_PRINCIPAL
+          )
+          if [[ "${ENABLE_GITHUB_SYNC:-}" != "true" && "${ENABLE_GITHUB_SYNC:-}" != "false" ]]; then
+            echo "ENABLE_GITHUB_SYNC must be explicitly set to true or false." >&2
+            exit 1
+          fi
+          if [[ "$ENABLE_GITHUB_SYNC" == "true" ]]; then
+            required+=(GITHUB_CREDENTIAL_VERSION)
+          fi
+          missing=()
+          for name in "${required[@]}"; do
+            if [[ -z "${!name:-}" ]]; then
+              missing+=("$name")
+            fi
+          done
+          if (( ${#missing[@]} > 0 )); then
+            echo "Missing required production settings: ${missing[*]}" >&2
+            exit 1
+          fi
+          for name in \
+            CF_D1_MEMORY_DATABASE_ID \
+            CF_D1_SEARCH_DATABASE_ID \
+            CF_RATE_LIMIT_NAMESPACE_EDGE \
+            CF_RATE_LIMIT_NAMESPACE_CLIENT \
+            CF_RATE_LIMIT_NAMESPACE_PRINCIPAL; do
+            echo "::add-mask::${!name}"
+          done
+
+      - name: Validate source and public Wrangler templates
+        run: pnpm check
+
+      - name: Verify captured production configuration
+        timeout-minutes: 2
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CF_D1_MEMORY_DATABASE_ID: ${{ vars.CF_D1_MEMORY_DATABASE_ID }}
+          CF_D1_SEARCH_DATABASE_ID: ${{ vars.CF_D1_SEARCH_DATABASE_ID }}
+          CF_RATE_LIMIT_NAMESPACE_EDGE: ${{ vars.CF_RATE_LIMIT_NAMESPACE_EDGE }}
+          CF_RATE_LIMIT_NAMESPACE_CLIENT: ${{ vars.CF_RATE_LIMIT_NAMESPACE_CLIENT }}
+          CF_RATE_LIMIT_NAMESPACE_PRINCIPAL: ${{ vars.CF_RATE_LIMIT_NAMESPACE_PRINCIPAL }}
+          ENABLE_GITHUB_SYNC: ${{ vars.ENABLE_GITHUB_SYNC }}
+          GITHUB_CREDENTIAL_VERSION: ${{ vars.SYNC_CREDENTIAL_VERSION }}
+          MEMORY_GATEWAY_ALLOWED_ORIGINS: ${{ vars.MEMORY_GATEWAY_ALLOWED_ORIGINS }}
+          MEMORY_GATEWAY_CUSTOM_DOMAIN: ${{ vars.MEMORY_GATEWAY_CUSTOM_DOMAIN }}
+          EXPECTED_CONFIGURATION_FINGERPRINT: ${{ needs.capture_production_state.outputs.configuration_fingerprint }}
+        run: node scripts/capture-deployment-state.mjs verify-configuration
+
+      - name: Render private deployment configs
+        env:
+          CF_D1_MEMORY_DATABASE_ID: ${{ vars.CF_D1_MEMORY_DATABASE_ID }}
+          CF_D1_SEARCH_DATABASE_ID: ${{ vars.CF_D1_SEARCH_DATABASE_ID }}
+          CF_RATE_LIMIT_NAMESPACE_EDGE: ${{ vars.CF_RATE_LIMIT_NAMESPACE_EDGE }}
+          CF_RATE_LIMIT_NAMESPACE_CLIENT: ${{ vars.CF_RATE_LIMIT_NAMESPACE_CLIENT }}
+          CF_RATE_LIMIT_NAMESPACE_PRINCIPAL: ${{ vars.CF_RATE_LIMIT_NAMESPACE_PRINCIPAL }}
+          MEMORY_GATEWAY_ALLOWED_ORIGINS: ${{ vars.MEMORY_GATEWAY_ALLOWED_ORIGINS }}
+          MEMORY_GATEWAY_CUSTOM_DOMAIN: ${{ vars.MEMORY_GATEWAY_CUSTOM_DOMAIN }}
+          GITHUB_CREDENTIAL_VERSION: ${{ vars.SYNC_CREDENTIAL_VERSION }}
+          ENABLE_GITHUB_SYNC: ${{ vars.ENABLE_GITHUB_SYNC }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/render-wrangler-config.mjs \
+            memory-orchestrator memory-gateway github-sync
+
+      - name: Require fully migrated remote D1 databases
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          config="wrangler/.wrangler/memory-orchestrator.generated.jsonc"
+          check_no_pending() {
+            local database="$1"
+            local output
+            if ! output="$(
+              pnpm exec wrangler d1 migrations list "$database" --remote \
+                --config "$config" 2>&1
+            )"; then
+              printf '%s\n' "$output" >&2
+              echo "Unable to verify remote migrations for $database; deployment is blocked." >&2
+              return 1
+            fi
+            printf '%s\n' "$output"
+            if [[ "$output" != *"No migrations to apply!"* ]] || \
+               [[ "$output" == *"Migrations to be applied:"* ]]; then
+              echo "Pending or indeterminate migrations for $database; deployment is blocked." >&2
+              return 1
+            fi
+          }
+          check_no_pending MEMORY_DB
+          check_no_pending SEARCH_DB
+
+      - name: Validate rendered deployment configs
+        env:
+          ENABLE_GITHUB_SYNC: ${{ vars.ENABLE_GITHUB_SYNC }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm exec wrangler deploy --dry-run --config wrangler/.wrangler/memory-orchestrator.generated.jsonc
+          pnpm exec wrangler deploy --dry-run --config wrangler/.wrangler/memory-gateway.generated.jsonc
+          pnpm exec wrangler deploy --dry-run --config wrangler/.wrangler/github-sync.generated.jsonc
+
+      - name: Revalidate Vectorize metadata admission
+        timeout-minutes: 2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/verify-github-main-head.mjs
+
+      - name: Reject pre-mutation deployment state drift
+        timeout-minutes: 2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CF_D1_MEMORY_DATABASE_ID: ${{ vars.CF_D1_MEMORY_DATABASE_ID }}
+          CF_D1_SEARCH_DATABASE_ID: ${{ vars.CF_D1_SEARCH_DATABASE_ID }}
+          CF_RATE_LIMIT_NAMESPACE_EDGE: ${{ vars.CF_RATE_LIMIT_NAMESPACE_EDGE }}
+          CF_RATE_LIMIT_NAMESPACE_CLIENT: ${{ vars.CF_RATE_LIMIT_NAMESPACE_CLIENT }}
+          CF_RATE_LIMIT_NAMESPACE_PRINCIPAL: ${{ vars.CF_RATE_LIMIT_NAMESPACE_PRINCIPAL }}
+          ENABLE_GITHUB_SYNC: ${{ vars.ENABLE_GITHUB_SYNC }}
+          GITHUB_CREDENTIAL_VERSION: ${{ vars.SYNC_CREDENTIAL_VERSION }}
+          MEMORY_GATEWAY_ALLOWED_ORIGINS: ${{ vars.MEMORY_GATEWAY_ALLOWED_ORIGINS }}
+          MEMORY_GATEWAY_CUSTOM_DOMAIN: ${{ vars.MEMORY_GATEWAY_CUSTOM_DOMAIN }}
+          EXPECTED_CONFIGURATION_FINGERPRINT: ${{ needs.capture_production_state.outputs.configuration_fingerprint }}
+          EXPECTED_ORCHESTRATOR_VERSION: ${{ needs.capture_production_state.outputs.orchestrator_previous_version }}
+          EXPECTED_GATEWAY_VERSION: ${{ needs.capture_production_state.outputs.gateway_previous_version }}
+          EXPECTED_GATEWAY_TRIGGER_STATE: ${{ needs.capture_production_state.outputs.gateway_previous_trigger_state }}
+          EXPECTED_GATEWAY_TRIGGER_FINGERPRINT: ${{ needs.capture_production_state.outputs.gateway_previous_trigger_fingerprint }}
+          EXPECTED_GITHUB_SYNC_VERSION: ${{ needs.capture_production_state.outputs.github_sync_previous_version }}
+          EXPECTED_GITHUB_SYNC_STATE: ${{ needs.capture_production_state.outputs.github_sync_previous_state }}
+          EXPECTED_GITHUB_SYNC_SCHEDULE_STATE: ${{ needs.capture_production_state.outputs.github_sync_previous_schedule_state }}
+          EXPECTED_GITHUB_SYNC_SECRET_STATE: ${{ needs.capture_production_state.outputs.github_sync_previous_secret_state }}
+          EDGEMNEME_BOOTSTRAP_MODE: ${{ needs.capture_production_state.outputs.bootstrap_mode }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/verify-github-main-head.mjs
+          node scripts/capture-deployment-state.mjs verify-configuration
+          node scripts/capture-deployment-state.mjs verify \
+            orchestrator_version \
+            gateway_version \
+            gateway_trigger_state \
+            gateway_trigger_fingerprint \
+            github_sync_version \
+            github_sync_state \
+            github_sync_schedule_state \
+            github_sync_secret_state
+          node scripts/gateway-deployment-target.mjs verify-predeploy \
+            wrangler/.wrangler/memory-gateway.generated.jsonc
+
+      - name: Ensure semantic Vectorize metadata indexes
+        timeout-minutes: 5
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          vectorize_index_name="edgemneme-memory"
+          max_poll_attempts=30
+          poll_interval_seconds=2
+
+          list_metadata_indexes() {
+            local output
+            if ! output="$(
+              pnpm exec wrangler vectorize list-metadata-index \
+                "$vectorize_index_name" --json
+            )"; then
+              echo "Unable to list Vectorize metadata indexes; deployment is blocked." >&2
+              return 1
+            fi
+            printf '%s' "$output"
+          }
+
+          inspect_metadata_indexes() {
+            local metadata_indexes_json="$1"
+            local validation_mode="$2"
+            METADATA_INDEXES_JSON="$metadata_indexes_json" \
+              METADATA_INDEX_VALIDATION_MODE="$validation_mode" \
+              node --input-type=module <<'NODE'
+          const requiredIndexes = new Map([
+            ["model_generation", "string"],
+            ["status", "string"],
+            ["repository_partition", "string"],
+            ["kind", "string"],
+            ["memory_class", "string"],
+            ["scope_key", "string"],
+            ["valid_from_epoch_ms", "number"],
+            ["valid_until_epoch_ms", "number"]
+          ]);
+          const validationMode = process.env.METADATA_INDEX_VALIDATION_MODE;
+          if (validationMode !== "allow-missing" && validationMode !== "exact") {
+            throw new Error("Vectorize metadata index validation mode is invalid.");
+          }
+          let indexes;
+          try {
+            indexes = JSON.parse(process.env.METADATA_INDEXES_JSON ?? "");
+          } catch {
+            throw new Error("Vectorize metadata index output is not valid JSON.");
+          }
+          if (!Array.isArray(indexes)) {
+            throw new Error("Vectorize metadata index output must be a JSON array.");
+          }
+          const configuredIndexes = new Map();
+          for (const index of indexes) {
+            if (
+              index === null ||
+              typeof index !== "object" ||
+              typeof index.propertyName !== "string" ||
+              index.propertyName.length === 0 ||
+              typeof index.indexType !== "string" ||
+              index.indexType.length === 0
+            ) {
+              throw new Error("Vectorize metadata index output contains a malformed entry.");
+            }
+            const propertyName = index.propertyName;
+            const indexType = index.indexType.toLowerCase();
+            if (configuredIndexes.has(propertyName)) {
+              throw new Error(`Vectorize contains duplicate metadata index ${propertyName}.`);
+            }
+            const requiredType = requiredIndexes.get(propertyName);
+            if (requiredType === undefined) {
+              throw new Error(`Vectorize contains unexpected metadata index ${propertyName}.`);
+            }
+            if (indexType !== requiredType) {
+              throw new Error(
+                `Vectorize metadata index ${propertyName} must use type ${requiredType}, found ${indexType}.`
+              );
+            }
+            configuredIndexes.set(propertyName, indexType);
+          }
+          const missingIndexes = [...requiredIndexes].filter(
+            ([propertyName]) => !configuredIndexes.has(propertyName)
+          );
+          if (validationMode === "exact" && missingIndexes.length > 0) {
+            throw new Error(
+              `Vectorize is missing required metadata indexes: ${missingIndexes
+                .map(([propertyName]) => propertyName)
+                .join(", ")}.`
+            );
+          }
+          for (const [propertyName, indexType] of missingIndexes) {
+            process.stdout.write(`${propertyName}\t${indexType}\n`);
+          }
+          NODE
+          }
+
+          metadata_indexes="$(list_metadata_indexes)"
+          missing_indexes="$(inspect_metadata_indexes "$metadata_indexes" "allow-missing")"
+          if [[ -z "$missing_indexes" ]]; then
+            inspect_metadata_indexes "$metadata_indexes" "exact" >/dev/null
+            echo "Vectorize metadata index set already satisfies the exact required contract."
+            exit 0
+          fi
+
+          while IFS=$'\t' read -r property_name index_type; do
+            if [[ -z "$property_name" ]]; then
+              continue
+            fi
+            if [[ "$index_type" != "string" && "$index_type" != "number" ]]; then
+              echo "Unsupported required Vectorize metadata index type; deployment is blocked." >&2
+              exit 1
+            fi
+            if ! pnpm exec wrangler vectorize create-metadata-index \
+              "$vectorize_index_name" \
+              --property-name="$property_name" \
+              --type="$index_type"; then
+              echo "Unable to create Vectorize metadata index $property_name; deployment is blocked." >&2
+              exit 1
+            fi
+          done <<< "$missing_indexes"
+
+          metadata_indexes_ready=false
+          for ((attempt = 1; attempt <= max_poll_attempts; attempt++)); do
+            metadata_indexes="$(list_metadata_indexes)"
+            missing_indexes="$(inspect_metadata_indexes "$metadata_indexes" "allow-missing")"
+            if [[ -z "$missing_indexes" ]]; then
+              inspect_metadata_indexes "$metadata_indexes" "exact" >/dev/null
+              metadata_indexes_ready=true
+              break
+            fi
+            if (( attempt < max_poll_attempts )); then
+              sleep "$poll_interval_seconds"
+            fi
+          done
+          if [[ "$metadata_indexes_ready" != "true" ]]; then
+            echo "Vectorize metadata indexes did not reach the exact required contract after $max_poll_attempts polling attempts; deployment is blocked." >&2
+            exit 1
+          fi
+          echo "Vectorize metadata index set satisfies the exact required contract."
+
+      - name: Prepare isolated canary identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import { randomUUID } from "node:crypto";
+          import { appendFileSync } from "node:fs";
+          import { join } from "node:path";
+
+          const projectId = randomUUID();
+          const values = {
+            EDGEMNEME_CANARY_PROJECT_ID: projectId,
+            EDGEMNEME_CANARY_PRINCIPAL_ID: randomUUID(),
+            EDGEMNEME_CANARY_PROMOTION_CANDIDATE_ID: randomUUID(),
+            EDGEMNEME_CANARY_CLEANUP_LEDGER: join(
+              process.env.RUNNER_TEMP,
+              `edgemneme-canary-${projectId}.json`
+            )
+          };
+          appendFileSync(
+            process.env.GITHUB_ENV,
+            Object.entries(values).map(([name, value]) => `${name}=${value}\n`).join("")
+          );
+          NODE
+
+      - name: Check projection rebuild deployment budget
+        timeout-minutes: 5
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: pnpm projection:rebuild:plan --resume --max-wait-seconds 3600
+
+      - name: Capture pre-deployment Worker versions
+        id: capture_core_versions
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          EDGEMNEME_BOOTSTRAP_EXPECTED_EMPTY: ${{ inputs.bootstrap_expected_empty }}
+          ENABLE_GITHUB_SYNC: ${{ vars.ENABLE_GITHUB_SYNC }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          worker_state() {
+            local worker_name="$1"
+            WORKER_NAME="$worker_name" node --input-type=module <<'NODE'
+          const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
+          const token = process.env.CLOUDFLARE_API_TOKEN;
+          const workerName = process.env.WORKER_NAME;
+          if (!accountId || !token || !workerName) {
+            throw new Error("Cloudflare Worker state inputs are incomplete.");
+          }
+          const response = await fetch(
+            `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}` +
+              `/workers/scripts/${encodeURIComponent(workerName)}/deployments`,
+            { headers: { Authorization: `Bearer ${token}` }, redirect: "manual" }
+          );
+          if (response.status === 404) {
+            process.stdout.write("absent");
+            process.exit(0);
+          }
+          if (!response.ok) {
+            throw new Error(`Cloudflare Worker state query failed with HTTP ${response.status}.`);
+          }
+          const envelope = await response.json();
+          const deployments = envelope?.result?.deployments;
+          if (envelope?.success !== true || !Array.isArray(deployments) || deployments.length === 0) {
+            throw new Error("The Cloudflare Worker deployment response is invalid.");
+          }
+          const candidates = deployments.map((deployment) => {
+            const createdAt = Date.parse(deployment?.created_on);
+            if (!Number.isFinite(createdAt)) {
+              throw new Error("A Worker deployment has an invalid creation timestamp.");
+            }
+            return { deployment, createdAt };
+          });
+          const latest = candidates.reduce((selected, candidate) =>
+            candidate.createdAt > selected.createdAt ? candidate : selected
+          ).deployment;
+          if (
+            !Array.isArray(latest.versions) ||
+            latest.versions.length !== 1 ||
+            typeof latest.versions[0]?.version_id !== "string" ||
+            !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+              latest.versions[0].version_id
+            ) ||
+            latest.versions[0]?.percentage !== 100
+          ) {
+            throw new Error("The active Worker deployment is not a single 100% version.");
+          }
+          process.stdout.write(latest.versions[0].version_id);
+          NODE
+          }
+          worker_presence() {
+            local worker_name="$1"
+            WORKER_NAME="$worker_name" node --input-type=module <<'NODE'
+          const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
+          const token = process.env.CLOUDFLARE_API_TOKEN;
+          const workerName = process.env.WORKER_NAME;
+          if (!accountId || !token || !workerName) {
+            throw new Error("Cloudflare Worker state inputs are incomplete.");
+          }
+          const response = await fetch(
+            `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}` +
+              `/workers/scripts/${encodeURIComponent(workerName)}/deployments`,
+            { headers: { Authorization: `Bearer ${token}` }, redirect: "manual" }
+          );
+          if (response.status === 404) {
+            process.stdout.write("absent");
+            process.exit(0);
+          }
+          if (!response.ok) {
+            throw new Error(`Cloudflare Worker state query failed with HTTP ${response.status}.`);
+          }
+          const envelope = await response.json();
+          if (
+            envelope?.success !== true ||
+            !Array.isArray(envelope?.result?.deployments) ||
+            envelope.result.deployments.length === 0
+          ) {
+            throw new Error("The Cloudflare Worker deployment response is invalid.");
+          }
+          process.stdout.write("present");
+          NODE
+          }
+          read_github_sync_schedule_state() {
+            node --input-type=module <<'NODE'
+          const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
+          const token = process.env.CLOUDFLARE_API_TOKEN;
+          if (!accountId || !token) {
+            throw new Error("Cloudflare schedule state inputs are incomplete.");
+          }
+          const response = await fetch(
+            `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}` +
+              "/workers/scripts/edgemneme-github-sync/schedules",
+            { headers: { Authorization: `Bearer ${token}` }, redirect: "manual" }
+          );
+          if (!response.ok) {
+            throw new Error(`Cloudflare schedule query failed with HTTP ${response.status}.`);
+          }
+          const envelope = await response.json();
+          const schedules = envelope?.result?.schedules;
+          if (envelope?.success !== true || !Array.isArray(schedules)) {
+            throw new Error("The Cloudflare schedule response is invalid.");
+          }
+          if (schedules.length === 0) {
+            process.stdout.write("disabled");
+            process.exit(0);
+          }
+          if (schedules.length === 1 && schedules[0]?.cron === "0 */6 * * *") {
+            process.stdout.write("enabled");
+            process.exit(0);
+          }
+          throw new Error("The GitHub sync Worker has an unrecognized Cron Trigger state.");
+          NODE
+          }
+          orchestrator_version="$(worker_state edgemneme-memory-orchestrator)"
+          gateway_version="$(worker_state edgemneme-memory-gateway)"
+          github_sync_state="$(worker_presence edgemneme-github-sync)"
+          github_sync_version=""
+          github_sync_schedule_state="absent"
+          github_sync_secret_state="absent"
+          if [[ "$github_sync_state" == "present" ]]; then
+            github_sync_version="$(worker_state edgemneme-github-sync)"
+            github_sync_schedule_state="$(read_github_sync_schedule_state)"
+            github_sync_secrets="$(
+              pnpm exec wrangler secret list \
+                --config wrangler/.wrangler/github-sync.generated.jsonc --format json
+            )"
+            github_sync_secret_state="$(SECRETS_JSON="$github_sync_secrets" node --input-type=module <<'NODE'
+          const secrets = JSON.parse(process.env.SECRETS_JSON ?? "");
+          if (!Array.isArray(secrets)) {
+            throw new Error("The GitHub sync secret binding response is invalid.");
+          }
+          if (secrets.length === 0) {
+            process.stdout.write("absent");
+          } else if (
+            secrets.length === 1 &&
+            secrets[0]?.name === "GITHUB_CLASSIC_TOKEN" &&
+            secrets[0]?.type === "secret_text"
+          ) {
+            process.stdout.write("present");
+          } else {
+            throw new Error("The GitHub sync Worker has an unexpected secret binding.");
+          }
+          NODE
+            )"
+            if [[ "$github_sync_schedule_state" == "enabled" && "$github_sync_secret_state" != "present" ]]; then
+              echo "The enabled GitHub sync Worker is missing its credential binding." >&2
+              exit 1
+            fi
+          fi
+          bootstrap="${EDGEMNEME_BOOTSTRAP_EXPECTED_EMPTY:-false}"
+          if [[ "$bootstrap" == "true" ]]; then
+            if [[ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]]; then
+              echo "Bootstrap is allowed only from a manual workflow_dispatch run." >&2
+              exit 1
+            fi
+            if [[ "$orchestrator_version" != "absent" || "$gateway_version" != "absent" ]]; then
+              echo "Bootstrap expected both core Workers to be absent; refusing deployment." >&2
+              exit 1
+            fi
+            if [[ "$ENABLE_GITHUB_SYNC" == "true" && "$github_sync_state" != "absent" ]]; then
+              echo "Enabled bootstrap expected the GitHub sync Worker to be absent; refusing deployment." >&2
+              exit 1
+            fi
+            orchestrator_version=""
+            gateway_version=""
+          else
+            if [[ "$orchestrator_version" == "absent" || "$gateway_version" == "absent" ]]; then
+              echo "A core Worker is absent; use the explicit expected-empty bootstrap input." >&2
+              exit 1
+            fi
+          fi
+          {
+            echo "EDGEMNEME_ORCHESTRATOR_PREVIOUS_VERSION=$orchestrator_version"
+            echo "EDGEMNEME_GATEWAY_PREVIOUS_VERSION=$gateway_version"
+            echo "EDGEMNEME_GITHUB_SYNC_PREVIOUS_VERSION=$github_sync_version"
+            echo "EDGEMNEME_GITHUB_SYNC_PREVIOUS_STATE=$github_sync_state"
+            echo "EDGEMNEME_GITHUB_SYNC_PREVIOUS_SCHEDULE_STATE=$github_sync_schedule_state"
+            echo "EDGEMNEME_GITHUB_SYNC_PREVIOUS_SECRET_STATE=$github_sync_secret_state"
+          } >> "$GITHUB_ENV"
+          {
+            echo "orchestrator_version=$orchestrator_version"
+            echo "gateway_version=$gateway_version"
+            echo "github_sync_version=$github_sync_version"
+            echo "github_sync_state=$github_sync_state"
+            echo "github_sync_schedule_state=$github_sync_schedule_state"
+            echo "github_sync_secret_state=$github_sync_secret_state"
+            echo "bootstrap_mode=$bootstrap"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Reject deployment state drift
+        timeout-minutes: 2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          EXPECTED_GATEWAY_TRIGGER_STATE: ${{ needs.capture_production_state.outputs.gateway_previous_trigger_state }}
+          EXPECTED_GATEWAY_TRIGGER_FINGERPRINT: ${{ needs.capture_production_state.outputs.gateway_previous_trigger_fingerprint }}
+          CAPTURED_ORCHESTRATOR_VERSION: ${{ needs.capture_production_state.outputs.orchestrator_previous_version }}
+          CAPTURED_GATEWAY_VERSION: ${{ needs.capture_production_state.outputs.gateway_previous_version }}
+          CAPTURED_GITHUB_SYNC_VERSION: ${{ needs.capture_production_state.outputs.github_sync_previous_version }}
+          CAPTURED_GITHUB_SYNC_STATE: ${{ needs.capture_production_state.outputs.github_sync_previous_state }}
+          CAPTURED_GITHUB_SYNC_SCHEDULE_STATE: ${{ needs.capture_production_state.outputs.github_sync_previous_schedule_state }}
+          CAPTURED_GITHUB_SYNC_SECRET_STATE: ${{ needs.capture_production_state.outputs.github_sync_previous_secret_state }}
+          CAPTURED_BOOTSTRAP_MODE: ${{ needs.capture_production_state.outputs.bootstrap_mode }}
+          OBSERVED_ORCHESTRATOR_VERSION: ${{ steps.capture_core_versions.outputs.orchestrator_version }}
+          OBSERVED_GATEWAY_VERSION: ${{ steps.capture_core_versions.outputs.gateway_version }}
+          OBSERVED_GITHUB_SYNC_VERSION: ${{ steps.capture_core_versions.outputs.github_sync_version }}
+          OBSERVED_GITHUB_SYNC_STATE: ${{ steps.capture_core_versions.outputs.github_sync_state }}
+          OBSERVED_GITHUB_SYNC_SCHEDULE_STATE: ${{ steps.capture_core_versions.outputs.github_sync_schedule_state }}
+          OBSERVED_GITHUB_SYNC_SECRET_STATE: ${{ steps.capture_core_versions.outputs.github_sync_secret_state }}
+          OBSERVED_BOOTSTRAP_MODE: ${{ steps.capture_core_versions.outputs.bootstrap_mode }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/verify-github-main-head.mjs
+          node scripts/capture-deployment-state.mjs verify \
+            gateway_trigger_state \
+            gateway_trigger_fingerprint
+          fields=(
+            ORCHESTRATOR_VERSION
+            GATEWAY_VERSION
+            GITHUB_SYNC_VERSION
+            GITHUB_SYNC_STATE
+            GITHUB_SYNC_SCHEDULE_STATE
+            GITHUB_SYNC_SECRET_STATE
+            BOOTSTRAP_MODE
+          )
+          for field in "${fields[@]}"; do
+            captured_name="CAPTURED_${field}"
+            observed_name="OBSERVED_${field}"
+            if [[ "${!captured_name}" != "${!observed_name}" ]]; then
+              echo "Production deployment state changed after the rollback snapshot; refusing deployment." >&2
+              exit 1
+            fi
+          done
+
+      - name: Revalidate disabled GitHub sync reconciliation main
+        if: vars.ENABLE_GITHUB_SYNC == 'false' && needs.capture_production_state.outputs.github_sync_previous_state == 'present'
+        timeout-minutes: 2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/verify-github-main-head.mjs
+
+      - name: Revalidate disabled GitHub sync reconciliation state
+        if: vars.ENABLE_GITHUB_SYNC == 'false' && needs.capture_production_state.outputs.github_sync_previous_state == 'present'
+        timeout-minutes: 2
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          EXPECTED_GITHUB_SYNC_VERSION: ${{ needs.capture_production_state.outputs.github_sync_previous_version }}
+          EXPECTED_GITHUB_SYNC_STATE: ${{ needs.capture_production_state.outputs.github_sync_previous_state }}
+          EXPECTED_GITHUB_SYNC_SCHEDULE_STATE: ${{ needs.capture_production_state.outputs.github_sync_previous_schedule_state }}
+          EXPECTED_GITHUB_SYNC_SECRET_STATE: ${{ needs.capture_production_state.outputs.github_sync_previous_secret_state }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/capture-deployment-state.mjs verify \
+            github_sync_version \
+            github_sync_state \
+            github_sync_schedule_state \
+            github_sync_secret_state
+
+      - name: Reconcile disabled GitHub sync
+        if: vars.ENABLE_GITHUB_SYNC == 'false' && needs.capture_production_state.outputs.github_sync_previous_state == 'present'
+        timeout-minutes: 35
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          config="wrangler/.wrangler/github-sync.generated.jsonc"
+          quiesce_tag="edgemneme-github-workflows-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-disabled"
+          secretless_tag="edgemneme-github-workflows-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-disabled-secretless"
+          active_version() {
+            local deployments
+            deployments="$(pnpm exec wrangler deployments list --config "$config" --json)" || return 1
+            DEPLOYMENTS_JSON="$deployments" node --input-type=module <<'NODE'
+          const deployments = JSON.parse(process.env.DEPLOYMENTS_JSON ?? "");
+          if (!Array.isArray(deployments) || deployments.length === 0) {
+            throw new Error("The GitHub sync Worker has no active deployment.");
+          }
+          const candidates = deployments.map((deployment) => {
+            const createdAt = Date.parse(deployment?.created_on);
+            if (!Number.isFinite(createdAt)) {
+              throw new Error("A GitHub sync deployment has an invalid creation timestamp.");
+            }
+            return { deployment, createdAt };
+          });
+          const latest = candidates.reduce((selected, candidate) =>
+            candidate.createdAt > selected.createdAt ? candidate : selected
+          ).deployment;
+          if (
+            !Array.isArray(latest.versions) ||
+            latest.versions.length !== 1 ||
+            typeof latest.versions[0]?.version_id !== "string" ||
+            !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+              latest.versions[0].version_id
+            ) ||
+            latest.versions[0]?.percentage !== 100
+          ) {
+            throw new Error("The active GitHub sync deployment is not a single 100% version.");
+          }
+          process.stdout.write(latest.versions[0].version_id);
+          NODE
+          }
+          tagged_current_version() {
+            local version_id="$1"
+            local expected_tag="$2"
+            local version
+            version="$(
+              pnpm exec wrangler versions view "$version_id" --config "$config" --json
+            )" || return 1
+            VERSION_JSON="$version" VERSION_ID="$version_id" EXPECTED_TAG="$expected_tag" \
+              node --input-type=module <<'NODE'
+          const version = JSON.parse(process.env.VERSION_JSON ?? "");
+          if (
+            typeof version !== "object" || version === null || Array.isArray(version) ||
+            !process.env.VERSION_ID || !process.env.EXPECTED_TAG ||
+            version.id !== process.env.VERSION_ID
+          ) {
+            throw new Error("The GitHub sync Worker version metadata is invalid.");
+          }
+          process.stdout.write(
+            version.annotations?.["workers/tag"] === process.env.EXPECTED_TAG ? version.id : ""
+          );
+          NODE
+          }
+          version_has_exact_disabled_github_contract() {
+            local version_id="$1"
+            local expected_secret_state="$2"
+            VERSION_ID="$version_id" EXPECTED_SECRET_STATE="$expected_secret_state" \
+              node --input-type=module <<'NODE'
+          const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
+          const token = process.env.CLOUDFLARE_API_TOKEN;
+          const versionId = process.env.VERSION_ID;
+          const expectedSecretState = process.env.EXPECTED_SECRET_STATE;
+          if (
+            !accountId || !token || !versionId ||
+            !["present", "absent"].includes(expectedSecretState ?? "")
+          ) {
+            throw new Error("The disabled GitHub sync version inputs are invalid.");
+          }
+          const response = await fetch(
+            `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}` +
+              `/workers/scripts/edgemneme-github-sync/versions/${encodeURIComponent(versionId)}`,
+            { headers: { Authorization: `Bearer ${token}` }, redirect: "manual" }
+          );
+          if (!response.ok) {
+            throw new Error(
+              `Cloudflare disabled GitHub sync version query failed with HTTP ${response.status}.`
+            );
+          }
+          const envelope = await response.json();
+          const result = envelope?.result;
+          const bindings = result?.resources?.bindings;
+          if (
+            envelope?.success !== true || result?.id !== versionId || !Array.isArray(bindings)
+          ) {
+            throw new Error("The disabled GitHub sync version response is invalid.");
+          }
+          const expected = new Map([
+            ["GITHUB_DISPATCH_WORKFLOW", [
+              "edgemneme-github-dispatch-workflow", "GitHubDispatchWorkflow"
+            ]],
+            ["GITHUB_REF_SYNC_WORKFLOW", [
+              "edgemneme-github-ref-sync-workflow", "GitHubRefSyncWorkflow"
+            ]],
+            ["GITHUB_RETENTION_WORKFLOW", [
+              "edgemneme-github-retention-workflow", "GitHubRetentionWorkflow"
+            ]]
+          ]);
+          const workflows = bindings.filter((binding) => binding?.type === "workflow");
+          const runtime = bindings.filter(
+            (binding) => binding?.type === "plain_text" && binding?.name === "GITHUB_SYNC_ENABLED"
+          );
+          const credential = bindings.filter(
+            (binding) => binding?.type === "plain_text" &&
+              binding?.name === "GITHUB_CREDENTIAL_VERSION"
+          );
+          const secrets = bindings.filter(
+            (binding) => binding?.type === "secret_text" || binding?.type === "secret_key"
+          );
+          const secretContract = expectedSecretState === "present"
+            ? secrets.length === 1 && secrets[0]?.type === "secret_text" &&
+              secrets[0]?.name === "GITHUB_CLASSIC_TOKEN"
+            : secrets.length === 0;
+          const compatible =
+            !bindings.some((binding) => binding?.type === "queue") &&
+            secretContract &&
+            runtime.length === 1 && runtime[0]?.text === "false" &&
+            credential.length === 1 && credential[0]?.text === "unconfigured" &&
+            workflows.length === expected.size &&
+            workflows.every((binding) => {
+              const contract = expected.get(binding?.name);
+              return contract !== undefined &&
+                binding.workflow_name === contract[0] &&
+                binding.class_name === contract[1] &&
+                (binding.script_name === undefined ||
+                  binding.script_name === "edgemneme-github-sync");
+            }) &&
+            new Set(workflows.map((binding) => binding.name)).size === expected.size;
+          process.stdout.write(compatible ? "compatible" : "incompatible");
+          NODE
+          }
+          github_sync_queue_state() {
+            node --input-type=module <<'NODE'
+          const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
+          const token = process.env.CLOUDFLARE_API_TOKEN;
+          if (!accountId || !token) {
+            throw new Error("Cloudflare Queue lifecycle inputs are incomplete.");
+          }
+          const base = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}`;
+          const headers = { Authorization: `Bearer ${token}` };
+          const request = async (url) => {
+            const response = await fetch(url, { headers, redirect: "manual" });
+            if (!response.ok) {
+              throw new Error(`Cloudflare Queue query failed with HTTP ${response.status}.`);
+            }
+            const envelope = await response.json();
+            if (envelope?.success !== true) {
+              throw new Error("The Cloudflare Queue response is invalid.");
+            }
+            return envelope;
+          };
+          const queueIds = new Set();
+          let totalCount;
+          let totalPages;
+          for (let page = 1; page <= 10_000; page += 1) {
+            const url = new URL(`${base}/queues`);
+            url.searchParams.set("page", String(page));
+            url.searchParams.set("per_page", "100");
+            const envelope = await request(url);
+            const info = envelope?.result_info;
+            if (
+              !Array.isArray(envelope.result) ||
+              !Number.isSafeInteger(info?.count) || info.count !== envelope.result.length ||
+              !Number.isSafeInteger(info?.page) || info.page !== page ||
+              !Number.isSafeInteger(info?.per_page) || info.per_page < 1 ||
+              info.count > info.per_page ||
+              !Number.isSafeInteger(info?.total_count) || info.total_count < 0 ||
+              !Number.isSafeInteger(info?.total_pages) || info.total_pages < 0 ||
+              (info.total_count > 0 &&
+                info.total_pages !== Math.ceil(info.total_count / info.per_page)) ||
+              (info.total_count === 0 && ![0, 1].includes(info.total_pages))
+            ) {
+              throw new Error("The Cloudflare Queue inventory pagination is invalid.");
+            }
+            totalCount ??= info.total_count;
+            totalPages ??= info.total_pages;
+            if (info.total_count !== totalCount || info.total_pages !== totalPages) {
+              throw new Error("The Cloudflare Queue inventory changed during pagination.");
+            }
+            for (const queue of envelope.result) {
+              if (
+                typeof queue?.queue_id !== "string" || queue.queue_id.length === 0 ||
+                typeof queue?.queue_name !== "string" || queue.queue_name.length === 0 ||
+                queueIds.has(queue.queue_id) ||
+                !Number.isSafeInteger(queue?.consumers_total_count) ||
+                queue.consumers_total_count < 0 ||
+                !Number.isSafeInteger(queue?.producers_total_count) ||
+                queue.producers_total_count < 0 ||
+                (queue.consumers !== undefined && !Array.isArray(queue.consumers)) ||
+                (queue.producers !== undefined && !Array.isArray(queue.producers))
+              ) {
+                throw new Error("The Cloudflare Queue inventory contains an invalid entry.");
+              }
+              queueIds.add(queue.queue_id);
+              let consumers = queue.consumers ?? [];
+              if (consumers.length > queue.consumers_total_count) {
+                throw new Error("A Cloudflare Queue consumer count is invalid.");
+              }
+              if (consumers.length !== queue.consumers_total_count) {
+                const consumerEnvelope = await request(
+                  `${base}/queues/${encodeURIComponent(queue.queue_id)}/consumers`
+                );
+                if (
+                  !Array.isArray(consumerEnvelope.result) ||
+                  consumerEnvelope.result.length !== queue.consumers_total_count
+                ) {
+                  throw new Error("A Cloudflare Queue consumer inventory is incomplete.");
+                }
+                consumers = consumerEnvelope.result;
+              }
+              const producers = queue.producers ?? [];
+              if (producers.length !== queue.producers_total_count) {
+                throw new Error("A Cloudflare Queue producer inventory is incomplete.");
+              }
+              const consumerIds = new Set();
+              for (const consumer of consumers) {
+                if (
+                  typeof consumer?.consumer_id !== "string" ||
+                  consumer.consumer_id.length === 0 ||
+                  consumerIds.has(consumer.consumer_id) ||
+                  !["worker", "http_pull"].includes(consumer?.type) ||
+                  (consumer.type === "worker" &&
+                    (typeof consumer.script_name !== "string" ||
+                      consumer.script_name.length === 0))
+                ) {
+                  throw new Error("A Cloudflare Queue consumer entry is invalid.");
+                }
+                consumerIds.add(consumer.consumer_id);
+                if (consumer?.script_name === "edgemneme-github-sync") {
+                  throw new Error("The GitHub sync Worker still has a Queue consumer.");
+                }
+              }
+              for (const producer of producers) {
+                if (
+                  (producer?.type !== "worker" && producer?.type !== "r2_bucket") ||
+                  (producer.type === "worker" &&
+                    (typeof producer.script !== "string" || producer.script.length === 0)) ||
+                  (producer.type === "r2_bucket" &&
+                    (typeof producer.bucket_name !== "string" || producer.bucket_name.length === 0))
+                ) {
+                  throw new Error("A Cloudflare Queue producer entry is invalid.");
+                }
+                if (producer?.script === "edgemneme-github-sync") {
+                  throw new Error("The GitHub sync Worker still has a Queue producer.");
+                }
+              }
+            }
+            if (page >= Math.max(1, totalPages)) break;
+            if (page === 10_000) {
+              throw new Error("Cloudflare Queue inventory pagination exceeded its safety bound.");
+            }
+          }
+          if (queueIds.size !== totalCount) {
+            throw new Error("The Cloudflare Queue inventory count is inconsistent.");
+          }
+          process.stdout.write("clear");
+          NODE
+          }
+          github_sync_secret_state() {
+            local secrets
+            secrets="$(pnpm exec wrangler secret list --config "$config" --format json)" || return 1
+            SECRETS_JSON="$secrets" node --input-type=module <<'NODE'
+          const secrets = JSON.parse(process.env.SECRETS_JSON ?? "");
+          if (!Array.isArray(secrets)) {
+            throw new Error("The GitHub sync secret binding response is invalid.");
+          }
+          if (secrets.length === 0) {
+            process.stdout.write("absent");
+          } else if (
+            secrets.length === 1 &&
+            secrets[0]?.name === "GITHUB_CLASSIC_TOKEN" &&
+            secrets[0]?.type === "secret_text"
+          ) {
+            process.stdout.write("present");
+          } else {
+            throw new Error("The GitHub sync Worker has an unexpected secret binding.");
+          }
+          NODE
+          }
+          assert_disabled_version() {
+            local expected_version="$1"
+            local expected_tag="$2"
+            local expected_secret_state="$3"
+            local active
+            local capability
+            local queue_state
+            local secret_state
+            local tagged
+            active="$(active_version)" || return 1
+            if [[ "$active" != "$expected_version" ]]; then
+              echo "The active GitHub sync Worker changed during disabled verification." >&2
+              return 1
+            fi
+            tagged="$(tagged_current_version "$active" "$expected_tag")" || return 1
+            if [[ -z "$tagged" || "$tagged" != "$active" ]]; then
+              echo "The disabled GitHub sync Worker is not exactly this run's tagged version." >&2
+              return 1
+            fi
+            capability="$(
+              version_has_exact_disabled_github_contract \
+                "$active" "$expected_secret_state"
+            )" || return 1
+            if [[ "$capability" != "compatible" ]]; then
+              echo "The disabled GitHub sync Worker does not have the exact three-Workflow contract." >&2
+              return 1
+            fi
+            queue_state="$(github_sync_queue_state)" || return 1
+            if [[ "$queue_state" != "clear" ]]; then
+              echo "The disabled GitHub sync Worker still has a Queue association." >&2
+              return 1
+            fi
+            secret_state="$(github_sync_secret_state)" || return 1
+            if [[ "$secret_state" != "$expected_secret_state" ]]; then
+              echo "The GitHub sync credential binding changed during disabled verification." >&2
+              return 1
+            fi
+          }
+          initial_secret_state="$(github_sync_secret_state)"
+          pnpm exec wrangler deploy --strict \
+            --tag "$quiesce_tag" \
+            --config "$config"
+          quiesced_version="$(active_version)"
+          tagged_current_version "$quiesced_version" "$quiesce_tag" > /dev/null
+          assert_disabled_version "$quiesced_version" "$quiesce_tag" "$initial_secret_state"
+
+          github_sync_schedule_state() {
+            node --input-type=module <<'NODE'
+          const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
+          const token = process.env.CLOUDFLARE_API_TOKEN;
+          if (!accountId || !token) {
+            throw new Error("Cloudflare schedule verification inputs are incomplete.");
+          }
+          const response = await fetch(
+            `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}` +
+              "/workers/scripts/edgemneme-github-sync/schedules",
+            { headers: { Authorization: `Bearer ${token}` }, redirect: "manual" }
+          );
+          if (!response.ok) {
+            throw new Error(`Cloudflare schedule query failed with HTTP ${response.status}.`);
+          }
+          const envelope = await response.json();
+          if (envelope?.success !== true || !Array.isArray(envelope?.result?.schedules)) {
+            throw new Error("The Cloudflare schedule response is invalid.");
+          }
+          const schedules = envelope.result.schedules;
+          if (schedules.length === 0) {
+            process.stdout.write("clear");
+          } else if (schedules.length === 1 && schedules[0]?.cron === "0 */6 * * *") {
+            process.stdout.write("pending");
+          } else {
+            throw new Error("The GitHub sync Worker has an unrecognized Cron Trigger state.");
+          }
+          NODE
+          }
+
+          remove_github_sync_secret_with_tag() {
+            local tag="$1"
+            VERSION_TAG="$tag" node --input-type=module <<'NODE'
+          const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
+          const token = process.env.CLOUDFLARE_API_TOKEN;
+          const tag = process.env.VERSION_TAG;
+          if (!accountId || !token || !tag) {
+            throw new Error("Cloudflare tagged secret deletion inputs are incomplete.");
+          }
+          const body = {
+            secrets: { GITHUB_CLASSIC_TOKEN: null },
+            version_tags: { "workers/tag": tag }
+          };
+          const response = await fetch(
+            `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}` +
+              "/workers/scripts/edgemneme-github-sync/secrets-bulk",
+            {
+              method: "PATCH",
+              headers: {
+                Authorization: `Bearer ${token}`,
+                "Content-Type": "application/json"
+              },
+              body: JSON.stringify(body),
+              redirect: "manual"
+            }
+          );
+          if (!response.ok) {
+            throw new Error(
+              `Cloudflare tagged secret deletion failed with HTTP ${response.status}.`
+            );
+          }
+          const envelope = await response.json();
+          const result = envelope?.result;
+          if (
+            envelope?.success !== true ||
+            typeof result !== "object" || result === null || Array.isArray(result) ||
+            Object.keys(result).length !== 0
+          ) {
+            throw new Error("The tagged GitHub sync secret deletion response is invalid.");
+          }
+          NODE
+          }
+
+          cloudflare_github_workflow_state() {
+            ALLOW_MISSING_WORKFLOWS="false" node --input-type=module <<'NODE'
+          const workflowContracts = [
+            {
+              name: "edgemneme-github-dispatch-workflow",
+              className: "GitHubDispatchWorkflow"
+            },
+            {
+              name: "edgemneme-github-ref-sync-workflow",
+              className: "GitHubRefSyncWorkflow"
+            },
+            {
+              name: "edgemneme-github-retention-workflow",
+              className: "GitHubRetentionWorkflow"
+            }
+          ];
+          const nonterminalStatuses = [
+            "queued",
+            "running",
+            "paused",
+            "waitingForPause",
+            "waiting",
+            "rollingBack"
+          ];
+          const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
+          const token = process.env.CLOUDFLARE_API_TOKEN;
+          const allowMissing = process.env.ALLOW_MISSING_WORKFLOWS === "true";
+          if (!accountId || !token || process.env.ALLOW_MISSING_WORKFLOWS !== "false") {
+            throw new Error("Cloudflare Workflow lifecycle inputs are invalid.");
+          }
+          const base = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}`;
+          const headers = { Authorization: `Bearer ${token}` };
+          const request = async (url, allowNotFound = false) => {
+            const response = await fetch(url, { headers, redirect: "manual" });
+            if (allowNotFound && response.status === 404) return null;
+            if (!response.ok) {
+              throw new Error(`Cloudflare Workflow query failed with HTTP ${response.status}.`);
+            }
+            const envelope = await response.json();
+            if (envelope?.success !== true) {
+              throw new Error("The Cloudflare Workflow response is invalid.");
+            }
+            return envelope;
+          };
+          const expectedInventory = new Map(
+            workflowContracts.map((contract) => [contract.name, contract.className])
+          );
+          const workflowInventoryNames = new Set();
+          const accountWorkflowIds = new Set();
+          const accountWorkflowNames = new Set();
+          let inventoryTotalCount;
+          let inventoryTotalPages;
+          for (let page = 1; page <= 10_000; page += 1) {
+            const url = new URL(`${base}/workflows`);
+            url.searchParams.set("page", String(page));
+            url.searchParams.set("per_page", "100");
+            const envelope = await request(url);
+            const info = envelope?.result_info;
+            if (
+              !Array.isArray(envelope.result) ||
+              !Number.isSafeInteger(info?.count) || info.count !== envelope.result.length ||
+              !Number.isSafeInteger(info?.page) || info.page !== page ||
+              !Number.isSafeInteger(info?.per_page) || info.per_page !== 100 ||
+              !Number.isSafeInteger(info?.total_count) || info.total_count < 0 ||
+              !Number.isSafeInteger(info?.total_pages) || info.total_pages < 0 ||
+              (info.total_count > 0 &&
+                info.total_pages !== Math.ceil(info.total_count / info.per_page)) ||
+              (info.total_count === 0 && ![0, 1].includes(info.total_pages))
+            ) {
+              throw new Error("The Cloudflare Workflow inventory pagination is invalid.");
+            }
+            inventoryTotalCount ??= info.total_count;
+            inventoryTotalPages ??= info.total_pages;
+            if (
+              info.total_count !== inventoryTotalCount ||
+              info.total_pages !== inventoryTotalPages
+            ) {
+              throw new Error("The Cloudflare Workflow inventory changed during pagination.");
+            }
+            for (const workflow of envelope.result) {
+              if (
+                typeof workflow?.id !== "string" || workflow.id.length === 0 ||
+                typeof workflow?.name !== "string" || workflow.name.length === 0 ||
+                typeof workflow?.script_name !== "string" || workflow.script_name.length === 0 ||
+                accountWorkflowIds.has(workflow.id) || accountWorkflowNames.has(workflow.name)
+              ) {
+                throw new Error("The Cloudflare Workflow inventory contains an invalid entry.");
+              }
+              accountWorkflowIds.add(workflow.id);
+              accountWorkflowNames.add(workflow.name);
+              if (workflow.script_name !== "edgemneme-github-sync") continue;
+              const expectedClass = expectedInventory.get(workflow.name);
+              if (
+                expectedClass === undefined || workflow.class_name !== expectedClass ||
+                (workflow.schedules !== undefined &&
+                  (!Array.isArray(workflow.schedules) || workflow.schedules.length !== 0))
+              ) {
+                throw new Error("The GitHub sync Workflow inventory is not the exact approved set.");
+              }
+              workflowInventoryNames.add(workflow.name);
+            }
+            const finalPage = Math.max(1, inventoryTotalPages);
+            if (page >= finalPage) break;
+            if (page === 10_000) {
+              throw new Error("Cloudflare Workflow inventory pagination exceeded its safety bound.");
+            }
+          }
+          if (
+            accountWorkflowIds.size !== inventoryTotalCount ||
+            workflowInventoryNames.size !== expectedInventory.size ||
+            [...expectedInventory.keys()].some((name) => !workflowInventoryNames.has(name))
+          ) {
+            throw new Error("The GitHub sync Workflow inventory is not the exact approved set.");
+          }
+          let pendingInstances = 0;
+          const observedInstanceKeys = new Set();
+          const statusInstanceKeys = new Set();
+          for (const contract of workflowContracts) {
+            const definitionEnvelope = await request(
+              `${base}/workflows/${encodeURIComponent(contract.name)}`,
+              allowMissing
+            );
+            if (definitionEnvelope === null) continue;
+            const workflow = definitionEnvelope.result;
+            if (
+              workflow?.name !== contract.name ||
+              workflow?.class_name !== contract.className ||
+              workflow?.script_name !== "edgemneme-github-sync" ||
+              (workflow?.schedules !== undefined &&
+                (!Array.isArray(workflow.schedules) || workflow.schedules.length !== 0))
+            ) {
+              throw new Error("A GitHub sync Workflow definition does not match the approved contract.");
+            }
+            for (const status of nonterminalStatuses) {
+              let cursor;
+              const observedCursors = new Set();
+              for (let page = 0; page < 10_000; page += 1) {
+                const url = new URL(
+                  `${base}/workflows/${encodeURIComponent(contract.name)}/instances`
+                );
+                url.searchParams.set("status", status);
+                url.searchParams.set("direction", "asc");
+                url.searchParams.set("per_page", "100");
+                if (cursor !== undefined) url.searchParams.set("cursor", cursor);
+                const envelope = await request(url);
+                if (!Array.isArray(envelope.result)) {
+                  throw new Error("The Cloudflare Workflow instance page is invalid.");
+                }
+                for (const instance of envelope.result) {
+                  const observedInstanceKey = JSON.stringify([contract.name, instance?.id]);
+                  const statusInstanceKey = JSON.stringify([
+                    contract.name, status, instance?.id
+                  ]);
+                  if (
+                    typeof instance?.id !== "string" ||
+                    instance.id.length === 0 ||
+                    instance.status !== status ||
+                    statusInstanceKeys.has(statusInstanceKey)
+                  ) {
+                    throw new Error("A Cloudflare Workflow instance is invalid or duplicated.");
+                  }
+                  statusInstanceKeys.add(statusInstanceKey);
+                  if (!observedInstanceKeys.has(observedInstanceKey)) {
+                    observedInstanceKeys.add(observedInstanceKey);
+                    pendingInstances += 1;
+                  }
+                }
+                const nextCursor = envelope?.result_info?.cursor;
+                if (nextCursor === undefined || nextCursor === null || nextCursor === "") break;
+                if (typeof nextCursor !== "string" || observedCursors.has(nextCursor)) {
+                  throw new Error("A Cloudflare Workflow instance cursor is invalid or repeated.");
+                }
+                observedCursors.add(nextCursor);
+                cursor = nextCursor;
+                if (page === 9_999) {
+                  throw new Error("Cloudflare Workflow instance pagination exceeded its safety bound.");
+                }
+              }
+            }
+          }
+          process.stdout.write(pendingInstances === 0 ? "clear" : "pending");
+          NODE
+          }
+
+          github_sync_d1_state() {
+            local schema
+            local table_names
+            local count_expression="0"
+            local output
+            schema="$(
+              pnpm exec wrangler d1 execute MEMORY_DB --remote --json \
+                --config "$config" \
+                --command "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('github_sync_dispatches', 'github_sync_dispatch_items', 'github_repository_sync_runs', 'github_credential_sync_lane') ORDER BY name;"
+            )" || return 1
+            table_names="$(D1_RESULT_JSON="$schema" node --input-type=module <<'NODE'
+          const statements = JSON.parse(process.env.D1_RESULT_JSON ?? "");
+          const rows = statements?.[0]?.results;
+          if (statements?.length !== 1 || statements[0]?.success !== true || !Array.isArray(rows)) {
+            throw new Error("The GitHub sync D1 schema probe response is invalid.");
+          }
+          const allowed = new Set([
+            "github_sync_dispatches",
+            "github_sync_dispatch_items",
+            "github_repository_sync_runs",
+            "github_credential_sync_lane"
+          ]);
+          const names = rows.map((row) => row?.name);
+          if (names.some((name) => typeof name !== "string" || !allowed.has(name)) ||
+              new Set(names).size !== names.length) {
+            throw new Error("The GitHub sync D1 schema probe contains an unexpected table.");
+          }
+          process.stdout.write(`|${names.join("|")}|`);
+          NODE
+            )" || return 1
+            if [[ "$table_names" == *"|github_sync_dispatches|"* ]]; then
+              count_expression+=" + (SELECT COUNT(*) FROM github_sync_dispatches WHERE status IN ('materialized', 'dispatching'))"
+            fi
+            if [[ "$table_names" == *"|github_sync_dispatch_items|"* ]]; then
+              count_expression+=" + (SELECT COUNT(*) FROM github_sync_dispatch_items WHERE status IN ('pending', 'running'))"
+            fi
+            if [[ "$table_names" == *"|github_repository_sync_runs|"* ]]; then
+              count_expression+=" + (SELECT COUNT(*) FROM github_repository_sync_runs WHERE status = 'running')"
+            fi
+            if [[ "$table_names" == *"|github_credential_sync_lane|"* ]]; then
+              count_expression+=" + (SELECT COUNT(*) FROM github_credential_sync_lane WHERE holder_id IS NOT NULL OR lease_claim_id IS NOT NULL OR lease_until IS NOT NULL)"
+            fi
+            output="$(
+              pnpm exec wrangler d1 execute MEMORY_DB --remote --json \
+                --config "$config" --command "SELECT $count_expression AS count;"
+            )" || return 1
+            D1_RESULT_JSON="$output" node --input-type=module <<'NODE'
+          const statements = JSON.parse(process.env.D1_RESULT_JSON ?? "");
+          const count = statements?.[0]?.results?.[0]?.count;
+          if (statements?.length !== 1 || statements[0]?.success !== true ||
+              !Number.isSafeInteger(count) || count < 0) {
+            throw new Error("The GitHub sync D1 drain response is invalid.");
+          }
+          process.stdout.write(count === 0 ? "clear" : "pending");
+          NODE
+          }
+
+          github_sync_zero_observation() {
+            local d1_state
+            local reconciliation_state
+            local schedule_state
+            local verified_schedule_state
+            local verified_workflow_state
+            local workflow_state
+            assert_disabled_version \
+              "$quiesced_version" "$quiesce_tag" "$initial_secret_state" || return 1
+            workflow_state="$(cloudflare_github_workflow_state)" || return 1
+            schedule_state="$(github_sync_schedule_state)" || return 1
+            if [[ "$schedule_state" != "clear" || "$workflow_state" != "clear" ]]; then
+              printf '%s' "pending"
+              return 0
+            fi
+            reconciliation_state="$(
+              node scripts/github-sync-quiescence.mjs reconcile \
+                --config "$config" \
+                --disabled-version "$quiesced_version" \
+                --schedule-state clear \
+                --workflow-state clear
+            )" || return 1
+            case "$reconciliation_state" in
+              clear|pending) ;;
+              *)
+                echo "GitHub sync D1 reconciliation returned an invalid state." >&2
+                return 1
+                ;;
+            esac
+            verified_schedule_state="$(github_sync_schedule_state)" || return 1
+            verified_workflow_state="$(cloudflare_github_workflow_state)" || return 1
+            assert_disabled_version \
+              "$quiesced_version" "$quiesce_tag" "$initial_secret_state" || return 1
+            if [[ "$verified_schedule_state" != "clear" || \
+                  "$verified_workflow_state" != "clear" ]]; then
+              echo "GitHub sync control-plane state changed during D1 reconciliation." >&2
+              return 1
+            fi
+            if [[ "$reconciliation_state" == "pending" ]]; then
+              printf '%s' "pending"
+              return 0
+            fi
+            d1_state="$(github_sync_d1_state)" || return 1
+            if [[ "$schedule_state" == "clear" && \
+                  "$verified_schedule_state" == "clear" && \
+                  "$workflow_state" == "clear" && \
+                  "$verified_workflow_state" == "clear" && \
+                  "$reconciliation_state" == "clear" && \
+                  "$d1_state" == "clear" ]]; then
+              printf '%s' "clear"
+            else
+              printf '%s' "pending"
+            fi
+          }
+
+          wait_for_github_sync_drain() {
+            local observation_state
+            local zero_observations=0
+            for ((attempt = 1; attempt <= 30; attempt++)); do
+              observation_state="$(github_sync_zero_observation)" || return 1
+              if [[ "$observation_state" == "clear" ]]; then
+                zero_observations=$((zero_observations + 1))
+                if (( zero_observations == 2 )); then
+                  return 0
+                fi
+              else
+                zero_observations=0
+              fi
+              if (( attempt < 30 )); then
+                sleep 60
+              fi
+            done
+            echo "GitHub sync did not reach two consecutive quiescent observations; the credential is retained." >&2
+            return 1
+          }
+
+          wait_for_github_sync_drain
+          final_observation_state="$(github_sync_zero_observation)"
+          if [[ "$final_observation_state" != "clear" ]]; then
+            echo "The final GitHub sync drain fence is not clear; the credential is retained." >&2
+            exit 1
+          fi
+          assert_disabled_version \
+            "$quiesced_version" "$quiesce_tag" "$initial_secret_state"
+          if [[ "$initial_secret_state" == "present" ]]; then
+            remove_github_sync_secret_with_tag "$secretless_tag"
+          else
+            secretless_tag="$quiesce_tag"
+          fi
+          secretless_version="$(active_version)"
+          tagged_current_version "$secretless_version" "$secretless_tag" > /dev/null
+          secretless_capability="$(
+            version_has_exact_disabled_github_contract "$secretless_version" "absent"
+          )"
+          if [[ "$secretless_capability" != "compatible" ]]; then
+            echo "The secretless GitHub sync version is not the exact disabled three-Workflow contract." >&2
+            exit 1
+          fi
+          assert_disabled_version "$secretless_version" "$secretless_tag" "absent"
+          secrets="$(pnpm exec wrangler secret list --config "$config" --format json)"
+          schedules_state="$(github_sync_schedule_state)"
+          workflow_state="$(cloudflare_github_workflow_state)"
+          d1_state="$(github_sync_d1_state)"
+          if [[ "$workflow_state" != "clear" || "$d1_state" != "clear" ]]; then
+            echo "GitHub sync work appeared after credential deletion." >&2
+            exit 1
+          fi
+          SECRETS_JSON="$secrets" SCHEDULES_STATE="$schedules_state" node --input-type=module <<'NODE'
+          const secrets = JSON.parse(process.env.SECRETS_JSON ?? "");
+          if (!Array.isArray(secrets) || process.env.SCHEDULES_STATE !== "clear") {
+            throw new Error("GitHub sync lifecycle verification output is invalid.");
+          }
+          if (secrets.length !== 0) {
+            throw new Error("Disabled GitHub sync retained an unexpected secret binding.");
+          }
+          NODE
+          assert_disabled_version "$secretless_version" "$secretless_tag" "absent"
+
+      - name: Revalidate orchestrator deployment main
+        timeout-minutes: 2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/verify-github-main-head.mjs
+
+      - name: Revalidate orchestrator deployment state
+        timeout-minutes: 2
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          EXPECTED_ORCHESTRATOR_VERSION: ${{ needs.capture_production_state.outputs.orchestrator_previous_version }}
+        run: node scripts/capture-deployment-state.mjs verify orchestrator_version
+
+      - name: Deploy memory orchestrator
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: >-
+          pnpm exec wrangler deploy --strict
+          --tag "edgemneme-ledger-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-orchestrator"
+          --config wrangler/.wrangler/memory-orchestrator.generated.jsonc
+
+      - name: Rebuild and verify projections
+        timeout-minutes: 65
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm projection:rebuild:enqueue --resume --max-wait-seconds 3600
+          pnpm projection:rebuild:verify --wait-seconds 3600
+
+      - name: Create ephemeral gateway secret file
+        env:
+          TOKEN_DIGEST_PEPPER: ${{ secrets.TOKEN_DIGEST_PEPPER }}
+          PAGE_TOKEN_HMAC_KEY: ${{ secrets.PAGE_TOKEN_HMAC_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import { mkdirSync, writeFileSync } from "node:fs";
+
+          const directory = "wrangler/.wrangler";
+          mkdirSync(directory, { recursive: true, mode: 0o700 });
+          const entries = ["TOKEN_DIGEST_PEPPER", "PAGE_TOKEN_HMAC_KEY"].map((name) => {
+            const value = process.env[name];
+            if (!value) {
+              throw new Error(`Required Worker secret ${name} is missing.`);
+            }
+            return [name, value];
+          });
+          writeFileSync(
+            `${directory}/memory-gateway.secrets.json`,
+            `${JSON.stringify(Object.fromEntries(entries))}\n`,
+            { mode: 0o600 }
+          );
+          NODE
+
+      - name: Revalidate gateway deployment main
+        timeout-minutes: 2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/verify-github-main-head.mjs
+
+      - name: Revalidate gateway deployment state
+        timeout-minutes: 2
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          EXPECTED_GATEWAY_VERSION: ${{ needs.capture_production_state.outputs.gateway_previous_version }}
+          EXPECTED_GATEWAY_TRIGGER_STATE: ${{ needs.capture_production_state.outputs.gateway_previous_trigger_state }}
+          EXPECTED_GATEWAY_TRIGGER_FINGERPRINT: ${{ needs.capture_production_state.outputs.gateway_previous_trigger_fingerprint }}
+          EDGEMNEME_BOOTSTRAP_MODE: ${{ needs.capture_production_state.outputs.bootstrap_mode }}
+        run: |
+          node scripts/capture-deployment-state.mjs verify \
+            gateway_version \
+            gateway_trigger_state \
+            gateway_trigger_fingerprint
+          node scripts/gateway-deployment-target.mjs verify-predeploy \
+            wrangler/.wrangler/memory-gateway.generated.jsonc
+
+      - name: Deploy memory gateway
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: >-
+          pnpm exec wrangler deploy --strict
+          --tag "github-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-gateway"
+          --config wrangler/.wrangler/memory-gateway.generated.jsonc
+          --secrets-file wrangler/.wrangler/memory-gateway.secrets.json
+
+      - name: Remove gateway secret file
+        if: always()
+        run: rm -f -- wrangler/.wrangler/memory-gateway.secrets.json
+
+      - name: Capture deployed gateway canary target
+        id: gateway_canary_target
+        timeout-minutes: 2
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          EXPECTED_GATEWAY_TRIGGER_STATE: ${{ needs.capture_production_state.outputs.gateway_previous_trigger_state }}
+          EXPECTED_GATEWAY_TRIGGER_FINGERPRINT: ${{ needs.capture_production_state.outputs.gateway_previous_trigger_fingerprint }}
+          EXPECTED_GATEWAY_DEPLOYMENT_TAG: github-${{ github.run_id }}-${{ github.run_attempt }}-gateway
+          EDGEMNEME_BOOTSTRAP_MODE: ${{ needs.capture_production_state.outputs.bootstrap_mode }}
+        run: >-
+          node scripts/gateway-deployment-target.mjs capture-canary-target
+          wrangler/.wrangler/memory-gateway.generated.jsonc
+
+      - name: Run isolated production canary
+        id: isolated_production_canary
+        timeout-minutes: 20
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          TOKEN_DIGEST_PEPPER: ${{ secrets.TOKEN_DIGEST_PEPPER }}
+          EDGEMNEME_GATEWAY_URL: ${{ steps.gateway_canary_target.outputs.gateway_url }}
+          EDGEMNEME_GATEWAY_EXPECTED_HOST: ${{ steps.gateway_canary_target.outputs.gateway_host }}
+        run: node scripts/run-synthetic-canary.mjs
+
+      - name: Recover isolated production canary
+        # A successful canary already completed cleanup. Recovery remains fail-closed
+        # because a missing project alone cannot prove Vectorize and R2 cleanup.
+        if: >-
+          always() &&
+          steps.isolated_production_canary.outcome != 'success' &&
+          steps.isolated_production_canary.outcome != 'skipped'
+        timeout-minutes: 12
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${EDGEMNEME_CANARY_PROJECT_ID:-}" ]] || \
+             [[ ! -f wrangler/.wrangler/memory-gateway.generated.jsonc ]]; then
+            exit 0
+          fi
+          node scripts/run-synthetic-canary.mjs --cleanup-only
+
+      - name: Reverify deployed gateway canary target
+        if: always() && steps.gateway_canary_target.outcome == 'success'
+        timeout-minutes: 2
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          EXPECTED_GATEWAY_ACTIVE_VERSION: ${{ steps.gateway_canary_target.outputs.gateway_active_version }}
+          EXPECTED_GATEWAY_TRIGGER_STATE: ${{ steps.gateway_canary_target.outputs.gateway_trigger_state }}
+          EXPECTED_GATEWAY_TRIGGER_FINGERPRINT: ${{ steps.gateway_canary_target.outputs.gateway_trigger_fingerprint }}
+          EXPECTED_GATEWAY_DEPLOYMENT_TAG: github-${{ github.run_id }}-${{ github.run_attempt }}-gateway
+        run: >-
+          node scripts/gateway-deployment-target.mjs verify-canary-target
+          wrangler/.wrangler/memory-gateway.generated.jsonc
+
+      - name: Create ephemeral GitHub sync secret file
+        if: vars.ENABLE_GITHUB_SYNC == 'true'
+        env:
+          GITHUB_CLASSIC_TOKEN: ${{ secrets.GITHUB_CLASSIC_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import { mkdirSync, writeFileSync } from "node:fs";
+
+          const token = process.env.GITHUB_CLASSIC_TOKEN;
+          if (!token) {
+            throw new Error("Required Worker secret GITHUB_CLASSIC_TOKEN is missing.");
+          }
+          const directory = "wrangler/.wrangler";
+          mkdirSync(directory, { recursive: true, mode: 0o700 });
+          writeFileSync(
+            `${directory}/github-sync.secrets.json`,
+            `${JSON.stringify({ GITHUB_CLASSIC_TOKEN: token })}\n`,
+            { mode: 0o600 }
+          );
+          NODE
+
+      - name: Revalidate GitHub sync deployment main
+        if: vars.ENABLE_GITHUB_SYNC == 'true'
+        timeout-minutes: 2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/verify-github-main-head.mjs
+
+      - name: Revalidate GitHub sync deployment state
+        if: vars.ENABLE_GITHUB_SYNC == 'true'
+        timeout-minutes: 2
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          EXPECTED_GITHUB_SYNC_VERSION: ${{ needs.capture_production_state.outputs.github_sync_previous_version }}
+          EXPECTED_GITHUB_SYNC_STATE: ${{ needs.capture_production_state.outputs.github_sync_previous_state }}
+          EXPECTED_GITHUB_SYNC_SCHEDULE_STATE: ${{ needs.capture_production_state.outputs.github_sync_previous_schedule_state }}
+          EXPECTED_GITHUB_SYNC_SECRET_STATE: ${{ needs.capture_production_state.outputs.github_sync_previous_secret_state }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/capture-deployment-state.mjs verify \
+            github_sync_version \
+            github_sync_state \
+            github_sync_schedule_state \
+            github_sync_secret_state
+
+      - name: Deploy GitHub sync
+        if: vars.ENABLE_GITHUB_SYNC == 'true'
+        timeout-minutes: 35
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          GITHUB_CREDENTIAL_VERSION: ${{ vars.SYNC_CREDENTIAL_VERSION }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          config="wrangler/.wrangler/github-sync.generated.jsonc"
+          active_version() {
+            local deployments
+            deployments="$(pnpm exec wrangler deployments list --config "$config" --json)" || return 1
+            DEPLOYMENTS_JSON="$deployments" node --input-type=module <<'NODE'
+          const deployments = JSON.parse(process.env.DEPLOYMENTS_JSON ?? "");
+          if (!Array.isArray(deployments) || deployments.length === 0) {
+            throw new Error("The GitHub sync Worker has no active deployment.");
+          }
+          const candidates = deployments.map((deployment) => {
+            const createdAt = Date.parse(deployment?.created_on);
+            if (!Number.isFinite(createdAt)) {
+              throw new Error("A GitHub sync deployment has an invalid creation timestamp.");
+            }
+            return { deployment, createdAt };
+          });
+          const latest = candidates.reduce((selected, candidate) =>
+            candidate.createdAt > selected.createdAt ? candidate : selected
+          ).deployment;
+          if (
+            !Array.isArray(latest.versions) ||
+            latest.versions.length !== 1 ||
+            typeof latest.versions[0]?.version_id !== "string" ||
+            !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+              latest.versions[0].version_id
+            ) ||
+            latest.versions[0]?.percentage !== 100
+          ) {
+            throw new Error("The active GitHub sync deployment is not a single 100% version.");
+          }
+          process.stdout.write(latest.versions[0].version_id);
+          NODE
+          }
+          tagged_current_version() {
+            local version_id="$1"
+            local expected_tag="$2"
+            local version
+            version="$(
+              pnpm exec wrangler versions view "$version_id" --config "$config" --json
+            )" || return 1
+            VERSION_JSON="$version" VERSION_ID="$version_id" EXPECTED_TAG="$expected_tag" \
+              node --input-type=module <<'NODE'
+          const version = JSON.parse(process.env.VERSION_JSON ?? "");
+          if (
+            typeof version !== "object" || version === null || Array.isArray(version) ||
+            !process.env.VERSION_ID || !process.env.EXPECTED_TAG ||
+            version.id !== process.env.VERSION_ID
+          ) {
+            throw new Error("The GitHub sync Worker version metadata is invalid.");
+          }
+          process.stdout.write(
+            version.annotations?.["workers/tag"] === process.env.EXPECTED_TAG ? version.id : ""
+          );
+          NODE
+          }
+          version_has_exact_enabled_github_contract() {
+            local version_id="$1"
+            VERSION_ID="$version_id" node --input-type=module <<'NODE'
+          const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
+          const token = process.env.CLOUDFLARE_API_TOKEN;
+          const versionId = process.env.VERSION_ID;
+          const credentialVersion = process.env.GITHUB_CREDENTIAL_VERSION;
+          if (!accountId || !token || !versionId || !credentialVersion) {
+            throw new Error("The enabled GitHub sync version inputs are invalid.");
+          }
+          const response = await fetch(
+            `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}` +
+              `/workers/scripts/edgemneme-github-sync/versions/${encodeURIComponent(versionId)}`,
+            { headers: { Authorization: `Bearer ${token}` }, redirect: "manual" }
+          );
+          if (!response.ok) {
+            throw new Error(
+              `Cloudflare enabled GitHub sync version query failed with HTTP ${response.status}.`
+            );
+          }
+          const envelope = await response.json();
+          const result = envelope?.result;
+          const bindings = result?.resources?.bindings;
+          if (
+            envelope?.success !== true || result?.id !== versionId || !Array.isArray(bindings)
+          ) {
+            throw new Error("The enabled GitHub sync version response is invalid.");
+          }
+          const expected = new Map([
+            ["GITHUB_DISPATCH_WORKFLOW", [
+              "edgemneme-github-dispatch-workflow", "GitHubDispatchWorkflow"
+            ]],
+            ["GITHUB_REF_SYNC_WORKFLOW", [
+              "edgemneme-github-ref-sync-workflow", "GitHubRefSyncWorkflow"
+            ]],
+            ["GITHUB_RETENTION_WORKFLOW", [
+              "edgemneme-github-retention-workflow", "GitHubRetentionWorkflow"
+            ]]
+          ]);
+          const workflows = bindings.filter((binding) => binding?.type === "workflow");
+          const runtime = bindings.filter(
+            (binding) => binding?.type === "plain_text" && binding?.name === "GITHUB_SYNC_ENABLED"
+          );
+          const credential = bindings.filter(
+            (binding) => binding?.type === "plain_text" &&
+              binding?.name === "GITHUB_CREDENTIAL_VERSION"
+          );
+          const secrets = bindings.filter(
+            (binding) => binding?.type === "secret_text" || binding?.type === "secret_key"
+          );
+          const compatible =
+            !bindings.some((binding) => binding?.type === "queue") &&
+            secrets.length === 1 && secrets[0]?.type === "secret_text" &&
+            secrets[0]?.name === "GITHUB_CLASSIC_TOKEN" &&
+            runtime.length === 1 && runtime[0]?.text === "true" &&
+            credential.length === 1 && credential[0]?.text === credentialVersion &&
+            workflows.length === expected.size &&
+            workflows.every((binding) => {
+              const contract = expected.get(binding?.name);
+              return contract !== undefined &&
+                binding.workflow_name === contract[0] &&
+                binding.class_name === contract[1] &&
+                (binding.script_name === undefined ||
+                  binding.script_name === "edgemneme-github-sync");
+            }) &&
+            new Set(workflows.map((binding) => binding.name)).size === expected.size;
+          process.stdout.write(compatible ? "compatible" : "incompatible");
+          NODE
+          }
+          github_sync_queue_state() {
+            node --input-type=module <<'NODE'
+          const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
+          const token = process.env.CLOUDFLARE_API_TOKEN;
+          if (!accountId || !token) {
+            throw new Error("Cloudflare Queue lifecycle inputs are incomplete.");
+          }
+          const base = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}`;
+          const headers = { Authorization: `Bearer ${token}` };
+          const request = async (url) => {
+            const response = await fetch(url, { headers, redirect: "manual" });
+            if (!response.ok) {
+              throw new Error(`Cloudflare Queue query failed with HTTP ${response.status}.`);
+            }
+            const envelope = await response.json();
+            if (envelope?.success !== true) {
+              throw new Error("The Cloudflare Queue response is invalid.");
+            }
+            return envelope;
+          };
+          const queueIds = new Set();
+          let totalCount;
+          let totalPages;
+          for (let page = 1; page <= 10_000; page += 1) {
+            const url = new URL(`${base}/queues`);
+            url.searchParams.set("page", String(page));
+            url.searchParams.set("per_page", "100");
+            const envelope = await request(url);
+            const info = envelope?.result_info;
+            if (
+              !Array.isArray(envelope.result) ||
+              !Number.isSafeInteger(info?.count) || info.count !== envelope.result.length ||
+              !Number.isSafeInteger(info?.page) || info.page !== page ||
+              !Number.isSafeInteger(info?.per_page) || info.per_page < 1 ||
+              info.count > info.per_page ||
+              !Number.isSafeInteger(info?.total_count) || info.total_count < 0 ||
+              !Number.isSafeInteger(info?.total_pages) || info.total_pages < 0 ||
+              (info.total_count > 0 &&
+                info.total_pages !== Math.ceil(info.total_count / info.per_page)) ||
+              (info.total_count === 0 && ![0, 1].includes(info.total_pages))
+            ) {
+              throw new Error("The Cloudflare Queue inventory pagination is invalid.");
+            }
+            totalCount ??= info.total_count;
+            totalPages ??= info.total_pages;
+            if (info.total_count !== totalCount || info.total_pages !== totalPages) {
+              throw new Error("The Cloudflare Queue inventory changed during pagination.");
+            }
+            for (const queue of envelope.result) {
+              if (
+                typeof queue?.queue_id !== "string" || queue.queue_id.length === 0 ||
+                typeof queue?.queue_name !== "string" || queue.queue_name.length === 0 ||
+                queueIds.has(queue.queue_id) ||
+                !Number.isSafeInteger(queue?.consumers_total_count) ||
+                queue.consumers_total_count < 0 ||
+                !Number.isSafeInteger(queue?.producers_total_count) ||
+                queue.producers_total_count < 0 ||
+                (queue.consumers !== undefined && !Array.isArray(queue.consumers)) ||
+                (queue.producers !== undefined && !Array.isArray(queue.producers))
+              ) {
+                throw new Error("The Cloudflare Queue inventory contains an invalid entry.");
+              }
+              queueIds.add(queue.queue_id);
+              let consumers = queue.consumers ?? [];
+              if (consumers.length > queue.consumers_total_count) {
+                throw new Error("A Cloudflare Queue consumer count is invalid.");
+              }
+              if (consumers.length !== queue.consumers_total_count) {
+                const consumerEnvelope = await request(
+                  `${base}/queues/${encodeURIComponent(queue.queue_id)}/consumers`
+                );
+                if (
+                  !Array.isArray(consumerEnvelope.result) ||
+                  consumerEnvelope.result.length !== queue.consumers_total_count
+                ) {
+                  throw new Error("A Cloudflare Queue consumer inventory is incomplete.");
+                }
+                consumers = consumerEnvelope.result;
+              }
+              const producers = queue.producers ?? [];
+              if (producers.length !== queue.producers_total_count) {
+                throw new Error("A Cloudflare Queue producer inventory is incomplete.");
+              }
+              const consumerIds = new Set();
+              for (const consumer of consumers) {
+                if (
+                  typeof consumer?.consumer_id !== "string" ||
+                  consumer.consumer_id.length === 0 ||
+                  consumerIds.has(consumer.consumer_id) ||
+                  !["worker", "http_pull"].includes(consumer?.type) ||
+                  (consumer.type === "worker" &&
+                    (typeof consumer.script_name !== "string" ||
+                      consumer.script_name.length === 0))
+                ) {
+                  throw new Error("A Cloudflare Queue consumer entry is invalid.");
+                }
+                consumerIds.add(consumer.consumer_id);
+                if (consumer?.script_name === "edgemneme-github-sync") {
+                  throw new Error("The GitHub sync Worker still has a Queue consumer.");
+                }
+              }
+              for (const producer of producers) {
+                if (
+                  (producer?.type !== "worker" && producer?.type !== "r2_bucket") ||
+                  (producer.type === "worker" &&
+                    (typeof producer.script !== "string" || producer.script.length === 0)) ||
+                  (producer.type === "r2_bucket" &&
+                    (typeof producer.bucket_name !== "string" || producer.bucket_name.length === 0))
+                ) {
+                  throw new Error("A Cloudflare Queue producer entry is invalid.");
+                }
+                if (producer?.script === "edgemneme-github-sync") {
+                  throw new Error("The GitHub sync Worker still has a Queue producer.");
+                }
+              }
+            }
+            if (page >= Math.max(1, totalPages)) break;
+            if (page === 10_000) {
+              throw new Error("Cloudflare Queue inventory pagination exceeded its safety bound.");
+            }
+          }
+          if (queueIds.size !== totalCount) {
+            throw new Error("The Cloudflare Queue inventory count is inconsistent.");
+          }
+          process.stdout.write("clear");
+          NODE
+          }
+          assert_active_tagged_version() {
+            local expected_version="$1"
+            local expected_tag="$2"
+            local active
+            local capability
+            local queue_state
+            local tagged
+            active="$(active_version)" || return 1
+            if [[ "$active" != "$expected_version" ]]; then
+              echo "The active GitHub sync Worker changed during enabled verification." >&2
+              return 1
+            fi
+            tagged="$(tagged_current_version "$active" "$expected_tag")" || return 1
+            if [[ -z "$tagged" || "$tagged" != "$active" ]]; then
+              echo "The active GitHub sync Worker is not exactly this run's tagged version." >&2
+              return 1
+            fi
+            capability="$(version_has_exact_enabled_github_contract "$active")" || return 1
+            if [[ "$capability" != "compatible" ]]; then
+              echo "The enabled GitHub sync Worker does not have the exact remote binding contract." >&2
+              return 1
+            fi
+            queue_state="$(github_sync_queue_state)" || return 1
+            if [[ "$queue_state" != "clear" ]]; then
+              echo "The enabled GitHub sync Worker still has a Queue association." >&2
+              return 1
+            fi
+          }
+          expected_tag="edgemneme-github-workflows-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-enabled"
+          pnpm exec wrangler deploy --strict \
+            --tag "$expected_tag" \
+            --config "$config" \
+            --secrets-file wrangler/.wrangler/github-sync.secrets.json
+          deployed_version="$(active_version)"
+          assert_active_tagged_version "$deployed_version" "$expected_tag"
+          secrets="$(pnpm exec wrangler secret list --config "$config" --format json)"
+          schedules="$(node --input-type=module <<'NODE'
+          const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
+          const token = process.env.CLOUDFLARE_API_TOKEN;
+          if (!accountId || !token) {
+            throw new Error("Cloudflare schedule verification inputs are incomplete.");
+          }
+          const response = await fetch(
+            `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}` +
+              "/workers/scripts/edgemneme-github-sync/schedules",
+            { headers: { Authorization: `Bearer ${token}` }, redirect: "manual" }
+          );
+          if (!response.ok) {
+            throw new Error(`Cloudflare schedule query failed with HTTP ${response.status}.`);
+          }
+          const envelope = await response.json();
+          if (envelope?.success !== true || !Array.isArray(envelope?.result?.schedules)) {
+            throw new Error("The Cloudflare schedule response is invalid.");
+          }
+          process.stdout.write(JSON.stringify(envelope.result.schedules));
+          NODE
+          )"
+          node --input-type=module <<'NODE'
+          const workflowContracts = [
+            ["edgemneme-github-dispatch-workflow", "GitHubDispatchWorkflow"],
+            ["edgemneme-github-ref-sync-workflow", "GitHubRefSyncWorkflow"],
+            ["edgemneme-github-retention-workflow", "GitHubRetentionWorkflow"]
+          ];
+          const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
+          const token = process.env.CLOUDFLARE_API_TOKEN;
+          if (!accountId || !token) {
+            throw new Error("Cloudflare Workflow verification inputs are incomplete.");
+          }
+          const base = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}`;
+          const headers = { Authorization: `Bearer ${token}` };
+          const request = async (url) => {
+            const response = await fetch(url, { headers, redirect: "manual" });
+            if (!response.ok) {
+              throw new Error(`Cloudflare Workflow verification failed with HTTP ${response.status}.`);
+            }
+            const envelope = await response.json();
+            if (envelope?.success !== true) {
+              throw new Error("The Cloudflare Workflow verification response is invalid.");
+            }
+            return envelope;
+          };
+          const expectedInventory = new Map(workflowContracts);
+          const workflowInventoryNames = new Set();
+          const accountWorkflowIds = new Set();
+          const accountWorkflowNames = new Set();
+          let inventoryTotalCount;
+          let inventoryTotalPages;
+          for (let page = 1; page <= 10_000; page += 1) {
+            const url = new URL(`${base}/workflows`);
+            url.searchParams.set("page", String(page));
+            url.searchParams.set("per_page", "100");
+            const envelope = await request(url);
+            const info = envelope?.result_info;
+            if (
+              !Array.isArray(envelope.result) ||
+              !Number.isSafeInteger(info?.count) || info.count !== envelope.result.length ||
+              !Number.isSafeInteger(info?.page) || info.page !== page ||
+              !Number.isSafeInteger(info?.per_page) || info.per_page !== 100 ||
+              !Number.isSafeInteger(info?.total_count) || info.total_count < 0 ||
+              !Number.isSafeInteger(info?.total_pages) || info.total_pages < 0 ||
+              (info.total_count > 0 &&
+                info.total_pages !== Math.ceil(info.total_count / info.per_page)) ||
+              (info.total_count === 0 && ![0, 1].includes(info.total_pages))
+            ) {
+              throw new Error("The Cloudflare Workflow inventory pagination is invalid.");
+            }
+            inventoryTotalCount ??= info.total_count;
+            inventoryTotalPages ??= info.total_pages;
+            if (
+              info.total_count !== inventoryTotalCount ||
+              info.total_pages !== inventoryTotalPages
+            ) {
+              throw new Error("The Cloudflare Workflow inventory changed during pagination.");
+            }
+            for (const workflow of envelope.result) {
+              if (
+                typeof workflow?.id !== "string" || workflow.id.length === 0 ||
+                typeof workflow?.name !== "string" || workflow.name.length === 0 ||
+                typeof workflow?.script_name !== "string" || workflow.script_name.length === 0 ||
+                accountWorkflowIds.has(workflow.id) || accountWorkflowNames.has(workflow.name)
+              ) {
+                throw new Error("The Cloudflare Workflow inventory contains an invalid entry.");
+              }
+              accountWorkflowIds.add(workflow.id);
+              accountWorkflowNames.add(workflow.name);
+              if (workflow.script_name !== "edgemneme-github-sync") continue;
+              const expectedClass = expectedInventory.get(workflow.name);
+              if (
+                expectedClass === undefined || workflow.class_name !== expectedClass ||
+                (workflow.schedules !== undefined &&
+                  (!Array.isArray(workflow.schedules) || workflow.schedules.length !== 0))
+              ) {
+                throw new Error("The GitHub sync Workflow inventory is not the exact approved set.");
+              }
+              workflowInventoryNames.add(workflow.name);
+            }
+            if (page >= Math.max(1, inventoryTotalPages)) break;
+            if (page === 10_000) {
+              throw new Error("Cloudflare Workflow inventory pagination exceeded its safety bound.");
+            }
+          }
+          if (
+            accountWorkflowIds.size !== inventoryTotalCount ||
+            workflowInventoryNames.size !== expectedInventory.size ||
+            [...expectedInventory.keys()].some((name) => !workflowInventoryNames.has(name))
+          ) {
+            throw new Error("The GitHub sync Workflow inventory is not the exact approved set.");
+          }
+          for (const [name, className] of workflowContracts) {
+            const envelope = await request(`${base}/workflows/${encodeURIComponent(name)}`);
+            const workflow = envelope?.result;
+            if (
+              envelope?.success !== true ||
+              workflow?.name !== name ||
+              workflow?.class_name !== className ||
+              workflow?.script_name !== "edgemneme-github-sync" ||
+              (workflow?.schedules !== undefined &&
+                (!Array.isArray(workflow.schedules) || workflow.schedules.length !== 0))
+            ) {
+              throw new Error("A GitHub sync Workflow definition does not match the approved contract.");
+            }
+          }
+          NODE
+          SECRETS_JSON="$secrets" SCHEDULES_JSON="$schedules" node --input-type=module <<'NODE'
+          const secrets = JSON.parse(process.env.SECRETS_JSON ?? "");
+          const schedules = JSON.parse(process.env.SCHEDULES_JSON ?? "");
+          if (!Array.isArray(secrets) || !Array.isArray(schedules)) {
+            throw new Error("GitHub sync lifecycle verification output is invalid.");
+          }
+          if (
+            secrets.length !== 1 ||
+            secrets[0]?.name !== "GITHUB_CLASSIC_TOKEN" ||
+            secrets[0]?.type !== "secret_text"
+          ) {
+            throw new Error(
+              "Enabled GitHub sync must have only the GITHUB_CLASSIC_TOKEN binding."
+            );
+          }
+          if (schedules.length !== 1 || schedules[0]?.cron !== "0 */6 * * *") {
+            throw new Error("Enabled GitHub sync must have exactly one approved Cron Trigger.");
+          }
+          NODE
+          assert_active_tagged_version "$deployed_version" "$expected_tag"
+
+      - name: Remove GitHub sync secret file
+        if: always() && vars.ENABLE_GITHUB_SYNC == 'true'
+        run: rm -f -- wrangler/.wrangler/github-sync.secrets.json
+
+      - name: Remove ephemeral deployment files
+        if: always()
+        shell: bash
+        run: |
+          rm -f -- \
+            wrangler/.wrangler/memory-orchestrator.generated.jsonc \
+            wrangler/.wrangler/memory-gateway.generated.jsonc \
+            wrangler/.wrangler/github-sync.generated.jsonc \
+            wrangler/.wrangler/memory-gateway.secrets.json \
+            wrangler/.wrangler/github-sync.secrets.json
+
+  rollback_workers:
+    name: Roll back failed Worker deployment
+    needs: [capture_production_state, deploy]
+    if: ${{ always() && needs.capture_production_state.result == 'success' && (needs.deploy.result == 'failure' || needs.deploy.result == 'cancelled') && needs.capture_production_state.outputs.bootstrap_mode != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: production-rollback
+    steps:
+      - name: Check out failed deployment source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Install pnpm for rollback
+        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        with:
+          version: 10.18.0
+          run_install: false
+
+      - name: Set up Node.js for rollback
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Verify rollback configuration parity
+        env:
+          CF_D1_MEMORY_DATABASE_ID: ${{ vars.CF_D1_MEMORY_DATABASE_ID }}
+          CF_D1_SEARCH_DATABASE_ID: ${{ vars.CF_D1_SEARCH_DATABASE_ID }}
+          CF_RATE_LIMIT_NAMESPACE_EDGE: ${{ vars.CF_RATE_LIMIT_NAMESPACE_EDGE }}
+          CF_RATE_LIMIT_NAMESPACE_CLIENT: ${{ vars.CF_RATE_LIMIT_NAMESPACE_CLIENT }}
+          CF_RATE_LIMIT_NAMESPACE_PRINCIPAL: ${{ vars.CF_RATE_LIMIT_NAMESPACE_PRINCIPAL }}
+          ENABLE_GITHUB_SYNC: ${{ vars.ENABLE_GITHUB_SYNC }}
+          GITHUB_CREDENTIAL_VERSION: ${{ vars.SYNC_CREDENTIAL_VERSION }}
+          MEMORY_GATEWAY_ALLOWED_ORIGINS: ${{ vars.MEMORY_GATEWAY_ALLOWED_ORIGINS }}
+          MEMORY_GATEWAY_CUSTOM_DOMAIN: ${{ vars.MEMORY_GATEWAY_CUSTOM_DOMAIN }}
+          UNATTENDED_ROLLBACK_ENABLED: ${{ vars.UNATTENDED_ROLLBACK_ENABLED }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CF_ROLLBACK_ACCOUNT_ID }}
+          EXPECTED_CONFIGURATION_FINGERPRINT: ${{ needs.capture_production_state.outputs.configuration_fingerprint }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$UNATTENDED_ROLLBACK_ENABLED" != "true" ]]; then
+            echo "The rollback environment is no longer attested for unattended recovery." >&2
+            exit 1
+          fi
+          node scripts/capture-deployment-state.mjs verify-configuration
+
+      - name: Install rollback dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Render rollback deployment configs
+        env:
+          CF_D1_MEMORY_DATABASE_ID: ${{ vars.CF_D1_MEMORY_DATABASE_ID }}
+          CF_D1_SEARCH_DATABASE_ID: ${{ vars.CF_D1_SEARCH_DATABASE_ID }}
+          CF_RATE_LIMIT_NAMESPACE_EDGE: ${{ vars.CF_RATE_LIMIT_NAMESPACE_EDGE }}
+          CF_RATE_LIMIT_NAMESPACE_CLIENT: ${{ vars.CF_RATE_LIMIT_NAMESPACE_CLIENT }}
+          CF_RATE_LIMIT_NAMESPACE_PRINCIPAL: ${{ vars.CF_RATE_LIMIT_NAMESPACE_PRINCIPAL }}
+          MEMORY_GATEWAY_ALLOWED_ORIGINS: ${{ vars.MEMORY_GATEWAY_ALLOWED_ORIGINS }}
+          MEMORY_GATEWAY_CUSTOM_DOMAIN: ${{ vars.MEMORY_GATEWAY_CUSTOM_DOMAIN }}
+          ENABLE_GITHUB_SYNC: ${{ vars.ENABLE_GITHUB_SYNC }}
+          GITHUB_CREDENTIAL_VERSION: ${{ vars.SYNC_CREDENTIAL_VERSION }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$ENABLE_GITHUB_SYNC" == "true" ]]; then
+            ENABLE_GITHUB_SYNC=false node scripts/render-wrangler-config.mjs \
+              memory-orchestrator memory-gateway github-sync
+          else
+            node scripts/render-wrangler-config.mjs memory-orchestrator memory-gateway
+          fi
+
+      - name: Rollback failed Worker deployment
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_ROLLBACK_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CF_ROLLBACK_ACCOUNT_ID }}
+          EDGEMNEME_ORCHESTRATOR_PREVIOUS_VERSION: ${{ needs.capture_production_state.outputs.orchestrator_previous_version }}
+          EDGEMNEME_GATEWAY_PREVIOUS_VERSION: ${{ needs.capture_production_state.outputs.gateway_previous_version }}
+          EXPECTED_GATEWAY_TRIGGER_STATE: ${{ needs.capture_production_state.outputs.gateway_previous_trigger_state }}
+          EXPECTED_GATEWAY_TRIGGER_FINGERPRINT: ${{ needs.capture_production_state.outputs.gateway_previous_trigger_fingerprint }}
+          EXPECTED_GATEWAY_CURRENT_TRIGGER_STATE: ${{ needs.capture_production_state.outputs.gateway_previous_trigger_state }}
+          EXPECTED_GATEWAY_CURRENT_TRIGGER_FINGERPRINT: ${{ needs.capture_production_state.outputs.gateway_previous_trigger_fingerprint }}
+          EDGEMNEME_GITHUB_SYNC_PREVIOUS_VERSION: ${{ needs.capture_production_state.outputs.github_sync_previous_version }}
+          EDGEMNEME_GITHUB_SYNC_PREVIOUS_STATE: ${{ needs.capture_production_state.outputs.github_sync_previous_state }}
+          EDGEMNEME_GITHUB_SYNC_PREVIOUS_SCHEDULE_STATE: ${{ needs.capture_production_state.outputs.github_sync_previous_schedule_state }}
+          EDGEMNEME_GITHUB_SYNC_PREVIOUS_SECRET_STATE: ${{ needs.capture_production_state.outputs.github_sync_previous_secret_state }}
+          EDGEMNEME_GITHUB_SYNC_ENABLED: ${{ vars.ENABLE_GITHUB_SYNC }}
+          GITHUB_CREDENTIAL_VERSION: ${{ vars.SYNC_CREDENTIAL_VERSION }}
+          EDGEMNEME_BOOTSTRAP_MODE: ${{ needs.capture_production_state.outputs.bootstrap_mode }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          active_version() {
+            local config="$1"
+            local deployments
+            deployments="$(pnpm exec wrangler deployments list --config "$config" --json)"
+            DEPLOYMENTS_JSON="$deployments" node --input-type=module <<'NODE'
+          const deployments = JSON.parse(process.env.DEPLOYMENTS_JSON ?? "");
+          if (!Array.isArray(deployments) || deployments.length === 0) {
+            throw new Error("The Worker has no active deployment.");
+          }
+          const candidates = deployments.map((deployment) => {
+            const createdAt = Date.parse(deployment?.created_on);
+            if (!Number.isFinite(createdAt)) {
+              throw new Error("A Worker deployment has an invalid creation timestamp.");
+            }
+            return { deployment, createdAt };
+          });
+          const latest = candidates.reduce((selected, candidate) =>
+            candidate.createdAt > selected.createdAt ? candidate : selected
+          ).deployment;
+          if (
+            !Array.isArray(latest.versions) ||
+            latest.versions.length !== 1 ||
+            typeof latest.versions[0]?.version_id !== "string" ||
+            !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+              latest.versions[0].version_id
+            ) ||
+            latest.versions[0]?.percentage !== 100
+          ) {
+            throw new Error("The active Worker deployment is not a single 100% version.");
+          }
+          process.stdout.write(latest.versions[0].version_id);
+          NODE
+          }
+          worker_presence() {
+            local worker_name="$1"
+            WORKER_NAME="$worker_name" node --input-type=module <<'NODE'
+          const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
+          const token = process.env.CLOUDFLARE_API_TOKEN;
+          const workerName = process.env.WORKER_NAME;
+          if (!accountId || !token || !workerName) {
+            throw new Error("Cloudflare Worker state inputs are incomplete.");
+          }
+          const response = await fetch(
+            `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}` +
+              `/workers/scripts/${encodeURIComponent(workerName)}/deployments`,
+            { headers: { Authorization: `Bearer ${token}` }, redirect: "manual" }
+          );
+          if (response.status === 404) {
+            process.stdout.write("absent");
+            process.exit(0);
+          }
+          if (!response.ok) {
+            throw new Error(`Cloudflare Worker state query failed with HTTP ${response.status}.`);
+          }
+          const envelope = await response.json();
+          if (
+            envelope?.success !== true ||
+            !Array.isArray(envelope?.result?.deployments) ||
+            envelope.result.deployments.length === 0
+          ) {
+            throw new Error("The Cloudflare Worker deployment response is invalid.");
+          }
+          process.stdout.write("present");
+          NODE
+          }
+          restore_github_sync_schedule_state() {
+            local schedule_state="$1"
+            SCHEDULE_STATE="$schedule_state" node --input-type=module <<'NODE'
+          const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
+          const token = process.env.CLOUDFLARE_API_TOKEN;
+          const scheduleState = process.env.SCHEDULE_STATE;
+          if (!accountId || !token || !["enabled", "disabled"].includes(scheduleState ?? "")) {
+            throw new Error("Cloudflare schedule rollback inputs are invalid.");
+          }
+          const desired = scheduleState === "enabled" ? [{ cron: "0 */6 * * *" }] : [];
+          const response = await fetch(
+            `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}` +
+              "/workers/scripts/edgemneme-github-sync/schedules",
+            {
+              method: "PUT",
+              headers: {
+                Authorization: `Bearer ${token}`,
+                "Content-Type": "application/json"
+              },
+              body: JSON.stringify(desired),
+              redirect: "manual"
+            }
+          );
+          if (!response.ok) {
+            throw new Error(`Cloudflare schedule rollback failed with HTTP ${response.status}.`);
+          }
+          const envelope = await response.json();
+          const schedules = envelope?.result?.schedules;
+          if (envelope?.success !== true || !Array.isArray(schedules)) {
+            throw new Error("The Cloudflare schedule rollback response is invalid.");
+          }
+          const restored =
+            desired.length === 0
+              ? schedules.length === 0
+              : schedules.length === 1 && schedules[0]?.cron === desired[0]?.cron;
+          if (!restored) {
+            throw new Error("The GitHub sync Cron Trigger state was not restored.");
+          }
+          NODE
+          }
+          tagged_current_version() {
+            local config="$1"
+            local version_id="$2"
+            local expected_tag="$3"
+            local version
+            if ! version="$(
+              pnpm exec wrangler versions view "$version_id" --config "$config" --json
+            )"; then
+              echo "::error::The current Worker version metadata is unavailable; refusing rollback because this run's exact tag cannot be proven." >&2
+              return 1
+            fi
+            VERSION_JSON="$version" VERSION_ID="$version_id" EXPECTED_TAG="$expected_tag" \
+              node --input-type=module <<'NODE'
+          const version = JSON.parse(process.env.VERSION_JSON ?? "");
+          if (
+            typeof version !== "object" || version === null || Array.isArray(version) ||
+            !process.env.VERSION_ID || !process.env.EXPECTED_TAG
+          ) {
+            throw new Error("The Worker version response is invalid.");
+          }
+          if (version.id !== process.env.VERSION_ID) {
+            throw new Error("The current Worker version cannot be identified exactly.");
+          }
+          process.stdout.write(
+            version.annotations?.["workers/tag"] === process.env.EXPECTED_TAG ? version.id : ""
+          );
+          NODE
+          }
+          version_has_ledger_capability() {
+            local config="$1"
+            local version_id="$2"
+            local version
+            if ! version="$(
+              pnpm exec wrangler versions view "$version_id" --config "$config" --json
+            )"; then
+              echo "::error::The previous orchestrator version metadata is unavailable; automatic rollback cannot prove Search chunk ledger compatibility. Manual roll-forward is required." >&2
+              return 1
+            fi
+            VERSION_JSON="$version" VERSION_ID="$version_id" node --input-type=module <<'NODE'
+          const version = JSON.parse(process.env.VERSION_JSON ?? "");
+          if (
+            typeof version !== "object" || version === null || Array.isArray(version) ||
+            !process.env.VERSION_ID
+          ) {
+            throw new Error("The Worker version capability response is invalid.");
+          }
+          if (version.id !== process.env.VERSION_ID) {
+            throw new Error("The previous orchestrator version cannot be identified exactly.");
+          }
+          const tag = version.annotations?.["workers/tag"];
+          process.stdout.write(
+            typeof tag === "string" && tag.startsWith("edgemneme-ledger-")
+              ? "compatible"
+              : "incompatible"
+          );
+          NODE
+          }
+          version_has_github_workflow_capability() {
+            local config="$1"
+            local version_id="$2"
+            local version
+            if ! version="$(
+              pnpm exec wrangler versions view "$version_id" --config "$config" --json
+            )"; then
+              echo "::error::The previous GitHub sync version metadata is unavailable. Manual roll-forward is required." >&2
+              return 1
+            fi
+            VERSION_JSON="$version" VERSION_ID="$version_id" node --input-type=module <<'NODE'
+          const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
+          const token = process.env.CLOUDFLARE_API_TOKEN;
+          const versionId = process.env.VERSION_ID;
+          const scheduleState = process.env.EDGEMNEME_GITHUB_SYNC_PREVIOUS_SCHEDULE_STATE;
+          const secretState = process.env.EDGEMNEME_GITHUB_SYNC_PREVIOUS_SECRET_STATE;
+          const credentialVersion = process.env.GITHUB_CREDENTIAL_VERSION;
+          const version = JSON.parse(process.env.VERSION_JSON ?? "");
+          if (
+            !accountId || !token || !versionId || version?.id !== versionId ||
+            !["enabled", "disabled"].includes(scheduleState ?? "") ||
+            !["present", "absent"].includes(secretState ?? "") ||
+            !credentialVersion ||
+            (scheduleState === "enabled" && secretState !== "present")
+          ) {
+            throw new Error("The previous GitHub sync Worker version response is invalid.");
+          }
+          const tag = version.annotations?.["workers/tag"];
+          if (typeof tag !== "string" || !tag.startsWith("edgemneme-github-workflows-")) {
+            process.stdout.write("incompatible");
+            process.exit(0);
+          }
+          const response = await fetch(
+            `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}` +
+              `/workers/scripts/edgemneme-github-sync/versions/${encodeURIComponent(versionId)}`,
+            { headers: { Authorization: `Bearer ${token}` }, redirect: "manual" }
+          );
+          if (!response.ok) {
+            throw new Error(
+              `Cloudflare GitHub sync version capability query failed with HTTP ${response.status}.`
+            );
+          }
+          const envelope = await response.json();
+          const result = envelope?.result;
+          const bindings = result?.resources?.bindings;
+          if (
+            envelope?.success !== true || result?.id !== versionId || !Array.isArray(bindings)
+          ) {
+            throw new Error("The Cloudflare GitHub sync version capability response is invalid.");
+          }
+          const expected = new Map([
+            ["GITHUB_DISPATCH_WORKFLOW", {
+              workflowName: "edgemneme-github-dispatch-workflow",
+              className: "GitHubDispatchWorkflow"
+            }],
+            ["GITHUB_REF_SYNC_WORKFLOW", {
+              workflowName: "edgemneme-github-ref-sync-workflow",
+              className: "GitHubRefSyncWorkflow"
+            }],
+            ["GITHUB_RETENTION_WORKFLOW", {
+              workflowName: "edgemneme-github-retention-workflow",
+              className: "GitHubRetentionWorkflow"
+            }]
+          ]);
+          const workflowBindings = bindings.filter((binding) => binding?.type === "workflow");
+          const hasQueue = bindings.some((binding) => binding?.type === "queue");
+          const runtimeBindings = bindings.filter(
+            (binding) => binding?.type === "plain_text" && binding?.name === "GITHUB_SYNC_ENABLED"
+          );
+          const credentialBindings = bindings.filter(
+            (binding) => binding?.type === "plain_text" &&
+              binding?.name === "GITHUB_CREDENTIAL_VERSION"
+          );
+          const secretBindings = bindings.filter(
+            (binding) => binding?.type === "secret_text" || binding?.type === "secret_key"
+          );
+          const expectedRuntime = scheduleState === "enabled" ? "true" : "false";
+          const expectedCredential = secretState === "present"
+            ? credentialVersion
+            : "unconfigured";
+          const expectedSecret = secretState === "present"
+            ? secretBindings.length === 1 &&
+              secretBindings[0]?.type === "secret_text" &&
+              secretBindings[0]?.name === "GITHUB_CLASSIC_TOKEN"
+            : secretBindings.length === 0;
+          const compatible =
+            !hasQueue &&
+            expectedSecret &&
+            runtimeBindings.length === 1 && runtimeBindings[0]?.text === expectedRuntime &&
+            credentialBindings.length === 1 &&
+            credentialBindings[0]?.text === expectedCredential &&
+            workflowBindings.length === expected.size &&
+            workflowBindings.every((binding) => {
+              const contract = expected.get(binding?.name);
+              return contract !== undefined &&
+                binding.workflow_name === contract.workflowName &&
+                binding.class_name === contract.className &&
+                (binding.script_name === undefined ||
+                  binding.script_name === "edgemneme-github-sync");
+            }) &&
+            new Set(workflowBindings.map((binding) => binding.name)).size === expected.size;
+          process.stdout.write(compatible ? "compatible" : "incompatible");
+          NODE
+          }
+          version_has_exact_disabled_github_contract() {
+            local version_id="$1"
+            local expected_secret_state="${2:-absent}"
+            VERSION_ID="$version_id" EXPECTED_SECRET_STATE="$expected_secret_state" \
+              node --input-type=module <<'NODE'
+          const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
+          const token = process.env.CLOUDFLARE_API_TOKEN;
+          const versionId = process.env.VERSION_ID;
+          const expectedSecretState = process.env.EXPECTED_SECRET_STATE;
+          if (
+            !accountId || !token || !versionId ||
+            !["present", "absent"].includes(expectedSecretState ?? "")
+          ) {
+            throw new Error("The disabled GitHub sync version inputs are invalid.");
+          }
+          const response = await fetch(
+            `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}` +
+              `/workers/scripts/edgemneme-github-sync/versions/${encodeURIComponent(versionId)}`,
+            { headers: { Authorization: `Bearer ${token}` }, redirect: "manual" }
+          );
+          if (!response.ok) {
+            throw new Error(
+              `Cloudflare disabled GitHub sync version query failed with HTTP ${response.status}.`
+            );
+          }
+          const envelope = await response.json();
+          const result = envelope?.result;
+          const bindings = result?.resources?.bindings;
+          if (
+            envelope?.success !== true || result?.id !== versionId || !Array.isArray(bindings)
+          ) {
+            throw new Error("The disabled GitHub sync version response is invalid.");
+          }
+          const expected = new Map([
+            ["GITHUB_DISPATCH_WORKFLOW", [
+              "edgemneme-github-dispatch-workflow", "GitHubDispatchWorkflow"
+            ]],
+            ["GITHUB_REF_SYNC_WORKFLOW", [
+              "edgemneme-github-ref-sync-workflow", "GitHubRefSyncWorkflow"
+            ]],
+            ["GITHUB_RETENTION_WORKFLOW", [
+              "edgemneme-github-retention-workflow", "GitHubRetentionWorkflow"
+            ]]
+          ]);
+          const workflows = bindings.filter((binding) => binding?.type === "workflow");
+          const runtime = bindings.filter(
+            (binding) => binding?.type === "plain_text" && binding?.name === "GITHUB_SYNC_ENABLED"
+          );
+          const credential = bindings.filter(
+            (binding) => binding?.type === "plain_text" &&
+              binding?.name === "GITHUB_CREDENTIAL_VERSION"
+          );
+          const secrets = bindings.filter(
+            (binding) => binding?.type === "secret_text" || binding?.type === "secret_key"
+          );
+          const secretContract = expectedSecretState === "present"
+            ? secrets.length === 1 && secrets[0]?.type === "secret_text" &&
+              secrets[0]?.name === "GITHUB_CLASSIC_TOKEN"
+            : secrets.length === 0;
+          const compatible =
+            !bindings.some((binding) => binding?.type === "queue") &&
+            secretContract &&
+            runtime.length === 1 && runtime[0]?.text === "false" &&
+            credential.length === 1 && credential[0]?.text === "unconfigured" &&
+            workflows.length === expected.size &&
+            workflows.every((binding) => {
+              const contract = expected.get(binding?.name);
+              return contract !== undefined &&
+                binding.workflow_name === contract[0] &&
+                binding.class_name === contract[1] &&
+                (binding.script_name === undefined ||
+                  binding.script_name === "edgemneme-github-sync");
+            }) &&
+            new Set(workflows.map((binding) => binding.name)).size === expected.size;
+          process.stdout.write(compatible ? "compatible" : "incompatible");
+          NODE
+          }
+          github_sync_queue_state() {
+            node --input-type=module <<'NODE'
+          const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
+          const token = process.env.CLOUDFLARE_API_TOKEN;
+          if (!accountId || !token) {
+            throw new Error("Cloudflare Queue lifecycle inputs are incomplete.");
+          }
+          const base = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}`;
+          const headers = { Authorization: `Bearer ${token}` };
+          const request = async (url) => {
+            const response = await fetch(url, { headers, redirect: "manual" });
+            if (!response.ok) {
+              throw new Error(`Cloudflare Queue query failed with HTTP ${response.status}.`);
+            }
+            const envelope = await response.json();
+            if (envelope?.success !== true) {
+              throw new Error("The Cloudflare Queue response is invalid.");
+            }
+            return envelope;
+          };
+          const queueIds = new Set();
+          let totalCount;
+          let totalPages;
+          for (let page = 1; page <= 10_000; page += 1) {
+            const url = new URL(`${base}/queues`);
+            url.searchParams.set("page", String(page));
+            url.searchParams.set("per_page", "100");
+            const envelope = await request(url);
+            const info = envelope?.result_info;
+            if (
+              !Array.isArray(envelope.result) ||
+              !Number.isSafeInteger(info?.count) || info.count !== envelope.result.length ||
+              !Number.isSafeInteger(info?.page) || info.page !== page ||
+              !Number.isSafeInteger(info?.per_page) || info.per_page < 1 ||
+              info.count > info.per_page ||
+              !Number.isSafeInteger(info?.total_count) || info.total_count < 0 ||
+              !Number.isSafeInteger(info?.total_pages) || info.total_pages < 0 ||
+              (info.total_count > 0 &&
+                info.total_pages !== Math.ceil(info.total_count / info.per_page)) ||
+              (info.total_count === 0 && ![0, 1].includes(info.total_pages))
+            ) {
+              throw new Error("The Cloudflare Queue inventory pagination is invalid.");
+            }
+            totalCount ??= info.total_count;
+            totalPages ??= info.total_pages;
+            if (info.total_count !== totalCount || info.total_pages !== totalPages) {
+              throw new Error("The Cloudflare Queue inventory changed during pagination.");
+            }
+            for (const queue of envelope.result) {
+              if (
+                typeof queue?.queue_id !== "string" || queue.queue_id.length === 0 ||
+                typeof queue?.queue_name !== "string" || queue.queue_name.length === 0 ||
+                queueIds.has(queue.queue_id) ||
+                !Number.isSafeInteger(queue?.consumers_total_count) ||
+                queue.consumers_total_count < 0 ||
+                !Number.isSafeInteger(queue?.producers_total_count) ||
+                queue.producers_total_count < 0 ||
+                (queue.consumers !== undefined && !Array.isArray(queue.consumers)) ||
+                (queue.producers !== undefined && !Array.isArray(queue.producers))
+              ) {
+                throw new Error("The Cloudflare Queue inventory contains an invalid entry.");
+              }
+              queueIds.add(queue.queue_id);
+              let consumers = queue.consumers ?? [];
+              if (consumers.length > queue.consumers_total_count) {
+                throw new Error("A Cloudflare Queue consumer count is invalid.");
+              }
+              if (consumers.length !== queue.consumers_total_count) {
+                const consumerEnvelope = await request(
+                  `${base}/queues/${encodeURIComponent(queue.queue_id)}/consumers`
+                );
+                if (
+                  !Array.isArray(consumerEnvelope.result) ||
+                  consumerEnvelope.result.length !== queue.consumers_total_count
+                ) {
+                  throw new Error("A Cloudflare Queue consumer inventory is incomplete.");
+                }
+                consumers = consumerEnvelope.result;
+              }
+              const producers = queue.producers ?? [];
+              if (producers.length !== queue.producers_total_count) {
+                throw new Error("A Cloudflare Queue producer inventory is incomplete.");
+              }
+              const consumerIds = new Set();
+              for (const consumer of consumers) {
+                if (
+                  typeof consumer?.consumer_id !== "string" ||
+                  consumer.consumer_id.length === 0 ||
+                  consumerIds.has(consumer.consumer_id) ||
+                  !["worker", "http_pull"].includes(consumer?.type) ||
+                  (consumer.type === "worker" &&
+                    (typeof consumer.script_name !== "string" ||
+                      consumer.script_name.length === 0))
+                ) {
+                  throw new Error("A Cloudflare Queue consumer entry is invalid.");
+                }
+                consumerIds.add(consumer.consumer_id);
+                if (consumer?.script_name === "edgemneme-github-sync") {
+                  throw new Error("The GitHub sync Worker still has a Queue consumer.");
+                }
+              }
+              for (const producer of producers) {
+                if (
+                  (producer?.type !== "worker" && producer?.type !== "r2_bucket") ||
+                  (producer.type === "worker" &&
+                    (typeof producer.script !== "string" || producer.script.length === 0)) ||
+                  (producer.type === "r2_bucket" &&
+                    (typeof producer.bucket_name !== "string" || producer.bucket_name.length === 0))
+                ) {
+                  throw new Error("A Cloudflare Queue producer entry is invalid.");
+                }
+                if (producer?.script === "edgemneme-github-sync") {
+                  throw new Error("The GitHub sync Worker still has a Queue producer.");
+                }
+              }
+            }
+            if (page >= Math.max(1, totalPages)) break;
+            if (page === 10_000) {
+              throw new Error("Cloudflare Queue inventory pagination exceeded its safety bound.");
+            }
+          }
+          if (queueIds.size !== totalCount) {
+            throw new Error("The Cloudflare Queue inventory count is inconsistent.");
+          }
+          process.stdout.write("clear");
+          NODE
+          }
+          assert_exact_disabled_github_version() {
+            local config="$1"
+            local expected_version="$2"
+            local expected_tag="$3"
+            local expected_secret_state="$4"
+            local active
+            local capability
+            local queue_state
+            local secret_state
+            local tagged
+            active="$(active_version "$config")" || return 1
+            if [[ "$active" != "$expected_version" ]]; then
+              echo "::error::The active GitHub sync Worker changed during rollback quiescence verification." >&2
+              return 1
+            fi
+            tagged="$(
+              tagged_current_version "$config" "$active" "$expected_tag"
+            )" || return 1
+            if [[ -z "$tagged" || "$tagged" != "$active" ]]; then
+              echo "::error::The active GitHub sync Worker is not exactly the expected tagged rollback version." >&2
+              return 1
+            fi
+            capability="$(
+              version_has_exact_disabled_github_contract \
+                "$active" "$expected_secret_state"
+            )" || return 1
+            if [[ "$capability" != "compatible" ]]; then
+              echo "::error::The rollback GitHub sync Worker is not the exact disabled three-Workflow contract." >&2
+              return 1
+            fi
+            queue_state="$(github_sync_queue_state)" || return 1
+            if [[ "$queue_state" != "clear" ]]; then
+              echo "::error::The rollback GitHub sync Worker still has a Queue association." >&2
+              return 1
+            fi
+            secret_state="$(github_sync_secret_state "$config")" || return 1
+            if [[ "$secret_state" != "$expected_secret_state" ]]; then
+              echo "::error::The rollback GitHub sync credential state changed unexpectedly." >&2
+              return 1
+            fi
+          }
+          rebuild_work_state() {
+            local config="$1"
+            local output
+            if ! output="$(
+              pnpm exec wrangler d1 execute MEMORY_DB --remote --json \
+                --config "$config" \
+                --command "SELECT
+                  (SELECT COUNT(*)
+                   FROM outbox_events rebuild_event
+                   WHERE rebuild_event.event_type = 'projection.rebuild.requested'
+                     AND rebuild_event.failed_at IS NULL
+                     AND (
+                       rebuild_event.dispatched_at IS NULL
+                       OR COALESCE((
+                         SELECT CASE
+                           WHEN rebuild_run.status IN ('complete', 'failed', 'terminated')
+                           THEN 0 ELSE 1
+                         END
+                         FROM workflow_runs rebuild_run
+                         WHERE rebuild_run.project_id = rebuild_event.project_id
+                           AND rebuild_run.root_workflow_id = rebuild_event.event_id
+                           AND rebuild_run.workflow_type = 'projection.rebuild.requested'
+                         ORDER BY rebuild_run.updated_at DESC, rebuild_run.workflow_id DESC
+                         LIMIT 1
+                       ), 1) = 1
+                     )) +
+                  (SELECT COUNT(*)
+                   FROM workflow_runs rebuild_run
+                   WHERE rebuild_run.workflow_type = 'projection.rebuild.requested'
+                     AND rebuild_run.status NOT IN ('complete', 'failed', 'terminated')) AS count;"
+            )"; then
+              echo "Unable to query the projection rebuild rollback guard." >&2
+              return 1
+            fi
+            D1_RESULT_JSON="$output" node --input-type=module <<'NODE'
+          const statements = JSON.parse(process.env.D1_RESULT_JSON ?? "");
+          const count = statements?.[0]?.results?.[0]?.count;
+          if (statements?.length !== 1 || statements[0]?.success !== true ||
+              !Number.isSafeInteger(count) || count < 0) {
+            throw new Error("The projection rebuild rollback guard response is invalid.");
+          }
+          process.stdout.write(count === 0 ? "clear" : "pending");
+          NODE
+          }
+          github_sync_schedule_state() {
+            node --input-type=module <<'NODE'
+          const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
+          const token = process.env.CLOUDFLARE_API_TOKEN;
+          if (!accountId || !token) {
+            throw new Error("Cloudflare schedule lifecycle inputs are incomplete.");
+          }
+          const response = await fetch(
+            `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}` +
+              "/workers/scripts/edgemneme-github-sync/schedules",
+            { headers: { Authorization: `Bearer ${token}` }, redirect: "manual" }
+          );
+          if (!response.ok) {
+            throw new Error(`Cloudflare schedule query failed with HTTP ${response.status}.`);
+          }
+          const envelope = await response.json();
+          const schedules = envelope?.result?.schedules;
+          if (envelope?.success !== true || !Array.isArray(schedules)) {
+            throw new Error("The Cloudflare schedule response is invalid.");
+          }
+          if (schedules.length === 0) {
+            process.stdout.write("clear");
+          } else if (schedules.length === 1 && schedules[0]?.cron === "0 */6 * * *") {
+            process.stdout.write("pending");
+          } else {
+            throw new Error("The GitHub sync Worker has an unrecognized Cron Trigger state.");
+          }
+          NODE
+          }
+          cloudflare_github_workflow_state() {
+            ALLOW_MISSING_WORKFLOWS="false" node --input-type=module <<'NODE'
+          const workflowContracts = [
+            ["edgemneme-github-dispatch-workflow", "GitHubDispatchWorkflow"],
+            ["edgemneme-github-ref-sync-workflow", "GitHubRefSyncWorkflow"],
+            ["edgemneme-github-retention-workflow", "GitHubRetentionWorkflow"]
+          ];
+          const nonterminalStatuses = [
+            "queued", "running", "paused", "waitingForPause", "waiting", "rollingBack"
+          ];
+          const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
+          const token = process.env.CLOUDFLARE_API_TOKEN;
+          if (!accountId || !token || process.env.ALLOW_MISSING_WORKFLOWS !== "false") {
+            throw new Error("Cloudflare Workflow lifecycle inputs are invalid.");
+          }
+          const base = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}`;
+          const headers = { Authorization: `Bearer ${token}` };
+          const request = async (url) => {
+            const response = await fetch(url, { headers, redirect: "manual" });
+            if (!response.ok) {
+              throw new Error(`Cloudflare Workflow query failed with HTTP ${response.status}.`);
+            }
+            const envelope = await response.json();
+            if (envelope?.success !== true) {
+              throw new Error("The Cloudflare Workflow response is invalid.");
+            }
+            return envelope;
+          };
+          const expectedInventory = new Map(workflowContracts);
+          const workflowInventoryNames = new Set();
+          const accountWorkflowIds = new Set();
+          const accountWorkflowNames = new Set();
+          let inventoryTotalCount;
+          let inventoryTotalPages;
+          for (let page = 1; page <= 10_000; page += 1) {
+            const url = new URL(`${base}/workflows`);
+            url.searchParams.set("page", String(page));
+            url.searchParams.set("per_page", "100");
+            const envelope = await request(url);
+            const info = envelope?.result_info;
+            if (
+              !Array.isArray(envelope.result) ||
+              !Number.isSafeInteger(info?.count) || info.count !== envelope.result.length ||
+              !Number.isSafeInteger(info?.page) || info.page !== page ||
+              !Number.isSafeInteger(info?.per_page) || info.per_page !== 100 ||
+              !Number.isSafeInteger(info?.total_count) || info.total_count < 0 ||
+              !Number.isSafeInteger(info?.total_pages) || info.total_pages < 0 ||
+              (info.total_count > 0 &&
+                info.total_pages !== Math.ceil(info.total_count / info.per_page)) ||
+              (info.total_count === 0 && ![0, 1].includes(info.total_pages))
+            ) {
+              throw new Error("The Cloudflare Workflow inventory pagination is invalid.");
+            }
+            inventoryTotalCount ??= info.total_count;
+            inventoryTotalPages ??= info.total_pages;
+            if (
+              info.total_count !== inventoryTotalCount ||
+              info.total_pages !== inventoryTotalPages
+            ) {
+              throw new Error("The Cloudflare Workflow inventory changed during pagination.");
+            }
+            for (const workflow of envelope.result) {
+              if (
+                typeof workflow?.id !== "string" || workflow.id.length === 0 ||
+                typeof workflow?.name !== "string" || workflow.name.length === 0 ||
+                typeof workflow?.script_name !== "string" || workflow.script_name.length === 0 ||
+                accountWorkflowIds.has(workflow.id) || accountWorkflowNames.has(workflow.name)
+              ) {
+                throw new Error("The Cloudflare Workflow inventory contains an invalid entry.");
+              }
+              accountWorkflowIds.add(workflow.id);
+              accountWorkflowNames.add(workflow.name);
+              if (workflow.script_name !== "edgemneme-github-sync") continue;
+              const expectedClass = expectedInventory.get(workflow.name);
+              if (
+                expectedClass === undefined || workflow.class_name !== expectedClass ||
+                (workflow.schedules !== undefined &&
+                  (!Array.isArray(workflow.schedules) || workflow.schedules.length !== 0))
+              ) {
+                throw new Error("The GitHub sync Workflow inventory is not the exact approved set.");
+              }
+              workflowInventoryNames.add(workflow.name);
+            }
+            if (page >= Math.max(1, inventoryTotalPages)) break;
+            if (page === 10_000) {
+              throw new Error("Cloudflare Workflow inventory pagination exceeded its safety bound.");
+            }
+          }
+          if (
+            accountWorkflowIds.size !== inventoryTotalCount ||
+            workflowInventoryNames.size !== expectedInventory.size ||
+            [...expectedInventory.keys()].some((name) => !workflowInventoryNames.has(name))
+          ) {
+            throw new Error("The GitHub sync Workflow inventory is not the exact approved set.");
+          }
+          let pendingInstances = 0;
+          const observedInstanceKeys = new Set();
+          const statusInstanceKeys = new Set();
+          for (const [name, className] of workflowContracts) {
+            const definitionEnvelope = await request(
+              `${base}/workflows/${encodeURIComponent(name)}`
+            );
+            const workflow = definitionEnvelope.result;
+            if (
+              workflow?.name !== name || workflow?.class_name !== className ||
+              workflow?.script_name !== "edgemneme-github-sync" ||
+              (workflow?.schedules !== undefined &&
+                (!Array.isArray(workflow.schedules) || workflow.schedules.length !== 0))
+            ) {
+              throw new Error("A GitHub sync Workflow definition does not match the approved contract.");
+            }
+            for (const status of nonterminalStatuses) {
+              let cursor;
+              const cursors = new Set();
+              for (let page = 0; page < 10_000; page += 1) {
+                const url = new URL(`${base}/workflows/${encodeURIComponent(name)}/instances`);
+                url.searchParams.set("status", status);
+                url.searchParams.set("direction", "asc");
+                url.searchParams.set("per_page", "100");
+                if (cursor !== undefined) url.searchParams.set("cursor", cursor);
+                const envelope = await request(url);
+                if (!Array.isArray(envelope.result)) {
+                  throw new Error("The Cloudflare Workflow instance page is invalid.");
+                }
+                for (const instance of envelope.result) {
+                  const observedInstanceKey = JSON.stringify([name, instance?.id]);
+                  const statusInstanceKey = JSON.stringify([name, status, instance?.id]);
+                  if (
+                    typeof instance?.id !== "string" || instance.id.length === 0 ||
+                    instance.status !== status || statusInstanceKeys.has(statusInstanceKey)
+                  ) {
+                    throw new Error("A Cloudflare Workflow instance is invalid or duplicated.");
+                  }
+                  statusInstanceKeys.add(statusInstanceKey);
+                  if (!observedInstanceKeys.has(observedInstanceKey)) {
+                    observedInstanceKeys.add(observedInstanceKey);
+                    pendingInstances += 1;
+                  }
+                }
+                const nextCursor = envelope?.result_info?.cursor;
+                if (nextCursor === undefined || nextCursor === null || nextCursor === "") break;
+                if (typeof nextCursor !== "string" || cursors.has(nextCursor)) {
+                  throw new Error("A Cloudflare Workflow instance cursor is invalid or repeated.");
+                }
+                cursors.add(nextCursor);
+                cursor = nextCursor;
+                if (page === 9_999) {
+                  throw new Error("Cloudflare Workflow instance pagination exceeded its safety bound.");
+                }
+              }
+            }
+          }
+          process.stdout.write(pendingInstances === 0 ? "clear" : "pending");
+          NODE
+          }
+          github_sync_d1_state() {
+            local config="$1"
+            local schema
+            local table_names
+            local count_expression="0"
+            local output
+            schema="$(
+              pnpm exec wrangler d1 execute MEMORY_DB --remote --json \
+                --config "$config" \
+                --command "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('github_sync_dispatches', 'github_sync_dispatch_items', 'github_repository_sync_runs', 'github_credential_sync_lane') ORDER BY name;"
+            )" || return 1
+            table_names="$(D1_RESULT_JSON="$schema" node --input-type=module <<'NODE'
+          const statements = JSON.parse(process.env.D1_RESULT_JSON ?? "");
+          const rows = statements?.[0]?.results;
+          const allowed = new Set([
+            "github_sync_dispatches", "github_sync_dispatch_items",
+            "github_repository_sync_runs", "github_credential_sync_lane"
+          ]);
+          if (statements?.length !== 1 || statements[0]?.success !== true || !Array.isArray(rows)) {
+            throw new Error("The GitHub sync D1 schema probe response is invalid.");
+          }
+          const names = rows.map((row) => row?.name);
+          if (names.some((name) => typeof name !== "string" || !allowed.has(name)) ||
+              new Set(names).size !== names.length) {
+            throw new Error("The GitHub sync D1 schema probe contains an unexpected table.");
+          }
+          process.stdout.write(`|${names.join("|")}|`);
+          NODE
+            )" || return 1
+            if [[ "$table_names" == *"|github_sync_dispatches|"* ]]; then
+              count_expression+=" + (SELECT COUNT(*) FROM github_sync_dispatches WHERE status IN ('materialized', 'dispatching'))"
+            fi
+            if [[ "$table_names" == *"|github_sync_dispatch_items|"* ]]; then
+              count_expression+=" + (SELECT COUNT(*) FROM github_sync_dispatch_items WHERE status IN ('pending', 'running'))"
+            fi
+            if [[ "$table_names" == *"|github_repository_sync_runs|"* ]]; then
+              count_expression+=" + (SELECT COUNT(*) FROM github_repository_sync_runs WHERE status = 'running')"
+            fi
+            if [[ "$table_names" == *"|github_credential_sync_lane|"* ]]; then
+              count_expression+=" + (SELECT COUNT(*) FROM github_credential_sync_lane WHERE holder_id IS NOT NULL OR lease_claim_id IS NOT NULL OR lease_until IS NOT NULL)"
+            fi
+            output="$(
+              pnpm exec wrangler d1 execute MEMORY_DB --remote --json \
+                --config "$config" --command "SELECT $count_expression AS count;"
+            )" || return 1
+            D1_RESULT_JSON="$output" node --input-type=module <<'NODE'
+          const statements = JSON.parse(process.env.D1_RESULT_JSON ?? "");
+          const count = statements?.[0]?.results?.[0]?.count;
+          if (statements?.length !== 1 || statements[0]?.success !== true ||
+              !Number.isSafeInteger(count) || count < 0) {
+            throw new Error("The GitHub sync D1 drain response is invalid.");
+          }
+          process.stdout.write(count === 0 ? "clear" : "pending");
+          NODE
+          }
+          wait_for_github_sync_drain() {
+            local config="$1"
+            local expected_version="$2"
+            local expected_tag="$3"
+            local zero_observations=0
+            local reconciliation_state
+            local schedule_state
+            local verified_schedule_state
+            local verified_workflow_state
+            local workflow_state
+            local d1_state
+            for ((attempt = 1; attempt <= 25; attempt++)); do
+              assert_exact_disabled_github_version \
+                "$config" "$expected_version" "$expected_tag" "present" || return 1
+              workflow_state="$(cloudflare_github_workflow_state)" || return 1
+              schedule_state="$(github_sync_schedule_state)" || return 1
+              if [[ "$schedule_state" != "clear" || "$workflow_state" != "clear" ]]; then
+                zero_observations=0
+                if (( attempt < 25 )); then
+                  sleep 60
+                fi
+                continue
+              fi
+              reconciliation_state="$(
+                node scripts/github-sync-quiescence.mjs reconcile \
+                  --config "$config" \
+                  --disabled-version "$expected_version" \
+                  --schedule-state clear \
+                  --workflow-state clear
+              )" || return 1
+              case "$reconciliation_state" in
+                clear|pending) ;;
+                *)
+                  echo "GitHub sync D1 reconciliation returned an invalid state." >&2
+                  return 1
+                  ;;
+              esac
+              verified_schedule_state="$(github_sync_schedule_state)" || return 1
+              verified_workflow_state="$(cloudflare_github_workflow_state)" || return 1
+              assert_exact_disabled_github_version \
+                "$config" "$expected_version" "$expected_tag" "present" || return 1
+              if [[ "$verified_schedule_state" != "clear" || \
+                    "$verified_workflow_state" != "clear" ]]; then
+                echo "GitHub sync control-plane state changed during D1 reconciliation." >&2
+                return 1
+              fi
+              if [[ "$reconciliation_state" == "pending" ]]; then
+                zero_observations=0
+                if (( attempt < 25 )); then
+                  sleep 60
+                fi
+                continue
+              fi
+              d1_state="$(github_sync_d1_state "$config")" || return 1
+              if [[ "$schedule_state" == "clear" && \
+                    "$verified_schedule_state" == "clear" && \
+                    "$workflow_state" == "clear" && \
+                    "$verified_workflow_state" == "clear" && \
+                    "$reconciliation_state" == "clear" && \
+                    "$d1_state" == "clear" ]]; then
+                zero_observations=$((zero_observations + 1))
+                if (( zero_observations == 2 )); then
+                  return 0
+                fi
+              else
+                zero_observations=0
+              fi
+              if (( attempt < 25 )); then
+                sleep 60
+              fi
+            done
+            echo "GitHub sync did not reach two consecutive quiescent observations; the credential is retained." >&2
+            return 1
+          }
+          github_sync_secret_state() {
+            local config="$1"
+            local secrets
+            secrets="$(pnpm exec wrangler secret list --config "$config" --format json)" || return 1
+            SECRETS_JSON="$secrets" node --input-type=module <<'NODE'
+          const secrets = JSON.parse(process.env.SECRETS_JSON ?? "");
+          if (!Array.isArray(secrets)) {
+            throw new Error("The GitHub sync secret binding response is invalid.");
+          }
+          if (secrets.length === 0) {
+            process.stdout.write("absent");
+          } else if (
+            secrets.length === 1 &&
+            secrets[0]?.name === "GITHUB_CLASSIC_TOKEN" &&
+            secrets[0]?.type === "secret_text"
+          ) {
+            process.stdout.write("present");
+          } else {
+            throw new Error("The GitHub sync Worker has an unexpected secret binding.");
+          }
+          NODE
+          }
+          remove_github_sync_secret_with_tag() {
+            local config="$1"
+            local tag="$2"
+            VERSION_TAG="$tag" node --input-type=module <<'NODE'
+          const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
+          const token = process.env.CLOUDFLARE_API_TOKEN;
+          const tag = process.env.VERSION_TAG;
+          if (!accountId || !token || !tag) {
+            throw new Error("Cloudflare tagged rollback secret deletion inputs are incomplete.");
+          }
+          const body = {
+            secrets: { GITHUB_CLASSIC_TOKEN: null },
+            version_tags: { "workers/tag": tag }
+          };
+          const response = await fetch(
+            `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}` +
+              "/workers/scripts/edgemneme-github-sync/secrets-bulk",
+            {
+              method: "PATCH",
+              headers: {
+                Authorization: `Bearer ${token}`,
+                "Content-Type": "application/json"
+              },
+              body: JSON.stringify(body),
+              redirect: "manual"
+            }
+          );
+          if (!response.ok) {
+            throw new Error(
+              `Cloudflare tagged rollback secret deletion failed with HTTP ${response.status}.`
+            );
+          }
+          const envelope = await response.json();
+          const result = envelope?.result;
+          if (
+            envelope?.success !== true ||
+            typeof result !== "object" || result === null || Array.isArray(result) ||
+            Object.keys(result).length !== 0
+          ) {
+            throw new Error("The tagged rollback secret deletion response is invalid.");
+          }
+          NODE
+          }
+          capture_gateway_run_trigger() {
+            local config="$1"
+            local tag="$2"
+            local expected_version="$3"
+            local capture_json
+            local parsed
+            local captured_version
+            capture_json="$(
+              EXPECTED_GATEWAY_DEPLOYMENT_TAG="$tag" \
+                node scripts/gateway-deployment-target.mjs \
+                  capture-rollback-current "$config"
+            )" || return 1
+            parsed="$(CAPTURE_JSON="$capture_json" node --input-type=module <<'NODE'
+          const capture = JSON.parse(process.env.CAPTURE_JSON ?? "");
+          const keys = Object.keys(capture).sort();
+          if (
+            keys.join(",") !== [
+              "gateway_active_version",
+              "gateway_trigger_fingerprint",
+              "gateway_trigger_state"
+            ].sort().join(",") ||
+            typeof capture.gateway_trigger_state !== "string" ||
+            !/^[A-Za-z0-9_-]+$/u.test(capture.gateway_trigger_state) ||
+            typeof capture.gateway_trigger_fingerprint !== "string" ||
+            !/^[0-9a-f]{64}$/u.test(capture.gateway_trigger_fingerprint) ||
+            typeof capture.gateway_active_version !== "string" ||
+            !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu.test(
+              capture.gateway_active_version
+            )
+          ) {
+            throw new Error("The rollback gateway trigger capture is invalid.");
+          }
+          process.stdout.write(
+            `${capture.gateway_trigger_state}\t${capture.gateway_trigger_fingerprint}` +
+              `\t${capture.gateway_active_version}`
+          );
+          NODE
+            )" || return 1
+            IFS=$'\t' read -r \
+              gateway_restore_current_state \
+              gateway_restore_current_fingerprint \
+              captured_version <<< "$parsed"
+            if [[ -z "$gateway_restore_current_state" || -z "$gateway_restore_current_fingerprint" || -z "$captured_version" ]]; then
+              echo "::error::The rollback gateway trigger capture is incomplete." >&2
+              return 1
+            fi
+            if [[ "$captured_version" != "$expected_version" ]]; then
+              echo "::error::The rollback gateway trigger capture belongs to a different tagged version." >&2
+              return 1
+            fi
+          }
+          rollback_if_advanced() {
+            local label="$1"
+            local config="$2"
+            local previous_version="$3"
+            local tag="$4"
+            local worker_name="$5"
+            local expected_absent="$6"
+            local deployed_version
+            local current_version
+            local confirmed_version
+            local ledger_capability
+            local presence
+            local rebuild_state
+            if [[ ! -f "$config" ]]; then
+              echo "::error::The required rollback config is missing for $label." >&2
+              return 1
+            fi
+            presence="$(worker_presence "$worker_name")" || return 1
+            if [[ "$presence" == "absent" ]]; then
+              if [[ -n "$previous_version" || "$expected_absent" != "true" ]]; then
+                echo "::error::The $label Worker is absent outside its captured expected-absent state; refusing to report rollback success." >&2
+                return 1
+              fi
+              return 0
+            fi
+            current_version="$(active_version "$config")" || return 1
+            if [[ -n "$previous_version" && "$current_version" == "$previous_version" ]]; then
+              return 0
+            fi
+            deployed_version="$(
+              tagged_current_version "$config" "$current_version" "$tag"
+            )" || return 1
+            if [[ -z "$previous_version" ]]; then
+              if [[ "$expected_absent" != "true" ]]; then
+                echo "::error::The active $label Worker has no captured previous version outside an expected-absent state; refusing mutation." >&2
+                return 1
+              fi
+              if [[ -z "$deployed_version" || "$current_version" != "$deployed_version" ]]; then
+                echo "::error::The expected-absent $label Worker is not exactly this run's tagged version; refusing mutation." >&2
+                return 1
+              fi
+              confirmed_version="$(active_version "$config")" || return 1
+              if [[ "$confirmed_version" != "$deployed_version" ]]; then
+                echo "::error::The expected-absent $label Worker changed during verification; refusing mutation." >&2
+                return 1
+              fi
+              if [[ "$label" == "gateway" ]]; then
+                capture_gateway_run_trigger \
+                  "$config" "$tag" "$deployed_version" || return 1
+                gateway_advanced_by_run=true
+                EDGEMNEME_GATEWAY_ADVANCED_BY_RUN=true \
+                  EDGEMNEME_GATEWAY_ALLOW_DETACHED_ABSENT=true \
+                  EXPECTED_GATEWAY_CURRENT_TRIGGER_STATE="$gateway_restore_current_state" \
+                  EXPECTED_GATEWAY_CURRENT_TRIGGER_FINGERPRINT="$gateway_restore_current_fingerprint" \
+                  node scripts/gateway-deployment-target.mjs restore || return 1
+                confirmed_version="$(
+                  EXPECTED_GATEWAY_DEPLOYMENT_TAG="$tag" \
+                    node scripts/gateway-deployment-target.mjs \
+                      verify-active-tag "$config"
+                )" || return 1
+                if [[ "$confirmed_version" != "$deployed_version" ]]; then
+                  echo "::error::The bootstrap gateway changed after trigger detachment; refusing deletion." >&2
+                  return 1
+                fi
+                pnpm exec wrangler delete --config "$config" --force || return 1
+                if [[ "$(worker_presence "$worker_name")" != "absent" ]]; then
+                  echo "::error::The failed expected-absent $label Worker still exists after deletion." >&2
+                  return 1
+                fi
+                gateway_restore_completed=true
+                return 0
+              fi
+              echo "::warning::Retaining the bootstrap orchestrator and its Durable Object state; no prior version exists. Manual roll-forward is required." >&2
+              return 0
+            fi
+            if [[ -z "$deployed_version" ]]; then
+              echo "::error::The active $label version changed, but this run's deployment tag is unavailable; refusing rollback." >&2
+              return 1
+            fi
+            if [[ "$current_version" != "$deployed_version" ]]; then
+              echo "::error::The $label deployment changed after this run; refusing rollback." >&2
+              return 1
+            fi
+            confirmed_version="$(active_version "$config")" || return 1
+            if [[ "$confirmed_version" != "$deployed_version" ]]; then
+              echo "::error::The $label deployment changed during rollback verification; refusing rollback." >&2
+              return 1
+            fi
+            if [[ "$label" == "orchestrator" ]]; then
+              rebuild_state="$(rebuild_work_state "$config")" || return 1
+              if [[ "$rebuild_state" == "pending" ]]; then
+                echo "::error::Projection rebuild work is still pending; retaining the current orchestrator instead of exposing the work to an older dispatcher." >&2
+                return 1
+              fi
+              ledger_capability="$(
+                version_has_ledger_capability "$config" "$previous_version"
+              )" || return 1
+              if [[ "$ledger_capability" != "compatible" ]]; then
+                echo "::error::The previous orchestrator is not proven compatible with the Search chunk ledger; retaining the current orchestrator for manual roll-forward." >&2
+                return 1
+              fi
+            fi
+            confirmed_version="$(active_version "$config")" || return 1
+            if [[ "$confirmed_version" != "$deployed_version" ]]; then
+              echo "::error::The $label deployment changed after rollback guards; refusing rollback." >&2
+              return 1
+            fi
+            if [[ "$label" == "gateway" ]]; then
+              capture_gateway_run_trigger \
+                "$config" "$tag" "$deployed_version" || return 1
+              gateway_advanced_by_run=true
+            fi
+            pnpm exec wrangler rollback "$previous_version" \
+              --config "$config" \
+              --message "Automated rollback after failed deployment gate for GitHub run ${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}." \
+              --yes || return 1
+            confirmed_version="$(active_version "$config")" || return 1
+            if [[ "$confirmed_version" != "$previous_version" ]]; then
+              echo "::error::The $label Worker did not reach its captured version after rollback." >&2
+              return 1
+            fi
+          }
+          rollback_github_sync() {
+            local config="wrangler/.wrangler/github-sync.generated.jsonc"
+            local previous_version="${EDGEMNEME_GITHUB_SYNC_PREVIOUS_VERSION:-}"
+            local previous_state="${EDGEMNEME_GITHUB_SYNC_PREVIOUS_STATE:-}"
+            local previous_schedule_state="${EDGEMNEME_GITHUB_SYNC_PREVIOUS_SCHEDULE_STATE:-}"
+            local previous_secret_state="${EDGEMNEME_GITHUB_SYNC_PREVIOUS_SECRET_STATE:-}"
+            local expected_tag="edgemneme-github-workflows-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-enabled"
+            local quiesce_tag="edgemneme-github-workflows-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-github-sync-rollback-quiesced"
+            local secretless_tag="edgemneme-github-workflows-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-github-sync-rollback-secretless"
+            local presence
+            local current_version
+            local deployed_version
+            local confirmed_version
+            local quiesced_version
+            local capability
+            local restored_secret_state
+            local workflow_state
+            local secretless_version
+            if [[ ! -f "$config" ]]; then
+              echo "::error::The GitHub sync rollback config is unavailable." >&2
+              return 1
+            fi
+            if [[ "$previous_state" != "present" && "$previous_state" != "absent" ]]; then
+              echo "::error::The captured GitHub sync Worker state is invalid." >&2
+              return 1
+            fi
+            if [[ "$previous_state" == "present" ]]; then
+              if [[ -z "$previous_version" ]] || \
+                 [[ "$previous_schedule_state" != "enabled" && "$previous_schedule_state" != "disabled" ]] || \
+                 [[ "$previous_secret_state" != "present" && "$previous_secret_state" != "absent" ]]; then
+                echo "::error::The captured GitHub sync lifecycle state is incomplete." >&2
+                return 1
+              fi
+              if [[ "$previous_schedule_state" == "enabled" && "$previous_secret_state" != "present" ]]; then
+                echo "::error::The captured enabled GitHub sync state had no credential binding." >&2
+                return 1
+              fi
+            elif [[ -n "$previous_version" || "$previous_schedule_state" != "absent" || "$previous_secret_state" != "absent" ]]; then
+              echo "::error::The captured expected-absent GitHub sync state is inconsistent." >&2
+              return 1
+            fi
+
+            presence="$(worker_presence edgemneme-github-sync)" || return 1
+            if [[ "$presence" == "absent" ]]; then
+              if [[ "$previous_state" != "absent" ]]; then
+                echo "::error::The GitHub sync Worker is absent outside its captured expected-absent state." >&2
+                return 1
+              fi
+              return 0
+            fi
+            current_version="$(active_version "$config")" || return 1
+            if [[ "$previous_state" == "present" && "$current_version" == "$previous_version" ]]; then
+              return 0
+            fi
+            deployed_version="$(
+              tagged_current_version "$config" "$current_version" "$expected_tag"
+            )" || return 1
+            if [[ -z "$deployed_version" || "$deployed_version" != "$current_version" ]]; then
+              echo "::error::The active GitHub sync Worker is not exactly this run's Workflow-capable version; refusing mutation." >&2
+              return 1
+            fi
+            confirmed_version="$(active_version "$config")" || return 1
+            if [[ "$confirmed_version" != "$deployed_version" ]]; then
+              echo "::error::The GitHub sync Worker changed during rollback verification." >&2
+              return 1
+            fi
+            if [[ "$(github_sync_secret_state "$config")" != "present" ]]; then
+              echo "::error::This run's enabled GitHub sync Worker no longer has its exact credential binding." >&2
+              return 1
+            fi
+            capability="$(
+              EDGEMNEME_GITHUB_SYNC_PREVIOUS_SCHEDULE_STATE=enabled \
+                EDGEMNEME_GITHUB_SYNC_PREVIOUS_SECRET_STATE=present \
+                version_has_github_workflow_capability "$config" "$deployed_version"
+            )" || return 1
+            if [[ "$capability" != "compatible" ]]; then
+              echo "::error::This run's GitHub sync Worker no longer has the exact enabled binding contract." >&2
+              return 1
+            fi
+            if [[ "$(github_sync_queue_state)" != "clear" ]]; then
+              echo "::error::This run's GitHub sync Worker still has a Queue association." >&2
+              return 1
+            fi
+
+            pnpm exec wrangler deploy --strict --tag "$quiesce_tag" --config "$config"
+            quiesced_version="$(active_version "$config")" || return 1
+            assert_exact_disabled_github_version \
+              "$config" "$quiesced_version" "$quiesce_tag" "present" || return 1
+            wait_for_github_sync_drain \
+              "$config" "$quiesced_version" "$quiesce_tag" || return 1
+            assert_exact_disabled_github_version \
+              "$config" "$quiesced_version" "$quiesce_tag" "present" || return 1
+
+            if [[ "$previous_state" == "absent" ]]; then
+              remove_github_sync_secret_with_tag "$config" "$secretless_tag" || return 1
+              secretless_version="$(active_version "$config")" || return 1
+              confirmed_version="$(
+                tagged_current_version \
+                  "$config" "$secretless_version" "$secretless_tag"
+              )" || return 1
+              if [[ -z "$confirmed_version" || "$confirmed_version" != "$secretless_version" ]]; then
+                echo "::error::The rollback secretless GitHub sync version cannot be proven exactly." >&2
+                return 1
+              fi
+              capability="$(
+                version_has_exact_disabled_github_contract "$secretless_version" "absent"
+              )" || return 1
+              if [[ "$capability" != "compatible" ]]; then
+                echo "::error::The secretless GitHub sync version is not the exact disabled three-Workflow contract." >&2
+                return 1
+              fi
+              assert_exact_disabled_github_version \
+                "$config" "$secretless_version" "$secretless_tag" "absent" || return 1
+              if [[ "$(github_sync_schedule_state)" != "clear" || \
+                    "$(cloudflare_github_workflow_state)" != "clear" || \
+                    "$(github_sync_d1_state "$config")" != "clear" ]]; then
+                echo "::error::GitHub sync work appeared before expected-absent rollback deletion." >&2
+                return 1
+              fi
+              assert_exact_disabled_github_version \
+                "$config" "$secretless_version" "$secretless_tag" "absent" || return 1
+              pnpm exec wrangler delete --config "$config" --force
+              if [[ "$(worker_presence edgemneme-github-sync)" != "absent" ]]; then
+                echo "::error::The expected-absent GitHub sync Worker still exists after deletion." >&2
+                return 1
+              fi
+              return 0
+            fi
+
+            capability="$(
+              version_has_github_workflow_capability "$config" "$previous_version"
+            )" || return 1
+            if [[ "$capability" != "compatible" ]]; then
+              echo "::error::The previous GitHub sync version does not have the exact three-Workflow capability. The current Worker remains disabled; Manual roll-forward is required." >&2
+              return 1
+            fi
+            assert_exact_disabled_github_version \
+              "$config" "$quiesced_version" "$quiesce_tag" "present" || return 1
+            pnpm exec wrangler rollback "$previous_version" \
+              --config "$config" \
+              --message "Automated rollback after failed deployment gate for GitHub run ${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}." \
+              --yes
+            confirmed_version="$(active_version "$config")" || return 1
+            if [[ "$confirmed_version" != "$previous_version" ]]; then
+              echo "::error::The GitHub sync Worker did not restore the exact previous version." >&2
+              return 1
+            fi
+            workflow_state="$(cloudflare_github_workflow_state)" || return 1
+            if [[ "$workflow_state" != "clear" ]]; then
+              echo "::error::The restored GitHub sync Workflow definitions are not quiescent." >&2
+              return 1
+            fi
+            if [[ "$(github_sync_queue_state)" != "clear" ]]; then
+              echo "::error::The restored GitHub sync Worker has a Queue association." >&2
+              return 1
+            fi
+            restored_secret_state="$(github_sync_secret_state "$config")" || return 1
+            if [[ "$restored_secret_state" != "$previous_secret_state" ]]; then
+              echo "::error::The restored GitHub sync version does not have its exact captured credential state." >&2
+              return 1
+            fi
+            restore_github_sync_schedule_state "$previous_schedule_state" || return 1
+            confirmed_version="$(active_version "$config")" || return 1
+            if [[ "$confirmed_version" != "$previous_version" ]]; then
+              echo "::error::The GitHub sync Worker changed after lifecycle restoration." >&2
+              return 1
+            fi
+            restored_secret_state="$(github_sync_secret_state "$config")" || return 1
+            if [[ "$restored_secret_state" != "$previous_secret_state" ]]; then
+              echo "::error::The GitHub sync credential state changed after lifecycle restoration." >&2
+              return 1
+            fi
+          }
+          set +e
+          github_sync_status=0
+          gateway_advanced_by_run=false
+          gateway_restore_completed=false
+          gateway_restore_current_state="${EXPECTED_GATEWAY_CURRENT_TRIGGER_STATE:-}"
+          gateway_restore_current_fingerprint="${EXPECTED_GATEWAY_CURRENT_TRIGGER_FINGERPRINT:-}"
+          if [[ "${EDGEMNEME_GITHUB_SYNC_ENABLED:-false}" == "true" ]]; then
+            rollback_github_sync
+            github_sync_status=$?
+          fi
+          rollback_if_advanced gateway \
+            wrangler/.wrangler/memory-gateway.generated.jsonc \
+            "${EDGEMNEME_GATEWAY_PREVIOUS_VERSION:-}" \
+            "github-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-gateway" \
+            edgemneme-memory-gateway \
+            "${EDGEMNEME_BOOTSTRAP_MODE:-false}"
+          gateway_status=$?
+          if (( gateway_status == 0 )) && [[ "$gateway_restore_completed" != "true" ]]; then
+            EXPECTED_GATEWAY_CURRENT_TRIGGER_STATE="$gateway_restore_current_state" \
+              EXPECTED_GATEWAY_CURRENT_TRIGGER_FINGERPRINT="$gateway_restore_current_fingerprint" \
+              EDGEMNEME_GATEWAY_ADVANCED_BY_RUN="$gateway_advanced_by_run" \
+              EDGEMNEME_GATEWAY_ALLOW_DETACHED_ABSENT=false \
+              node scripts/gateway-deployment-target.mjs restore
+            gateway_status=$?
+          fi
+          if (( gateway_status == 0 )); then
+            EXPECTED_GATEWAY_VERSION="${EDGEMNEME_GATEWAY_PREVIOUS_VERSION:-}" \
+              node scripts/capture-deployment-state.mjs verify \
+                gateway_version \
+                gateway_trigger_state \
+                gateway_trigger_fingerprint
+            gateway_status=$?
+          fi
+          rollback_if_advanced orchestrator \
+            wrangler/.wrangler/memory-orchestrator.generated.jsonc \
+            "${EDGEMNEME_ORCHESTRATOR_PREVIOUS_VERSION:-}" \
+            "edgemneme-ledger-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-orchestrator" \
+            edgemneme-memory-orchestrator \
+            "${EDGEMNEME_BOOTSTRAP_MODE:-false}"
+          orchestrator_status=$?
+          set -e
+          if (( github_sync_status != 0 || gateway_status != 0 || orchestrator_status != 0 )); then
+            echo "::error::One or more Worker rollbacks failed; inspect the original failed step and rollback logs." >&2
+            exit 1
+          fi
+
+      - name: Remove rollback deployment configs
+        if: always()
+        run: >-
+          rm -f --
+          wrangler/.wrangler/memory-orchestrator.generated.jsonc
+          wrangler/.wrangler/memory-gateway.generated.jsonc
+          wrangler/.wrangler/github-sync.generated.jsonc
