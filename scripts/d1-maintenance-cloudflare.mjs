@@ -200,11 +200,19 @@ function parseConsumer(consumer, queueName, ids) {
   if (!["worker", "http_pull"].includes(consumer?.type)) {
     throw new Error(`${queueName} contains an unknown consumer type.`);
   }
+  const workerScripts = [consumer?.script, consumer?.service, consumer?.script_name]
+    .filter((value) => value !== undefined && value !== null);
+  if (
+    consumer.type === "worker" &&
+    (workerScripts.length === 0 || new Set(workerScripts).size !== 1)
+  ) {
+    throw new Error(`${queueName} consumer script is invalid.`);
+  }
   return {
     id,
     type: consumer.type,
     script: consumer.type === "worker"
-      ? identifier(consumer?.script_name, `${queueName} consumer script`)
+      ? identifier(workerScripts[0], `${queueName} consumer script`)
       : null
   };
 }

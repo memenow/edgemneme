@@ -1032,19 +1032,31 @@ jobs:
               }
               const consumerIds = new Set();
               for (const consumer of consumers) {
+                const workerScripts = [consumer?.script, consumer?.service, consumer?.script_name]
+                  .filter((value) => value !== undefined && value !== null);
+                const validWorkerScript = (value) =>
+                  typeof value === "string" &&
+                  value.length > 0 &&
+                  value.length <= 512 &&
+                  value.trim() === value &&
+                  !/[\u0000-\u001f\u007f]/u.test(value);
+                const workerScript =
+                  workerScripts.length > 0 &&
+                  workerScripts.every(validWorkerScript) &&
+                  new Set(workerScripts).size === 1
+                    ? workerScripts[0]
+                    : null;
                 if (
                   typeof consumer?.consumer_id !== "string" ||
                   consumer.consumer_id.length === 0 ||
                   consumerIds.has(consumer.consumer_id) ||
                   !["worker", "http_pull"].includes(consumer?.type) ||
-                  (consumer.type === "worker" &&
-                    (typeof consumer.script_name !== "string" ||
-                      consumer.script_name.length === 0))
+                  (consumer.type === "worker" && workerScript === null)
                 ) {
                   throw new Error("A Cloudflare Queue consumer entry is invalid.");
                 }
                 consumerIds.add(consumer.consumer_id);
-                if (consumer?.script_name === "edgemneme-github-sync") {
+                if (workerScript === "edgemneme-github-sync") {
                   throw new Error("The GitHub sync Worker still has a Queue consumer.");
                 }
               }
@@ -1997,19 +2009,31 @@ jobs:
               }
               const consumerIds = new Set();
               for (const consumer of consumers) {
+                const workerScripts = [consumer?.script, consumer?.service, consumer?.script_name]
+                  .filter((value) => value !== undefined && value !== null);
+                const validWorkerScript = (value) =>
+                  typeof value === "string" &&
+                  value.length > 0 &&
+                  value.length <= 512 &&
+                  value.trim() === value &&
+                  !/[\u0000-\u001f\u007f]/u.test(value);
+                const workerScript =
+                  workerScripts.length > 0 &&
+                  workerScripts.every(validWorkerScript) &&
+                  new Set(workerScripts).size === 1
+                    ? workerScripts[0]
+                    : null;
                 if (
                   typeof consumer?.consumer_id !== "string" ||
                   consumer.consumer_id.length === 0 ||
                   consumerIds.has(consumer.consumer_id) ||
                   !["worker", "http_pull"].includes(consumer?.type) ||
-                  (consumer.type === "worker" &&
-                    (typeof consumer.script_name !== "string" ||
-                      consumer.script_name.length === 0))
+                  (consumer.type === "worker" && workerScript === null)
                 ) {
                   throw new Error("A Cloudflare Queue consumer entry is invalid.");
                 }
                 consumerIds.add(consumer.consumer_id);
-                if (consumer?.script_name === "edgemneme-github-sync") {
+                if (workerScript === "edgemneme-github-sync") {
                   throw new Error("The GitHub sync Worker still has a Queue consumer.");
                 }
               }
@@ -2760,19 +2784,31 @@ jobs:
               }
               const consumerIds = new Set();
               for (const consumer of consumers) {
+                const workerScripts = [consumer?.script, consumer?.service, consumer?.script_name]
+                  .filter((value) => value !== undefined && value !== null);
+                const validWorkerScript = (value) =>
+                  typeof value === "string" &&
+                  value.length > 0 &&
+                  value.length <= 512 &&
+                  value.trim() === value &&
+                  !/[\u0000-\u001f\u007f]/u.test(value);
+                const workerScript =
+                  workerScripts.length > 0 &&
+                  workerScripts.every(validWorkerScript) &&
+                  new Set(workerScripts).size === 1
+                    ? workerScripts[0]
+                    : null;
                 if (
                   typeof consumer?.consumer_id !== "string" ||
                   consumer.consumer_id.length === 0 ||
                   consumerIds.has(consumer.consumer_id) ||
                   !["worker", "http_pull"].includes(consumer?.type) ||
-                  (consumer.type === "worker" &&
-                    (typeof consumer.script_name !== "string" ||
-                      consumer.script_name.length === 0))
+                  (consumer.type === "worker" && workerScript === null)
                 ) {
                   throw new Error("A Cloudflare Queue consumer entry is invalid.");
                 }
                 consumerIds.add(consumer.consumer_id);
-                if (consumer?.script_name === "edgemneme-github-sync") {
+                if (workerScript === "edgemneme-github-sync") {
                   throw new Error("The GitHub sync Worker still has a Queue consumer.");
                 }
               }
