@@ -138,7 +138,7 @@ afterEach(() => {
 });
 
 describe("Cloudflare production maintenance observation", () => {
-  it("proves a bounded greenfield control plane using GET only", async () => {
+  it("accepts optional pagination fields for an empty filtered gateway domain inventory", async () => {
     const requests: Array<{ url: URL; init?: RequestInit }> = [];
     const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const url = new URL(String(input));
@@ -151,7 +151,12 @@ describe("Cloudflare production maintenance observation", () => {
         return response({}, 404);
       }
       if (path.endsWith("/workers/domains")) {
-        return response(envelope([], { count: 0, total_count: 0, total_pages: 0 }));
+        return response(envelope([], {
+          count: 0,
+          page: 1,
+          per_page: 0,
+          total_count: 0
+        }));
       }
       if (path === "/client/v4/zones") return response(emptyPage(1, 50));
       if (path.endsWith("/queues")) return response(emptyPage(1, 100));
@@ -182,6 +187,10 @@ describe("Cloudflare production maintenance observation", () => {
     expect(requests.every(({ init }) => init?.method === "GET")).toBe(true);
     expect(requests.every(({ init }) => init?.redirect === "manual")).toBe(true);
     expect(requests.every(({ url }) => !url.pathname.endsWith("/settings"))).toBe(true);
+    expect(requests.some(({ url }) =>
+      url.pathname.endsWith("/workers/domains") &&
+      url.searchParams.get("service") === "edgemneme-memory-gateway"
+    )).toBe(true);
   });
 
   it("records stable non-target resources from the immutable active version", async () => {
