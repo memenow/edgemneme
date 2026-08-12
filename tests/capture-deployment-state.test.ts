@@ -127,7 +127,17 @@ function cloudflareFetch(options: {
     }
     if (url.pathname.endsWith("/workers/domains")) {
       expect(url.searchParams.get("service")).toBe("edgemneme-memory-gateway");
-      return Response.json({ success: true, result: [], result_info: { total_count: 0 } });
+      return Response.json({
+        success: true,
+        result: [],
+        result_info: {
+          count: 0,
+          page: 1,
+          per_page: 0,
+          total_count: 2_000,
+          total_pages: 100
+        }
+      });
     }
     if (url.pathname.endsWith("/workers/scripts/edgemneme-memory-gateway/subdomain")) {
       if (options.absentWorkers?.has("edgemneme-memory-gateway") === true) {

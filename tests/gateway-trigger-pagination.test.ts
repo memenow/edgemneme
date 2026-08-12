@@ -88,6 +88,7 @@ function zones(count: number): Zone[] {
 describe("gateway trigger pagination", () => {
   it("honors the documented single-page domain metadata semantics", () => {
     const result = [{ id: "domain-one" }];
+    const emptyResult: unknown[] = [];
     expect(
       validateSinglePageList(
         {
@@ -100,16 +101,65 @@ describe("gateway trigger pagination", () => {
             total_pages: 100
           }
         },
-        "Cloudflare custom domain list"
+        "Cloudflare custom domain list",
+        { allowZeroPerPageWithUnfilteredTotals: true }
       )
     ).toBe(result);
+    expect(
+      validateSinglePageList(
+        {
+          result: emptyResult,
+          result_info: {
+            count: 0,
+            page: 1,
+            per_page: 0,
+            total_count: 2_000,
+            total_pages: 100
+          }
+        },
+        "Cloudflare custom domain list",
+        { allowZeroPerPageWithUnfilteredTotals: true }
+      )
+    ).toBe(emptyResult);
     expect(() =>
       validateSinglePageList(
         {
           result,
           result_info: { count: 2 }
         },
-        "Cloudflare custom domain list"
+        "Cloudflare custom domain list",
+        { allowZeroPerPageWithUnfilteredTotals: true }
+      )
+    ).toThrow("single-page metadata is inconsistent");
+    expect(() =>
+      validateSinglePageList(
+        {
+          result,
+          result_info: {
+            count: 1,
+            page: 1,
+            per_page: 0,
+            total_count: 2_000,
+            total_pages: 100
+          }
+        },
+        "Cloudflare custom domain list",
+        { allowZeroPerPageWithUnfilteredTotals: true }
+      )
+    ).toThrow("single-page metadata is inconsistent");
+    expect(() =>
+      validateSinglePageList(
+        {
+          result: emptyResult,
+          result_info: {
+            count: 0,
+            page: 1,
+            per_page: 0,
+            total_count: 1,
+            total_pages: 1
+          }
+        },
+        "Cloudflare Worker route list"
       )
     ).toThrow("single-page metadata is inconsistent");
   });

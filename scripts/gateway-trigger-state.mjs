@@ -138,7 +138,11 @@ async function readGatewayDomains(context) {
     context,
     `/accounts/${encodeURIComponent(context.accountId)}/workers/domains?${query.toString()}`
   );
-  const domains = validateSinglePageList(envelope, "Cloudflare custom domain list");
+  const domains = validateSinglePageList(
+    envelope,
+    "Cloudflare custom domain list",
+    { allowZeroPerPageWithUnfilteredTotals: true }
+  );
   const domainIds = new Set();
   const hostnames = new Set();
   return domains.map((domain) => {
@@ -170,7 +174,8 @@ async function assertCustomDomainAvailable(context, hostname) {
   );
   const domains = validateSinglePageList(
     envelope,
-    "Cloudflare custom domain ownership list"
+    "Cloudflare custom domain ownership list",
+    { allowZeroPerPageWithUnfilteredTotals: true }
   );
   const domainIds = new Set();
   const hostnames = new Set();
