@@ -2,10 +2,11 @@ import { createHmac, randomBytes } from "node:crypto";
 import {
   chmodSync,
   existsSync,
+  lstatSync,
   mkdtempSync,
   readFileSync,
+  renameSync,
   rmSync,
-  unlinkSync,
   writeFileSync
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -73,6 +74,7 @@ const clientResultPath = join(temporaryDirectory, "client-result.json");
 const cleanupLedgerPath =
   process.env.EDGEMNEME_CANARY_CLEANUP_LEDGER ??
   join(temporaryDirectory, "cleanup-ledger.json");
+const cleanupCompletionPath = `${cleanupLedgerPath}.complete`;
 const projectId = canaryUuid("EDGEMNEME_CANARY_PROJECT_ID", cleanupOnly);
 const principalId = canaryUuid("EDGEMNEME_CANARY_PRINCIPAL_ID", cleanupOnly);
 const repositoryId = canaryUuid("EDGEMNEME_CANARY_REPOSITORY_ID", false);
@@ -96,6 +98,7 @@ let seedAttempted = cleanupOnly;
 let operationError;
 
 if (!cleanupOnly) {
+  rmSync(cleanupCompletionPath, { force: true });
   writeFileSync(
     seedPath,
     syntheticSeedSql({
@@ -125,6 +128,8 @@ try {
         EDGEMNEME_GATEWAY_URL: gatewayUrl,
         EDGEMNEME_GATEWAY_EXPECTED_HOST:
           process.env.EDGEMNEME_GATEWAY_EXPECTED_HOST ?? "",
+        EDGEMNEME_GATEWAY_EXPECTED_VERSION:
+          process.env.EDGEMNEME_GATEWAY_EXPECTED_VERSION ?? "",
         EDGEMNEME_CANARY_TOKEN: token,
         EDGEMNEME_CANARY_PROJECT_REF: projectRef,
         EDGEMNEME_CANARY_PROJECT_ID: projectId,
@@ -149,8 +154,29 @@ try {
 let cleanupError;
 if (seedAttempted) {
   try {
-    await cleanupSyntheticProject(projectId, principalId, cleanupPath, cleanupLedgerPath);
-    console.log("Synthetic D1, Vectorize, and R2 records cleaned.");
+    if (cleanupOnly && existsSync(cleanupCompletionPath)) {
+      await verifyCompletedSyntheticCleanup(
+        cleanupCompletionPath,
+        cleanupLedgerPath,
+        projectId,
+        principalId
+      );
+      console.log("Synthetic cleanup completion revalidated.");
+    } else {
+      await cleanupSyntheticProject(
+        projectId,
+        principalId,
+        cleanupPath,
+        cleanupLedgerPath,
+        cleanupCompletionPath
+      );
+      if (existsSync(cleanupLedgerPath) || !existsSync(cleanupCompletionPath)) {
+        throw new Error(
+          "The synthetic cleanup ledger did not atomically become a completion receipt."
+        );
+      }
+      console.log("Synthetic D1, Vectorize, and R2 records cleaned.");
+    }
   } catch (error) {
     cleanupError = new Error(`Synthetic cleanup failed for reserved project ${projectRef}.`, {
       cause: error
@@ -575,9 +601,16 @@ async function cleanupSyntheticProject(
   syntheticProjectId,
   syntheticPrincipalId,
   memoryCleanupPath,
-  ledgerPath
+  ledgerPath,
+  completionPath
 ) {
+  const persistedLedger = loadCleanupLedger(
+    ledgerPath,
+    syntheticProjectId,
+    syntheticPrincipalId
+  );
   const discoverLedger = () => ({
+    schema_version: 1,
     project_id: syntheticProjectId,
     principal_id: syntheticPrincipalId,
     vector_ids: prepareSearchCleanup(syntheticProjectId),
@@ -585,20 +618,19 @@ async function cleanupSyntheticProject(
   });
   await executeSyntheticCleanup({
     claimAdmissionFence: () =>
-      claimSyntheticCleanupFence(syntheticProjectId, syntheticPrincipalId),
+      claimSyntheticCleanupFence(
+        syntheticProjectId,
+        syntheticPrincipalId,
+        persistedLedger !== null
+      ),
     waitForQuiescence: () => waitForSyntheticQuiescence(syntheticProjectId),
     loadLedger: () => {
-      const persisted = loadCleanupLedger(
-        ledgerPath,
-        syntheticProjectId,
-        syntheticPrincipalId
-      );
-      return persisted === null
+      return persistedLedger === null
         ? null
         : mergeSyntheticCleanupLedgers(
             syntheticProjectId,
             syntheticPrincipalId,
-            [persisted, discoverLedger()]
+            [persistedLedger, discoverLedger()]
           );
     },
     createLedger: discoverLedger,
@@ -612,11 +644,22 @@ async function cleanupSyntheticProject(
     deleteAuthority: () => runD1File(memoryCleanupPath, "Synthetic authority cleanup"),
     verifyAuthorityCleanup: () =>
       verifySyntheticCleanup(syntheticProjectId, syntheticPrincipalId),
-    removeLedger: () => unlinkSync(ledgerPath)
+    publishCompletionReceipt: (ledger) =>
+      publishCleanupCompletionReceipt(
+        ledgerPath,
+        completionPath,
+        ledger,
+        syntheticProjectId,
+        syntheticPrincipalId
+      )
   });
 }
 
-function claimSyntheticCleanupFence(syntheticProjectId, syntheticPrincipalId) {
+function claimSyntheticCleanupFence(
+  syntheticProjectId,
+  syntheticPrincipalId,
+  allowVerifiedAbsentAuthority
+) {
   const project = sqlLiteral(syntheticProjectId);
   const principal = sqlLiteral(syntheticPrincipalId);
   const claimedAt = new Date().toISOString();
@@ -639,14 +682,23 @@ function claimSyntheticCleanupFence(syntheticProjectId, syntheticPrincipalId) {
   );
   const rows = runD1Query(
     "MEMORY_DB",
-    `SELECT cleanup_claim_id FROM synthetic_cleanup_registry
-     WHERE project_id = ${project} AND principal_id = ${principal}
-       AND cleanup_fenced_at IS NOT NULL`,
+    `SELECT cleanup_claim_id, cleanup_fenced_at FROM synthetic_cleanup_registry
+     WHERE project_id = ${project} AND principal_id = ${principal}`,
     "Synthetic cleanup admission fence verification"
   );
-  if (rows.length !== 1 || rows[0]?.cleanup_claim_id !== claimId) {
-    throw new Error("The synthetic cleanup admission fence could not be claimed.");
+  if (
+    rows.length === 1 &&
+    rows[0]?.cleanup_claim_id === claimId &&
+    typeof rows[0]?.cleanup_fenced_at === "string" &&
+    rows[0].cleanup_fenced_at.length > 0
+  ) {
+    return;
   }
+  if (rows.length === 0 && allowVerifiedAbsentAuthority) {
+    verifySyntheticCleanup(syntheticProjectId, syntheticPrincipalId);
+    return;
+  }
+  throw new Error("The synthetic cleanup admission fence could not be claimed.");
 }
 
 async function waitForSyntheticQuiescence(syntheticProjectId) {
@@ -680,6 +732,7 @@ function loadCleanupLedger(ledgerPath, expectedProjectId, expectedPrincipalId) {
   if (!existsSync(ledgerPath)) {
     return null;
   }
+  assertPrivateRegularFile(ledgerPath, "synthetic cleanup ledger");
   let ledger;
   try {
     ledger = JSON.parse(readFileSync(ledgerPath, "utf8"));
@@ -692,8 +745,97 @@ function loadCleanupLedger(ledgerPath, expectedProjectId, expectedPrincipalId) {
 
 function writeCleanupLedger(ledgerPath, ledger) {
   validateSyntheticCleanupLedger(ledger, ledger.project_id, ledger.principal_id);
-  writeFileSync(ledgerPath, `${JSON.stringify(ledger)}\n`, { mode: 0o600 });
-  chmodSync(ledgerPath, 0o600);
+  const temporaryLedgerPath =
+    `${ledgerPath}.tmp-${process.pid}-${randomBytes(8).toString("hex")}`;
+  try {
+    writeFileSync(temporaryLedgerPath, `${JSON.stringify(ledger)}\n`, {
+      flag: "wx",
+      mode: 0o600
+    });
+    chmodSync(temporaryLedgerPath, 0o600);
+    renameSync(temporaryLedgerPath, ledgerPath);
+    chmodSync(ledgerPath, 0o600);
+  } finally {
+    rmSync(temporaryLedgerPath, { force: true });
+  }
+}
+
+function publishCleanupCompletionReceipt(
+  ledgerPath,
+  receiptPath,
+  ledger,
+  expectedProjectId,
+  expectedPrincipalId
+) {
+  if (receiptPath !== `${ledgerPath}.complete`) {
+    throw new Error("The synthetic cleanup receipt path is not adjacent to its ledger.");
+  }
+  validateSyntheticCleanupLedger(
+    ledger,
+    expectedProjectId,
+    expectedPrincipalId
+  );
+  const persistedLedger = loadCleanupLedger(
+    ledgerPath,
+    expectedProjectId,
+    expectedPrincipalId
+  );
+  if (
+    persistedLedger === null ||
+    JSON.stringify(persistedLedger) !== JSON.stringify(ledger) ||
+    existsSync(receiptPath)
+  ) {
+    throw new Error(
+      "The synthetic cleanup ledger cannot become the exact completion receipt."
+    );
+  }
+  renameSync(ledgerPath, receiptPath);
+  chmodSync(receiptPath, 0o600);
+  assertPrivateRegularFile(receiptPath, "synthetic cleanup completion receipt");
+}
+
+async function verifyCompletedSyntheticCleanup(
+  receiptPath,
+  ledgerPath,
+  expectedProjectId,
+  expectedPrincipalId
+) {
+  assertPrivateRegularFile(receiptPath, "synthetic cleanup completion receipt");
+  let receipt;
+  try {
+    receipt = JSON.parse(readFileSync(receiptPath, "utf8"));
+  } catch {
+    throw new Error("The synthetic cleanup completion receipt is invalid.");
+  }
+  try {
+    validateSyntheticCleanupLedger(
+      receipt,
+      expectedProjectId,
+      expectedPrincipalId
+    );
+  } catch {
+    throw new Error(
+      "The synthetic cleanup completion receipt is outside its exact identity scope."
+    );
+  }
+  if (existsSync(ledgerPath)) {
+    throw new Error("The synthetic cleanup completion receipt conflicts with a retained ledger.");
+  }
+  await waitForVectorizeAbsence(receipt.vector_ids);
+  await verifyProjectionCleanup(expectedProjectId, receipt.r2_keys);
+  verifySyntheticCleanup(expectedProjectId, expectedPrincipalId);
+}
+
+function assertPrivateRegularFile(path, label) {
+  let stats;
+  try {
+    stats = lstatSync(path);
+  } catch {
+    throw new Error(`The ${label} is unavailable.`);
+  }
+  if (!stats.isFile() || (stats.mode & 0o777) !== 0o600) {
+    throw new Error(`The ${label} must be a mode-0600 regular file.`);
+  }
 }
 
 async function verifyProjectionCleanup(syntheticProjectId, r2Keys) {
@@ -906,6 +1048,9 @@ function verifySyntheticCleanup(syntheticProjectId, syntheticPrincipalId) {
             (SELECT COUNT(*) FROM github_access_baselines
              WHERE approved_by_principal_id = ${principal}
                AND credential_version = 'system.synthetic.' || ${project}) AS github_baselines,
+            (SELECT COUNT(*) FROM synthetic_cleanup_registry
+             WHERE project_id = ${project}
+               AND principal_id = ${principal}) AS synthetic_cleanup_registry,
             (SELECT COUNT(*) FROM projects WHERE project_id = ${project}) AS projects,
             (SELECT COUNT(*) FROM principals WHERE principal_id = ${principal}) AS principals`,
     "Synthetic authority cleanup verification"
@@ -929,5 +1074,13 @@ function verifySyntheticCleanup(syntheticProjectId, syntheticPrincipalId) {
   );
   if (foreignKeys.length !== 0) {
     throw new Error("Synthetic cleanup left a foreign key violation.");
+  }
+  const searchForeignKeys = runD1Query(
+    "SEARCH_DB",
+    "PRAGMA foreign_key_check",
+    "Synthetic search foreign key cleanup verification"
+  );
+  if (searchForeignKeys.length !== 0) {
+    throw new Error("Synthetic search cleanup left a foreign key violation.");
   }
 }

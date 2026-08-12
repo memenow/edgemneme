@@ -5,11 +5,15 @@ on:
     branches: [main]
   workflow_dispatch:
     inputs:
-      bootstrap_expected_empty:
-        description: Confirm that both core Workers are expected to be absent before this run
+      deployment_mode:
+        description: Assert the exact core Worker state expected before this deployment
         required: true
-        default: false
-        type: boolean
+        default: normal
+        type: choice
+        options:
+          - normal
+          - bootstrap-empty
+          - bootstrap-recover-gateway
 
 permissions:
   contents: read
@@ -77,7 +81,7 @@ jobs:
           CF_RATE_LIMIT_NAMESPACE_EDGE: ${{ vars.CF_RATE_LIMIT_NAMESPACE_EDGE }}
           CF_RATE_LIMIT_NAMESPACE_CLIENT: ${{ vars.CF_RATE_LIMIT_NAMESPACE_CLIENT }}
           CF_RATE_LIMIT_NAMESPACE_PRINCIPAL: ${{ vars.CF_RATE_LIMIT_NAMESPACE_PRINCIPAL }}
-          EDGEMNEME_BOOTSTRAP_EXPECTED_EMPTY: ${{ inputs.bootstrap_expected_empty }}
+          EDGEMNEME_DEPLOYMENT_MODE: ${{ inputs.deployment_mode || 'normal' }}
           ENABLE_GITHUB_SYNC: ${{ vars.ENABLE_GITHUB_SYNC }}
           GITHUB_CREDENTIAL_VERSION: ${{ vars.SYNC_CREDENTIAL_VERSION }}
           MEMORY_GATEWAY_ALLOWED_ORIGINS: ${{ vars.MEMORY_GATEWAY_ALLOWED_ORIGINS }}
@@ -537,7 +541,7 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          EDGEMNEME_BOOTSTRAP_EXPECTED_EMPTY: ${{ inputs.bootstrap_expected_empty }}
+          EDGEMNEME_DEPLOYMENT_MODE: ${{ inputs.deployment_mode || 'normal' }}
           ENABLE_GITHUB_SYNC: ${{ vars.ENABLE_GITHUB_SYNC }}
         shell: bash
         run: |
@@ -691,27 +695,43 @@ jobs:
               exit 1
             fi
           fi
-          bootstrap="${EDGEMNEME_BOOTSTRAP_EXPECTED_EMPTY:-false}"
-          if [[ "$bootstrap" == "true" ]]; then
+          deployment_mode="${EDGEMNEME_DEPLOYMENT_MODE:-normal}"
+          bootstrap=false
+          if [[ "$deployment_mode" == "bootstrap-empty" ]]; then
             if [[ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]]; then
-              echo "Bootstrap is allowed only from a manual workflow_dispatch run." >&2
+              echo "Deployment mode $deployment_mode is allowed only from a manual workflow_dispatch run." >&2
               exit 1
             fi
             if [[ "$orchestrator_version" != "absent" || "$gateway_version" != "absent" ]]; then
-              echo "Bootstrap expected both core Workers to be absent; refusing deployment." >&2
-              exit 1
-            fi
-            if [[ "$ENABLE_GITHUB_SYNC" == "true" && "$github_sync_state" != "absent" ]]; then
-              echo "Enabled bootstrap expected the GitHub sync Worker to be absent; refusing deployment." >&2
+              echo "Deployment mode bootstrap-empty expected both core Workers to be absent; refusing deployment." >&2
               exit 1
             fi
             orchestrator_version=""
             gateway_version=""
-          else
-            if [[ "$orchestrator_version" == "absent" || "$gateway_version" == "absent" ]]; then
-              echo "A core Worker is absent; use the explicit expected-empty bootstrap input." >&2
+            bootstrap=true
+          elif [[ "$deployment_mode" == "bootstrap-recover-gateway" ]]; then
+            if [[ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]]; then
+              echo "Deployment mode $deployment_mode is allowed only from a manual workflow_dispatch run." >&2
               exit 1
             fi
+            if [[ "$orchestrator_version" == "absent" || "$gateway_version" != "absent" ]]; then
+              echo "Deployment mode bootstrap-recover-gateway expected the orchestrator Worker to be present and the gateway Worker to be absent; refusing deployment." >&2
+              exit 1
+            fi
+            gateway_version=""
+            bootstrap=true
+          elif [[ "$deployment_mode" == "normal" ]]; then
+            if [[ "$orchestrator_version" == "absent" || "$gateway_version" == "absent" ]]; then
+              echo "Deployment mode normal requires both core Workers to be present." >&2
+              exit 1
+            fi
+          else
+            echo "Deployment mode must be exactly normal, bootstrap-empty, or bootstrap-recover-gateway." >&2
+            exit 1
+          fi
+          if [[ "$bootstrap" == "true" && "$ENABLE_GITHUB_SYNC" == "true" && "$github_sync_state" != "absent" ]]; then
+            echo "Deployment mode $deployment_mode expected the enabled GitHub sync Worker to be absent; refusing deployment." >&2
+            exit 1
           fi
           {
             echo "EDGEMNEME_ORCHESTRATOR_PREVIOUS_VERSION=$orchestrator_version"
@@ -1705,6 +1725,7 @@ jobs:
           TOKEN_DIGEST_PEPPER: ${{ secrets.TOKEN_DIGEST_PEPPER }}
           EDGEMNEME_GATEWAY_URL: ${{ steps.gateway_canary_target.outputs.gateway_url }}
           EDGEMNEME_GATEWAY_EXPECTED_HOST: ${{ steps.gateway_canary_target.outputs.gateway_host }}
+          EDGEMNEME_GATEWAY_EXPECTED_VERSION: ${{ steps.gateway_canary_target.outputs.gateway_active_version }}
         run: node scripts/run-synthetic-canary.mjs
 
       - name: Recover isolated production canary
@@ -3416,7 +3437,7 @@ jobs:
                   echo "::error::The bootstrap gateway changed after trigger detachment; refusing deletion." >&2
                   return 1
                 fi
-                pnpm exec wrangler delete --config "$config" --force || return 1
+                node scripts/delete-worker-script.mjs "$worker_name" || return 1
                 if [[ "$(worker_presence "$worker_name")" != "absent" ]]; then
                   echo "::error::The failed expected-absent $label Worker still exists after deletion." >&2
                   return 1
@@ -3595,7 +3616,7 @@ jobs:
               fi
               assert_exact_disabled_github_version \
                 "$config" "$secretless_version" "$secretless_tag" "absent" || return 1
-              pnpm exec wrangler delete --config "$config" --force
+              node scripts/delete-worker-script.mjs edgemneme-github-sync
               if [[ "$(worker_presence edgemneme-github-sync)" != "absent" ]]; then
                 echo "::error::The expected-absent GitHub sync Worker still exists after deletion." >&2
                 return 1

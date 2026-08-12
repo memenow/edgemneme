@@ -31,6 +31,9 @@ describe("production canary host pin", () => {
     expect(canary).toContain(
       "EDGEMNEME_GATEWAY_EXPECTED_HOST: ${{ steps.gateway_canary_target.outputs.gateway_host }}"
     );
+    expect(canary).toContain(
+      "EDGEMNEME_GATEWAY_EXPECTED_VERSION: ${{ steps.gateway_canary_target.outputs.gateway_active_version }}"
+    );
     expect(canary).not.toContain("vars.MEMORY_GATEWAY_PUBLIC_URL");
     expect(canary).not.toContain("vars.MEMORY_GATEWAY_EXPECTED_HOST");
     expect(rendering).toContain("MEMORY_GATEWAY_CUSTOM_DOMAIN");

@@ -62,7 +62,13 @@ describe("synthetic canary Search cleanup", () => {
       claimAdmissionFence: () => undefined,
       waitForQuiescence: () => undefined,
       loadLedger: () => null,
-      createLedger: () => ({ vector_ids: vectorIds, r2_keys: [] }),
+      createLedger: () => ({
+        schema_version: 1,
+        project_id: targetProjectId,
+        principal_id: "target-principal",
+        vector_ids: vectorIds,
+        r2_keys: []
+      }),
       writeLedger: () => undefined,
       deleteSearchVectors: (ledger: { vector_ids: string[] }) => {
         for (const vectorId of ledger.vector_ids) {
@@ -95,7 +101,7 @@ describe("synthetic canary Search cleanup", () => {
       },
       deleteAuthority: () => undefined,
       verifyAuthorityCleanup: () => undefined,
-      removeLedger: () => undefined
+      publishCompletionReceipt: () => undefined
     });
 
     expect(vectors).toEqual(new Set([otherVectorId]));
@@ -138,12 +144,14 @@ describe("synthetic canary Search cleanup", () => {
     expect(
       mergeSyntheticCleanupLedgers(projectId, principalId, [
         {
+          schema_version: 1,
           project_id: projectId,
           principal_id: principalId,
           vector_ids: [],
           r2_keys: []
         },
         {
+          schema_version: 1,
           project_id: projectId,
           principal_id: principalId,
           vector_ids: [receiptVectorId],
@@ -151,6 +159,7 @@ describe("synthetic canary Search cleanup", () => {
         }
       ])
     ).toEqual({
+      schema_version: 1,
       project_id: projectId,
       principal_id: principalId,
       vector_ids: [receiptVectorId],

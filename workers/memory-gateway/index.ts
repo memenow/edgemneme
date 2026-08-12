@@ -18,6 +18,7 @@ import {
 interface Env extends GatewayEnv {
   TOKEN_DIGEST_PEPPER: string;
   ALLOWED_ORIGINS: string;
+  CF_VERSION_METADATA: WorkerVersionMetadata;
   MCP_EDGE_LIMITER: RateLimit;
   MCP_CLIENT_LIMITER: RateLimit;
   MCP_PRINCIPAL_LIMITER: RateLimit;
@@ -35,11 +36,13 @@ const CORS_ALLOWED_HEADERS = [
 const CORS_EXPOSED_HEADERS = [
   "MCP-Protocol-Version",
   "MCP-Session-Id",
-  "Retry-After"
+  "Retry-After",
+  "X-Edgemneme-Worker-Version"
 ].join(", ");
 export const MCP_POST_BODY_MAX_BYTES = 2 * 1024 * 1024;
 const MCP_BODY_READ_CHUNK_BYTES = 64 * 1024;
 const JSON_RPC_INVALID_REQUEST = -32600;
+const WORKER_VERSION_HEADER = "x-edgemneme-worker-version";
 
 const projectRef = z.string().min(8).max(256);
 const identifier = z.string().uuid();
@@ -97,6 +100,16 @@ const memorySearchFilters = z.object({
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const response = await handleGatewayRequest(request, env, ctx);
+    return withWorkerVersionHeader(response, env.CF_VERSION_METADATA.id);
+  }
+} satisfies ExportedHandler<Env>;
+
+async function handleGatewayRequest(
+  request: Request,
+  env: Env,
+  ctx: ExecutionContext
+): Promise<Response> {
     const requestId = crypto.randomUUID();
     let corsOrigin: string | null = null;
     try {
@@ -180,8 +193,7 @@ export default {
         corsOrigin
       );
     }
-  }
-} satisfies ExportedHandler<Env>;
+}
 
 class McpRequestBodyError extends EdgeMnemeError {
   constructor(
@@ -355,6 +367,16 @@ function withCorsHeaders(response: Response, origin: string | null): Response {
   headers.set("access-control-allow-origin", origin);
   headers.set("access-control-expose-headers", CORS_EXPOSED_HEADERS);
   appendVary(headers, "Origin");
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers
+  });
+}
+
+function withWorkerVersionHeader(response: Response, versionId: string): Response {
+  const headers = new Headers(response.headers);
+  headers.set(WORKER_VERSION_HEADER, versionId);
   return new Response(response.body, {
     status: response.status,
     statusText: response.statusText,

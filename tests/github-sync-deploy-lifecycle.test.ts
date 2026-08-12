@@ -532,7 +532,7 @@ github_sync_d1_state
       rollback.indexOf("remove_github_sync_secret_with_tag")
     );
     expect(rollback.indexOf("wait_for_github_sync_drain")).toBeLessThan(
-      rollback.indexOf('wrangler delete --config "$config" --force')
+      rollback.indexOf("node scripts/delete-worker-script.mjs edgemneme-github-sync")
     );
   });
 
@@ -545,7 +545,9 @@ github_sync_d1_state
       "github_sync_secret_state"
     );
     const absentBranch = rollback.slice(rollback.indexOf('if [[ "$previous_state" == "absent" ]]'));
-    const deletion = absentBranch.indexOf('wrangler delete --config "$config" --force');
+    const deletion = absentBranch.indexOf(
+      "node scripts/delete-worker-script.mjs edgemneme-github-sync"
+    );
 
     expect(rollbackScript).toContain("assert_exact_disabled_github_version() {");
     expect(drain.match(/assert_exact_disabled_github_version/g)).toHaveLength(2);
@@ -813,7 +815,7 @@ ${rollbackNodeHeredoc("restore_github_sync_schedule_state")}
     const expectedAbsent = githubRollback.indexOf('if [[ "$previous_state" == "absent" ]]');
     const removeSecret = githubRollback.indexOf("remove_github_sync_secret", expectedAbsent);
     const deleteWorker = githubRollback.indexOf(
-      'wrangler delete --config "$config" --force',
+      "node scripts/delete-worker-script.mjs edgemneme-github-sync",
       expectedAbsent
     );
 

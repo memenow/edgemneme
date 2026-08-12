@@ -118,13 +118,13 @@ describe("production workflow safety", () => {
     expect(rollbackJob).toContain("capture belongs to a different tagged version");
     expect(rollbackJob).toContain("verify-active-tag");
     expect(rollbackJob.indexOf("capture-rollback-current")).toBeLessThan(
-      rollbackJob.indexOf("pnpm exec wrangler delete --config")
+      rollbackJob.indexOf("node scripts/delete-worker-script.mjs")
     );
     const bootstrapDetach = rollbackJob.indexOf(
       "EDGEMNEME_GATEWAY_ALLOW_DETACHED_ABSENT=true"
     );
     const bootstrapTagRecheck = rollbackJob.indexOf("verify-active-tag");
-    const bootstrapDelete = rollbackJob.indexOf("pnpm exec wrangler delete --config");
+    const bootstrapDelete = rollbackJob.indexOf("node scripts/delete-worker-script.mjs");
     expect(bootstrapTagRecheck).toBeGreaterThan(bootstrapDetach);
     expect(bootstrapDelete).toBeGreaterThan(bootstrapTagRecheck);
     expect(rollbackJob).toContain("gateway-deployment-target.mjs restore");

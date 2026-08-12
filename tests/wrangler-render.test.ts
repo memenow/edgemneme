@@ -90,6 +90,7 @@ describe("Wrangler deployment config renderer", () => {
       vars: {
         ALLOWED_ORIGINS: "https://app.example.com,https://admin.example.com"
       },
+      version_metadata: { binding: "CF_VERSION_METADATA" },
       routes: [{ pattern: "memory.example.com", custom_domain: true }],
       d1_databases: [
         {
@@ -528,9 +529,13 @@ describe("production workflow secret isolation", () => {
     expect(capture).toContain("https://api.cloudflare.com/client/v4/accounts/");
     expect(capture).toContain('redirect: "manual"');
     expect(capture).toContain("response.status === 404");
-    expect(capture).toContain("bootstrap_expected_empty");
+    expect(capture).toContain("deployment_mode");
     expect(capture).toContain("workflow_dispatch");
-    expect(capture).toContain("expected both core Workers to be absent");
+    expect(capture).toContain("bootstrap-empty expected both core Workers to be absent");
+    expect(capture).toContain("bootstrap-recover-gateway");
+    expect(capture).toContain(
+      "expected the orchestrator Worker to be present and the gateway Worker to be absent"
+    );
     expect(capture).toContain("EDGEMNEME_ORCHESTRATOR_PREVIOUS_VERSION");
     expect(capture).toContain("EDGEMNEME_GATEWAY_PREVIOUS_VERSION");
     expect(capture).toContain("EDGEMNEME_GITHUB_SYNC_PREVIOUS_VERSION");
@@ -539,7 +544,7 @@ describe("production workflow secret isolation", () => {
     expect(capture).toContain("EDGEMNEME_GITHUB_SYNC_PREVIOUS_SECRET_STATE");
     expect(capture).toContain("edgemneme-github-sync");
     expect(capture).toContain("read_github_sync_schedule_state");
-    expect(capture).toContain("Enabled bootstrap expected the GitHub sync Worker to be absent");
+    expect(capture).toContain("expected the enabled GitHub sync Worker to be absent");
     expect(capture).toContain("percentage !== 100");
     expect(capture).toContain("invalid creation timestamp");
     expect(orchestratorDeploy).toContain(
@@ -625,7 +630,10 @@ describe("production workflow secret isolation", () => {
       "status NOT IN ('complete', 'failed', 'terminated')"
     );
     expect(rollback).toContain("retaining the current orchestrator");
-    expect(rollback).toContain("wrangler delete --config \"$config\" --force");
+    expect(rollback).toContain('node scripts/delete-worker-script.mjs "$worker_name"');
+    expect(rollback).toContain(
+      "node scripts/delete-worker-script.mjs edgemneme-github-sync"
+    );
     expect(rollback).toContain("Retaining the bootstrap orchestrator");
     expect(rollback).toContain("wrangler rollback \"$previous_version\"");
     expect(rollback).toContain("restore_github_sync_schedule_state");

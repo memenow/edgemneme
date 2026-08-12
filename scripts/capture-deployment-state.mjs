@@ -10,6 +10,11 @@ const ACTIVE_VERSION_PATTERN =
 const GITHUB_SYNC_CRON = "0 */6 * * *";
 const GITHUB_SYNC_WORKER = "edgemneme-github-sync";
 const REQUEST_TIMEOUT_MS = 15_000;
+const DEPLOYMENT_MODES = new Set([
+  "normal",
+  "bootstrap-empty",
+  "bootstrap-recover-gateway",
+]);
 const STATE_FIELDS = new Set([
   "orchestrator_version",
   "gateway_version",
@@ -47,6 +52,18 @@ function booleanValue(environment, name, defaultValue) {
     throw new Error(`Deployment input ${name} must be exactly true or false.`);
   }
   return value === "true";
+}
+
+function deploymentModeValue(environment) {
+  const rawValue = environment.EDGEMNEME_DEPLOYMENT_MODE;
+  const mode = rawValue === undefined || rawValue.trim() === "" ? "normal" : rawValue.trim();
+  if (!DEPLOYMENT_MODES.has(mode)) {
+    throw new Error(
+      "Deployment input EDGEMNEME_DEPLOYMENT_MODE must be exactly normal, " +
+        "bootstrap-empty, or bootstrap-recover-gateway.",
+    );
+  }
+  return mode;
 }
 
 function optionalValue(environment, name) {
@@ -238,31 +255,44 @@ async function observeDeploymentState(environment, fetchImpl) {
 
 export async function captureDeploymentState(environment = process.env, fetchImpl = fetch) {
   const enableGitHubSync = booleanValue(environment, "ENABLE_GITHUB_SYNC", false);
-  const bootstrapMode = booleanValue(
-    environment,
-    "EDGEMNEME_BOOTSTRAP_EXPECTED_EMPTY",
-    false
-  );
+  const deploymentMode = deploymentModeValue(environment);
+  const bootstrapMode = deploymentMode !== "normal";
+
+  if (bootstrapMode && environment.GITHUB_EVENT_NAME !== "workflow_dispatch") {
+    throw new Error(
+      `Deployment mode ${deploymentMode} is allowed only from a manual workflow_dispatch run.`,
+    );
+  }
+
   const observed = await observeDeploymentState(environment, fetchImpl);
   let orchestratorVersion = observed.orchestrator_version;
   let gatewayVersion = observed.gateway_version;
 
-  if (bootstrapMode) {
-    if (environment.GITHUB_EVENT_NAME !== "workflow_dispatch") {
-      throw new Error("Bootstrap is allowed only from a manual workflow_dispatch run.");
-    }
+  if (deploymentMode === "bootstrap-empty") {
     if (orchestratorVersion !== "absent" || gatewayVersion !== "absent") {
-      throw new Error("Bootstrap expected both core Workers to be absent; refusing deployment.");
-    }
-    if (enableGitHubSync && observed.github_sync_state !== "absent") {
       throw new Error(
-        "Enabled bootstrap expected the GitHub sync Worker to be absent; refusing deployment."
+        "Deployment mode bootstrap-empty expected both core Workers to be absent; refusing deployment.",
       );
     }
     orchestratorVersion = "";
     gatewayVersion = "";
+  } else if (deploymentMode === "bootstrap-recover-gateway") {
+    if (orchestratorVersion === "absent" || gatewayVersion !== "absent") {
+      throw new Error(
+        "Deployment mode bootstrap-recover-gateway expected the orchestrator Worker to be present " +
+          "and the gateway Worker to be absent; refusing deployment.",
+      );
+    }
+    gatewayVersion = "";
   } else if (orchestratorVersion === "absent" || gatewayVersion === "absent") {
-    throw new Error("A core Worker is absent; use the explicit expected-empty bootstrap input.");
+    throw new Error("Deployment mode normal requires both core Workers to be present.");
+  }
+
+  if (bootstrapMode && enableGitHubSync && observed.github_sync_state !== "absent") {
+    throw new Error(
+      `Deployment mode ${deploymentMode} expected the enabled GitHub sync Worker to be absent; ` +
+        "refusing deployment.",
+    );
   }
 
   return {
