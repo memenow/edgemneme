@@ -6,10 +6,72 @@ import * as canaryProcess from "../scripts/canary-process.mjs";
 const {
   canaryUuid,
   clientEnvironment,
+  createPinnedGatewayFetch,
   requireGatewayUrl,
   runProcessCaptureIfFound,
   waitForCredentialPropagation
 } = canaryProcess;
+
+const GATEWAY_URL = "https://trusted-gateway.workers.dev/mcp";
+const GATEWAY_HOST = "trusted-gateway.workers.dev";
+const GATEWAY_VERSION = "123e4567-e89b-42d3-a456-426614174000";
+
+function gatewayResponse(
+  options: {
+    body?: string;
+    contentType?: string;
+    redirected?: boolean;
+    status?: number;
+    type?: ResponseType;
+    url?: string;
+    version?: string | null;
+  } = {}
+): Response {
+  const headers = new Headers();
+  if (options.contentType !== undefined) {
+    headers.set("content-type", options.contentType);
+  }
+  if (options.version !== null) {
+    headers.set(
+      "x-edgemneme-worker-version",
+      options.version ?? GATEWAY_VERSION
+    );
+  }
+  const response = new Response(options.body ?? "", {
+    status: options.status ?? 200,
+    headers
+  });
+  Object.defineProperties(response, {
+    redirected: { value: options.redirected ?? false },
+    type: { value: options.type ?? "default" },
+    url: { value: options.url ?? GATEWAY_URL }
+  });
+  return response;
+}
+
+function cloudflare1104Response(): Response {
+  return gatewayResponse({
+    body: JSON.stringify({
+      type: "https://developers.cloudflare.com/workers/observability/errors/#error-1104",
+      title: "Error 1104: Script not found",
+      status: 500,
+      detail: "The Worker script required to render this page could not be found.",
+      error_code: 1104,
+      error_name: "worker_script_not_found",
+      error_category: "worker",
+      cloudflare_error: true
+    }),
+    contentType: "application/json",
+    status: 500,
+    version: null
+  });
+}
+
+function readinessOptions(
+  overrides: Record<string, unknown> = {}
+): Record<string, unknown> {
+  return { expectedVersion: GATEWAY_VERSION, ...overrides };
+}
 
 afterEach(() => {
   vi.unstubAllEnvs();
@@ -118,27 +180,165 @@ describe("synthetic canary process boundary", () => {
   });
 
   it("sends the propagation probe only to the exact host without redirect following", async () => {
-    const fetchMock = vi.fn().mockResolvedValue({
-      ok: true,
-      status: 200,
-      url: "https://trusted-gateway.workers.dev/mcp"
-    });
+    const fetchMock = vi.fn().mockImplementation(() =>
+      Promise.resolve(gatewayResponse())
+    );
     vi.stubGlobal("fetch", fetchMock);
 
     await expect(
       waitForCredentialPropagation(
-        "https://trusted-gateway.workers.dev/mcp",
+        GATEWAY_URL,
         "synthetic-bearer",
-        "trusted-gateway.workers.dev"
+        GATEWAY_HOST,
+        readinessOptions({
+          consecutiveSuccesses: 3,
+          maxAttempts: 3,
+          retryDelayMs: 0,
+          delayImplementation: vi.fn()
+        })
       )
     ).resolves.toBeUndefined();
-    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(fetchMock).toHaveBeenCalledTimes(3);
     expect(fetchMock).toHaveBeenCalledWith(
-      "https://trusted-gateway.workers.dev/mcp",
+      GATEWAY_URL,
       expect.objectContaining({
-        redirect: "manual",
-        headers: expect.objectContaining({ authorization: "Bearer synthetic-bearer" })
+        redirect: "manual"
       })
+    );
+    const headers = fetchMock.mock.calls[0]?.[1]?.headers as Headers;
+    expect(headers.get("authorization")).toBe("Bearer synthetic-bearer");
+    expect(headers.get("Cloudflare-Workers-Version-Overrides")).toBe(
+      `edgemneme-memory-gateway="${GATEWAY_VERSION}"`
+    );
+  });
+
+  it("retries an exact Cloudflare 500/1104 and requires a fresh stable success streak", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(gatewayResponse())
+      .mockResolvedValueOnce(gatewayResponse())
+      .mockResolvedValueOnce(cloudflare1104Response())
+      .mockImplementation(() => Promise.resolve(gatewayResponse()));
+    const delayImplementation = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      waitForCredentialPropagation(
+        GATEWAY_URL,
+        "synthetic-bearer",
+        GATEWAY_HOST,
+        readinessOptions({
+          consecutiveSuccesses: 3,
+          maxAttempts: 7,
+          retryDelayMs: 5,
+          delayImplementation
+        })
+      )
+    ).resolves.toBeUndefined();
+    expect(fetchMock).toHaveBeenCalledTimes(6);
+    expect(delayImplementation).toHaveBeenCalledTimes(5);
+    expect(delayImplementation).toHaveBeenCalledWith(5);
+  });
+
+  it("fails when the gateway never sustains the required success streak", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(gatewayResponse())
+      .mockResolvedValueOnce(cloudflare1104Response())
+      .mockResolvedValueOnce(gatewayResponse())
+      .mockResolvedValueOnce(cloudflare1104Response());
+    const delayImplementation = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      waitForCredentialPropagation(
+        GATEWAY_URL,
+        "synthetic-bearer",
+        GATEWAY_HOST,
+        readinessOptions({
+          consecutiveSuccesses: 2,
+          maxAttempts: 4,
+          retryDelayMs: 0,
+          delayImplementation
+        })
+      )
+    ).rejects.toThrow(/propagation window/iu);
+    expect(delayImplementation).toHaveBeenCalledTimes(3);
+  });
+
+  it("does not retry unrelated HTTP failures or transport timeouts", async () => {
+    const unrelatedFailure = gatewayResponse({
+      body: JSON.stringify({
+        status: 500,
+        error_code: 1104,
+        error_name: "worker_script_not_found",
+        cloudflare_error: false
+      }),
+      contentType: "application/json",
+      status: 500,
+      version: null
+    });
+    const fetchMock = vi.fn().mockResolvedValue(unrelatedFailure);
+    const delayImplementation = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      waitForCredentialPropagation(
+        GATEWAY_URL,
+        "synthetic-bearer",
+        GATEWAY_HOST,
+        readinessOptions({ delayImplementation })
+      )
+    ).rejects.toThrow(/expected Worker version/iu);
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(delayImplementation).not.toHaveBeenCalled();
+
+    const timeout = Object.assign(new Error("timed out"), { name: "TimeoutError" });
+    const timeoutFetch = vi.fn().mockRejectedValue(timeout);
+    vi.stubGlobal("fetch", timeoutFetch);
+    await expect(
+      waitForCredentialPropagation(
+        GATEWAY_URL,
+        "synthetic-bearer",
+        GATEWAY_HOST,
+        readinessOptions({ delayImplementation })
+      )
+    ).rejects.toBe(timeout);
+    expect(timeoutFetch).toHaveBeenCalledOnce();
+    expect(delayImplementation).not.toHaveBeenCalled();
+  });
+
+  it("requires every pinned response to prove the exact gateway version", async () => {
+    for (const version of [null, "987e6543-e21b-43d3-b654-426614174111"]) {
+      const fetchMock = vi.fn().mockResolvedValue(gatewayResponse({ version }));
+      const pinnedFetch = createPinnedGatewayFetch(
+        GATEWAY_URL,
+        GATEWAY_HOST,
+        GATEWAY_VERSION,
+        fetchMock
+      );
+      await expect(pinnedFetch(GATEWAY_URL)).rejects.toThrow(
+        /expected Worker version/iu
+      );
+    }
+
+    const exactFetch = vi.fn().mockResolvedValue(gatewayResponse());
+    const pinnedFetch = createPinnedGatewayFetch(
+      GATEWAY_URL,
+      GATEWAY_HOST,
+      GATEWAY_VERSION,
+      exactFetch
+    );
+    await expect(
+      pinnedFetch(new Request(GATEWAY_URL, { headers: { "x-request": "one" } }), {
+        headers: { authorization: "Bearer synthetic-bearer" }
+      })
+    ).resolves.toMatchObject({ ok: true });
+    const headers = exactFetch.mock.calls[0]?.[1]?.headers as Headers;
+    expect(headers.get("x-request")).toBe("one");
+    expect(headers.get("authorization")).toBe("Bearer synthetic-bearer");
+    expect(headers.get("Cloudflare-Workers-Version-Overrides")).toBe(
+      `edgemneme-memory-gateway="${GATEWAY_VERSION}"`
     );
   });
 
@@ -152,9 +352,10 @@ describe("synthetic canary process boundary", () => {
 
     await expect(
       waitForCredentialPropagation(
-        "https://trusted-gateway.workers.dev/mcp",
+        GATEWAY_URL,
         "synthetic-bearer",
-        "trusted-gateway.workers.dev"
+        GATEWAY_HOST,
+        readinessOptions()
       )
     ).rejects.toThrow(/redirect/iu);
     expect(redirectFetch).toHaveBeenCalledOnce();
@@ -172,9 +373,10 @@ describe("synthetic canary process boundary", () => {
 
     await expect(
       waitForCredentialPropagation(
-        "https://trusted-gateway.workers.dev/mcp",
+        GATEWAY_URL,
         "synthetic-bearer",
-        "trusted-gateway.workers.dev"
+        GATEWAY_HOST,
+        readinessOptions()
       )
     ).rejects.toThrow(/unexpected URL/iu);
     expect(crossOriginFetch).toHaveBeenCalledOnce();

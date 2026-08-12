@@ -4,6 +4,7 @@ import {
   existsSync,
   mkdtempSync,
   readFileSync,
+  renameSync,
   rmSync,
   unlinkSync,
   writeFileSync
@@ -73,6 +74,7 @@ const clientResultPath = join(temporaryDirectory, "client-result.json");
 const cleanupLedgerPath =
   process.env.EDGEMNEME_CANARY_CLEANUP_LEDGER ??
   join(temporaryDirectory, "cleanup-ledger.json");
+const cleanupCompletionPath = `${cleanupLedgerPath}.complete`;
 const projectId = canaryUuid("EDGEMNEME_CANARY_PROJECT_ID", cleanupOnly);
 const principalId = canaryUuid("EDGEMNEME_CANARY_PRINCIPAL_ID", cleanupOnly);
 const repositoryId = canaryUuid("EDGEMNEME_CANARY_REPOSITORY_ID", false);
@@ -96,6 +98,7 @@ let seedAttempted = cleanupOnly;
 let operationError;
 
 if (!cleanupOnly) {
+  rmSync(cleanupCompletionPath, { force: true });
   writeFileSync(
     seedPath,
     syntheticSeedSql({
@@ -125,6 +128,8 @@ try {
         EDGEMNEME_GATEWAY_URL: gatewayUrl,
         EDGEMNEME_GATEWAY_EXPECTED_HOST:
           process.env.EDGEMNEME_GATEWAY_EXPECTED_HOST ?? "",
+        EDGEMNEME_GATEWAY_EXPECTED_VERSION:
+          process.env.EDGEMNEME_GATEWAY_EXPECTED_VERSION ?? "",
         EDGEMNEME_CANARY_TOKEN: token,
         EDGEMNEME_CANARY_PROJECT_REF: projectRef,
         EDGEMNEME_CANARY_PROJECT_ID: projectId,
@@ -149,8 +154,22 @@ try {
 let cleanupError;
 if (seedAttempted) {
   try {
-    await cleanupSyntheticProject(projectId, principalId, cleanupPath, cleanupLedgerPath);
-    console.log("Synthetic D1, Vectorize, and R2 records cleaned.");
+    if (cleanupOnly && existsSync(cleanupCompletionPath)) {
+      verifyCompletedSyntheticCleanup(
+        cleanupCompletionPath,
+        cleanupLedgerPath,
+        projectId,
+        principalId
+      );
+      console.log("Synthetic cleanup completion revalidated.");
+    } else {
+      await cleanupSyntheticProject(projectId, principalId, cleanupPath, cleanupLedgerPath);
+      if (existsSync(cleanupLedgerPath)) {
+        throw new Error("The synthetic cleanup ledger remained after verified cleanup.");
+      }
+      writeCleanupCompletionMarker(cleanupCompletionPath, projectId, principalId);
+      console.log("Synthetic D1, Vectorize, and R2 records cleaned.");
+    }
   } catch (error) {
     cleanupError = new Error(`Synthetic cleanup failed for reserved project ${projectRef}.`, {
       cause: error
@@ -694,6 +713,63 @@ function writeCleanupLedger(ledgerPath, ledger) {
   validateSyntheticCleanupLedger(ledger, ledger.project_id, ledger.principal_id);
   writeFileSync(ledgerPath, `${JSON.stringify(ledger)}\n`, { mode: 0o600 });
   chmodSync(ledgerPath, 0o600);
+}
+
+function writeCleanupCompletionMarker(
+  markerPath,
+  expectedProjectId,
+  expectedPrincipalId
+) {
+  const marker = {
+    schema_version: 1,
+    project_id: expectedProjectId,
+    principal_id: expectedPrincipalId
+  };
+  const temporaryMarkerPath =
+    `${markerPath}.tmp-${process.pid}-${randomBytes(8).toString("hex")}`;
+  try {
+    writeFileSync(temporaryMarkerPath, `${JSON.stringify(marker)}\n`, {
+      flag: "wx",
+      mode: 0o600
+    });
+    chmodSync(temporaryMarkerPath, 0o600);
+    renameSync(temporaryMarkerPath, markerPath);
+    chmodSync(markerPath, 0o600);
+  } finally {
+    rmSync(temporaryMarkerPath, { force: true });
+  }
+}
+
+function verifyCompletedSyntheticCleanup(
+  markerPath,
+  ledgerPath,
+  expectedProjectId,
+  expectedPrincipalId
+) {
+  let marker;
+  try {
+    marker = JSON.parse(readFileSync(markerPath, "utf8"));
+  } catch {
+    throw new Error("The synthetic cleanup completion marker is invalid.");
+  }
+  if (
+    typeof marker !== "object" ||
+    marker === null ||
+    Array.isArray(marker) ||
+    Object.keys(marker).sort().join(",") !==
+      "principal_id,project_id,schema_version" ||
+    marker.schema_version !== 1 ||
+    marker.project_id !== expectedProjectId ||
+    marker.principal_id !== expectedPrincipalId
+  ) {
+    throw new Error(
+      "The synthetic cleanup completion marker is outside its exact identity scope."
+    );
+  }
+  if (existsSync(ledgerPath)) {
+    throw new Error("The synthetic cleanup completion marker conflicts with a retained ledger.");
+  }
+  verifySyntheticCleanup(expectedProjectId, expectedPrincipalId);
 }
 
 async function verifyProjectionCleanup(syntheticProjectId, r2Keys) {

@@ -9,12 +9,14 @@ import gatewayWorker, {
 const DELETION_CANDIDATE_ID =
   `github-path-absent-observation:${"a".repeat(64)}:` +
   `${"b".repeat(64)}:${"c".repeat(64)}`;
+const GATEWAY_VERSION = "123e4567-e89b-42d3-a456-426614174000";
 
 describe("stateless MCP handler", () => {
   it("supports a complete SDK initialization across independent HTTP requests", async () => {
     const methods: string[] = [];
     const sessionHeaders: Array<string | null> = [];
     const corsOrigins: Array<string | null> = [];
+    const workerVersions: Array<string | null> = [];
     const env = gatewayEnvironment();
     env.ALLOWED_ORIGINS = "https://console.example";
     const context = {
@@ -36,6 +38,9 @@ describe("stateless MCP handler", () => {
           const response = await gatewayWorker.fetch(request, env, context);
           sessionHeaders.push(response.headers.get("mcp-session-id"));
           corsOrigins.push(response.headers.get("access-control-allow-origin"));
+          workerVersions.push(
+            response.headers.get("x-edgemneme-worker-version")
+          );
           return response;
         }
       }
@@ -64,6 +69,7 @@ describe("stateless MCP handler", () => {
       expect(methods.filter((method) => method === "POST").length).toBeGreaterThanOrEqual(3);
       expect(sessionHeaders).toEqual(sessionHeaders.map(() => null));
       expect(corsOrigins).toEqual(corsOrigins.map(() => "https://console.example"));
+      expect(workerVersions).toEqual(workerVersions.map(() => GATEWAY_VERSION));
     } finally {
       await client.close();
     }
@@ -247,6 +253,10 @@ describe("stateless MCP handler", () => {
     );
     expect(response.headers.get("access-control-allow-methods")).toContain("POST");
     expect(response.headers.get("access-control-allow-headers")).toContain("Authorization");
+    expect(response.headers.get("access-control-expose-headers")).toContain(
+      "X-Edgemneme-Worker-Version"
+    );
+    expect(response.headers.get("x-edgemneme-worker-version")).toBe(GATEWAY_VERSION);
     expect(response.headers.get("vary")).toContain("Origin");
     expect(response.headers.get("vary")).toContain("Access-Control-Request-Method");
     expect(limiterCalls).toBe(0);
@@ -272,6 +282,7 @@ describe("stateless MCP handler", () => {
     expect(response.status).toBe(401);
     await expect(response.json()).resolves.toMatchObject({ code: "UNAUTHENTICATED" });
     expect(response.headers.has("access-control-allow-origin")).toBe(false);
+    expect(response.headers.get("x-edgemneme-worker-version")).toBe(GATEWAY_VERSION);
   });
 
   it("adds readable CORS headers to errors for an allowed origin", async () => {
@@ -293,6 +304,10 @@ describe("stateless MCP handler", () => {
     expect(response.headers.get("access-control-expose-headers")).toContain(
       "MCP-Session-Id"
     );
+    expect(response.headers.get("access-control-expose-headers")).toContain(
+      "X-Edgemneme-Worker-Version"
+    );
+    expect(response.headers.get("x-edgemneme-worker-version")).toBe(GATEWAY_VERSION);
     expect(response.headers.get("vary")).toContain("Origin");
   });
 
@@ -311,6 +326,7 @@ describe("stateless MCP handler", () => {
 
     expect(response.status).toBe(404);
     expect(response.headers.has("access-control-allow-origin")).toBe(false);
+    expect(response.headers.get("x-edgemneme-worker-version")).toBe(GATEWAY_VERSION);
   });
 });
 
@@ -780,6 +796,11 @@ function gatewayEnvironment(
     MCP_EDGE_LIMITER: limiter,
     MCP_CLIENT_LIMITER: limiter,
     MCP_PRINCIPAL_LIMITER: limiter,
+    CF_VERSION_METADATA: {
+      id: GATEWAY_VERSION,
+      tag: "test",
+      timestamp: "2026-08-12T00:00:00.000Z"
+    },
     MEMORY_DB: database
   } as Parameters<typeof gatewayWorker.fetch>[1];
 }
@@ -852,6 +873,11 @@ function mutationGatewayEnvironment(): {
       MCP_EDGE_LIMITER: limiter,
       MCP_CLIENT_LIMITER: limiter,
       MCP_PRINCIPAL_LIMITER: limiter,
+      CF_VERSION_METADATA: {
+        id: GATEWAY_VERSION,
+        tag: "test",
+        timestamp: "2026-08-12T00:00:00.000Z"
+      },
       MEMORY_DB: database,
       PROJECT_COORDINATOR: coordinator
     } as unknown as Parameters<typeof gatewayWorker.fetch>[1],

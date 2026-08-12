@@ -47,7 +47,7 @@ function environment(overrides: Record<string, string> = {}): Record<string, str
     CF_RATE_LIMIT_NAMESPACE_PRINCIPAL: "principal-rate-limit",
     ENABLE_GITHUB_SYNC: "true",
     GITHUB_CREDENTIAL_VERSION: "synthetic-credential-version",
-    EDGEMNEME_BOOTSTRAP_EXPECTED_EMPTY: "false",
+    EDGEMNEME_DEPLOYMENT_MODE: "normal",
     GITHUB_EVENT_NAME: "push",
     ...overrides
   };
@@ -225,15 +225,15 @@ describe("deployment state capture", () => {
     expect(requests.some((request) => request.endsWith("/secrets"))).toBe(true);
   });
 
-  it("permits an explicit manual bootstrap only when required Workers are absent", async () => {
+  it("permits bootstrap-empty only when all enabled Workers are absent", async () => {
     const absentWorkers = new Set([
       "edgemneme-memory-orchestrator",
       "edgemneme-memory-gateway",
-      "edgemneme-github-sync"
+      "edgemneme-github-sync",
     ]);
     const state = await captureDeploymentState(
       environment({
-        EDGEMNEME_BOOTSTRAP_EXPECTED_EMPTY: "true",
+        EDGEMNEME_DEPLOYMENT_MODE: "bootstrap-empty",
         GITHUB_EVENT_NAME: "workflow_dispatch"
       }),
       cloudflareFetch({ absentWorkers })
@@ -248,13 +248,153 @@ describe("deployment state capture", () => {
     expect(state.bootstrap_mode).toBe("true");
   });
 
-  it("rejects absent core Workers outside explicit bootstrap", async () => {
+  it("captures the existing orchestrator for a manual gateway recovery", async () => {
+    const absentWorkers = new Set([
+      "edgemneme-memory-gateway",
+      "edgemneme-github-sync",
+    ]);
+    const state = await captureDeploymentState(
+      environment({
+        EDGEMNEME_DEPLOYMENT_MODE: "bootstrap-recover-gateway",
+        GITHUB_EVENT_NAME: "workflow_dispatch"
+      }),
+      cloudflareFetch({ absentWorkers })
+    );
+
+    expect(state.orchestrator_version).toBe(ORCHESTRATOR_VERSION);
+    expect(state.gateway_version).toBe("");
+    expect(state.gateway_trigger_state).toBe(
+      encodeGatewayTriggerState(ABSENT_GATEWAY_TRIGGER)
+    );
+    expect(state.github_sync_state).toBe("absent");
+    expect(state.bootstrap_mode).toBe("true");
+  });
+
+  it("defaults to normal deployment mode", async () => {
+    const captureEnvironment = environment();
+    delete captureEnvironment.EDGEMNEME_DEPLOYMENT_MODE;
+
+    await expect(
+      captureDeploymentState(captureEnvironment, cloudflareFetch())
+    ).resolves.toMatchObject({
+      orchestrator_version: ORCHESTRATOR_VERSION,
+      gateway_version: GATEWAY_VERSION,
+      bootstrap_mode: "false"
+    });
+  });
+
+  it("rejects unsupported deployment modes before querying Cloudflare", async () => {
+    let queried = false;
+    const fetchImpl = (async () => {
+      queried = true;
+      throw new Error("unexpected query");
+    }) as typeof fetch;
+
+    await expect(
+      captureDeploymentState(
+        environment({ EDGEMNEME_DEPLOYMENT_MODE: "bootstrap" }),
+        fetchImpl
+      )
+    ).rejects.toThrow("must be exactly normal, bootstrap-empty, or bootstrap-recover-gateway");
+    expect(queried).toBe(false);
+  });
+
+  it.each(["bootstrap-empty", "bootstrap-recover-gateway"])(
+    "rejects %s outside workflow_dispatch",
+    async (deploymentMode) => {
+      const absentWorkers =
+        deploymentMode === "bootstrap-empty"
+          ? new Set([
+              "edgemneme-memory-orchestrator",
+              "edgemneme-memory-gateway",
+              "edgemneme-github-sync"
+            ])
+          : new Set(["edgemneme-memory-gateway", "edgemneme-github-sync"]);
+
+      await expect(
+        captureDeploymentState(
+          environment({ EDGEMNEME_DEPLOYMENT_MODE: deploymentMode }),
+          cloudflareFetch({ absentWorkers })
+        )
+      ).rejects.toThrow("allowed only from a manual workflow_dispatch run");
+    }
+  );
+
+  it.each([
+    {
+      label: "the orchestrator exists",
+      absentWorkers: new Set(["edgemneme-memory-gateway", "edgemneme-github-sync"]),
+    },
+    {
+      label: "the gateway exists",
+      absentWorkers: new Set(["edgemneme-memory-orchestrator", "edgemneme-github-sync"]),
+    },
+  ])("rejects bootstrap-empty when $label", async ({ absentWorkers }) => {
+    await expect(
+      captureDeploymentState(
+        environment({
+          EDGEMNEME_DEPLOYMENT_MODE: "bootstrap-empty",
+          GITHUB_EVENT_NAME: "workflow_dispatch",
+        }),
+        cloudflareFetch({ absentWorkers }),
+      ),
+    ).rejects.toThrow("bootstrap-empty expected both core Workers to be absent");
+  });
+
+  it.each([
+    {
+      label: "the orchestrator is absent",
+      absentWorkers: new Set([
+        "edgemneme-memory-orchestrator",
+        "edgemneme-memory-gateway",
+        "edgemneme-github-sync",
+      ]),
+    },
+    {
+      label: "the gateway exists",
+      absentWorkers: new Set(["edgemneme-github-sync"]),
+    },
+  ])("rejects gateway recovery when $label", async ({ absentWorkers }) => {
+    await expect(
+      captureDeploymentState(
+        environment({
+          EDGEMNEME_DEPLOYMENT_MODE: "bootstrap-recover-gateway",
+          GITHUB_EVENT_NAME: "workflow_dispatch",
+        }),
+        cloudflareFetch({ absentWorkers }),
+      ),
+    ).rejects.toThrow(
+      "bootstrap-recover-gateway expected the orchestrator Worker to be present and the gateway Worker to be absent",
+    );
+  });
+
+  it.each(["bootstrap-empty", "bootstrap-recover-gateway"])(
+    "rejects an enabled GitHub sync Worker during %s",
+    async (deploymentMode) => {
+      const absentWorkers =
+        deploymentMode === "bootstrap-empty"
+          ? new Set(["edgemneme-memory-orchestrator", "edgemneme-memory-gateway"])
+          : new Set(["edgemneme-memory-gateway"]);
+
+      await expect(
+        captureDeploymentState(
+          environment({
+            EDGEMNEME_DEPLOYMENT_MODE: deploymentMode,
+            GITHUB_EVENT_NAME: "workflow_dispatch",
+          }),
+          cloudflareFetch({ absentWorkers }),
+        ),
+      ).rejects.toThrow("expected the enabled GitHub sync Worker to be absent");
+    }
+  );
+
+  it("rejects absent core Workers in normal mode", async () => {
     await expect(
       captureDeploymentState(
         environment(),
         cloudflareFetch({ absentWorkers: new Set(["edgemneme-memory-gateway"]) })
       )
-    ).rejects.toThrow("A core Worker is absent");
+    ).rejects.toThrow("Deployment mode normal requires both core Workers to be present");
   });
 
   it("rejects non-atomic active deployments", async () => {

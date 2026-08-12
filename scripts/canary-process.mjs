@@ -4,6 +4,16 @@ import { createHash, randomUUID } from "node:crypto";
 const CAPTURE_LIMIT_BYTES = 64 * 1024;
 const DEFAULT_TIMEOUT_MS = 240_000;
 const LONG_TIMEOUT_MS = 900_000;
+const GATEWAY_READY_CONSECUTIVE_SUCCESSES = 6;
+const GATEWAY_READY_MAX_ATTEMPTS = 24;
+const GATEWAY_READY_RETRY_DELAY_MS = 5_000;
+const GATEWAY_WORKER_NAME = "edgemneme-memory-gateway";
+const GATEWAY_VERSION_OVERRIDE_HEADER =
+  "Cloudflare-Workers-Version-Overrides";
+const GATEWAY_VERSION_RESPONSE_HEADER = "x-edgemneme-worker-version";
+const CLOUDFLARE_ERROR_BODY_LIMIT_BYTES = 16 * 1024;
+const WORKER_VERSION_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 const CLIENT_ENVIRONMENT_KEYS = [
   "PATH",
   "TMPDIR",
@@ -206,12 +216,35 @@ export function delay(milliseconds) {
 export async function waitForCredentialPropagation(
   url,
   bearerToken,
-  expectedHost = process.env.EDGEMNEME_GATEWAY_EXPECTED_HOST
+  expectedHost = process.env.EDGEMNEME_GATEWAY_EXPECTED_HOST,
+  options = {}
 ) {
+  const {
+    consecutiveSuccesses = GATEWAY_READY_CONSECUTIVE_SUCCESSES,
+    expectedVersion = process.env.EDGEMNEME_GATEWAY_EXPECTED_VERSION,
+    maxAttempts = GATEWAY_READY_MAX_ATTEMPTS,
+    retryDelayMs = GATEWAY_READY_RETRY_DELAY_MS,
+    delayImplementation = delay
+  } = options;
+  if (
+    !Number.isSafeInteger(consecutiveSuccesses) ||
+    consecutiveSuccesses < 2 ||
+    !Number.isSafeInteger(maxAttempts) ||
+    maxAttempts < consecutiveSuccesses ||
+    !Number.isSafeInteger(retryDelayMs) ||
+    retryDelayMs < 0 ||
+    typeof delayImplementation !== "function"
+  ) {
+    throw new Error("Gateway readiness options are invalid.");
+  }
   const gatewayUrl = validateGatewayUrl(url, "Gateway URL", expectedHost);
-  const gatewayFetch = createPinnedGatewayFetch(
+  const gatewayVersion = validateGatewayVersion(expectedVersion);
+  const gatewayFetch = createPinnedGatewayTransportFetch(
     gatewayUrl.toString(),
-    expectedHost
+    expectedHost,
+    gatewayVersion,
+    globalThis.fetch,
+    false
   );
   const requestBody = JSON.stringify({
     jsonrpc: "2.0",
@@ -223,27 +256,35 @@ export async function waitForCredentialPropagation(
       clientInfo: { name: "EdgeMneme synthetic canary", version: "2026-07-25" }
     }
   });
-  for (let attempt = 0; attempt < 12; attempt += 1) {
-    try {
-      const response = await gatewayFetch(gatewayUrl.toString(), {
-        method: "POST",
-        headers: {
-          authorization: `Bearer ${bearerToken}`,
-          accept: "application/json, text/event-stream",
-          "content-type": "application/json"
-        },
-        body: requestBody,
-        signal: AbortSignal.timeout(10_000)
-      });
-      if (response.ok) {
+  let successfulProbes = 0;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const response = await gatewayFetch(gatewayUrl.toString(), {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${bearerToken}`,
+        accept: "application/json, text/event-stream",
+        "content-type": "application/json"
+      },
+      body: requestBody,
+      signal: AbortSignal.timeout(10_000)
+    });
+    if (await isCloudflareScriptNotFound(response)) {
+      successfulProbes = 0;
+    } else {
+      assertGatewayResponseVersion(response, gatewayVersion);
+      if (!response.ok) {
+        throw new Error(
+          `Gateway readiness probe failed with HTTP status ${response.status}.`
+        );
+      }
+      successfulProbes += 1;
+      if (successfulProbes === consecutiveSuccesses) {
         return;
       }
-    } catch (error) {
-      if (error?.name !== "TimeoutError") {
-        throw error;
-      }
     }
-    await delay(3_000);
+    if (attempt + 1 < maxAttempts) {
+      await delayImplementation(retryDelayMs);
+    }
   }
   throw new Error(
     "Gateway did not accept the synthetic credential within the propagation window."
@@ -269,7 +310,24 @@ export function requireGatewayUrl(
 export function createPinnedGatewayFetch(
   gatewayUrl,
   expectedHost = process.env.EDGEMNEME_GATEWAY_EXPECTED_HOST,
+  expectedVersion = process.env.EDGEMNEME_GATEWAY_EXPECTED_VERSION,
   fetchImplementation = globalThis.fetch
+) {
+  return createPinnedGatewayTransportFetch(
+    gatewayUrl,
+    expectedHost,
+    validateGatewayVersion(expectedVersion),
+    fetchImplementation,
+    true
+  );
+}
+
+function createPinnedGatewayTransportFetch(
+  gatewayUrl,
+  expectedHost,
+  expectedVersion,
+  fetchImplementation,
+  verifyResponseVersion
 ) {
   const pinnedUrl = validateGatewayUrl(gatewayUrl, "Gateway URL", expectedHost);
   if (typeof fetchImplementation !== "function") {
@@ -284,8 +342,14 @@ export function createPinnedGatewayFetch(
     if (requestUrl.toString() !== pinnedUrl.toString()) {
       throw new Error("Gateway request URL does not match the pinned endpoint.");
     }
+    const headers = requestHeaders(input, init?.headers);
+    headers.set(
+      GATEWAY_VERSION_OVERRIDE_HEADER,
+      `${GATEWAY_WORKER_NAME}="${expectedVersion}"`
+    );
     const response = await fetchImplementation(input, {
       ...init,
+      headers,
       redirect: "manual"
     });
     if (
@@ -298,8 +362,96 @@ export function createPinnedGatewayFetch(
     if (response.url !== pinnedUrl.toString()) {
       throw new Error("Gateway returned a response from an unexpected URL.");
     }
+    if (verifyResponseVersion) {
+      assertGatewayResponseVersion(response, expectedVersion);
+    }
     return response;
   };
+}
+
+function requestHeaders(input, initHeaders) {
+  const headers = new Headers(input instanceof Request ? input.headers : undefined);
+  new Headers(initHeaders).forEach((value, name) => headers.set(name, value));
+  return headers;
+}
+
+function assertGatewayResponseVersion(response, expectedVersion) {
+  const observedVersion = response.headers?.get?.(
+    GATEWAY_VERSION_RESPONSE_HEADER
+  );
+  if (observedVersion !== expectedVersion) {
+    throw new Error(
+      "Gateway response did not prove the expected Worker version."
+    );
+  }
+}
+
+async function isCloudflareScriptNotFound(response) {
+  if (
+    response.status !== 500 ||
+    !/^application\/(?:problem\+)?json(?:\s*;|$)/iu.test(
+      response.headers?.get?.("content-type") ?? ""
+    ) ||
+    typeof response.clone !== "function"
+  ) {
+    return false;
+  }
+  const declaredLength = response.headers?.get?.("content-length");
+  if (
+    declaredLength !== null &&
+    (!/^\d+$/u.test(declaredLength) ||
+      Number(declaredLength) > CLOUDFLARE_ERROR_BODY_LIMIT_BYTES)
+  ) {
+    return false;
+  }
+  let body = "";
+  try {
+    const reader = response.clone().body?.getReader();
+    if (reader === undefined) {
+      return false;
+    }
+    const decoder = new TextDecoder();
+    let byteLength = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        body += decoder.decode();
+        break;
+      }
+      byteLength += value.byteLength;
+      if (byteLength > CLOUDFLARE_ERROR_BODY_LIMIT_BYTES) {
+        await reader.cancel();
+        return false;
+      }
+      body += decoder.decode(value, { stream: true });
+    }
+  } catch {
+    return false;
+  }
+  let error;
+  try {
+    error = JSON.parse(body);
+  } catch {
+    return false;
+  }
+  return (
+    error !== null &&
+    typeof error === "object" &&
+    !Array.isArray(error) &&
+    error.status === 500 &&
+    error.error_code === 1104 &&
+    error.error_name === "worker_script_not_found" &&
+    error.cloudflare_error === true
+  );
+}
+
+function validateGatewayVersion(value) {
+  if (typeof value !== "string" || !WORKER_VERSION_PATTERN.test(value)) {
+    throw new Error(
+      "EDGEMNEME_GATEWAY_EXPECTED_VERSION must be a canonical lowercase Worker version UUID."
+    );
+  }
+  return value;
 }
 
 function validateGatewayUrl(value, label, expectedHost) {

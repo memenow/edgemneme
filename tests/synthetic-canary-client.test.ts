@@ -119,6 +119,7 @@ const PROMOTION_CANDIDATE_ID = "22222222-2222-4222-8222-222222222222";
 const QUALITY_WORKFLOW_ID = "55555555-5555-4555-8555-555555555555";
 const MEMORY_ID = "memory-1";
 const REVISION_ID = "revision-1";
+const GATEWAY_VERSION = "123e4567-e89b-42d3-a456-426614174000";
 const FORMAL_CONTENT =
   "EdgeMneme stores formal memory in D1 and treats search indexes as rebuildable projections.";
 let temporaryDirectory: string | undefined;
@@ -137,14 +138,13 @@ describe("synthetic MCP canary client", () => {
   });
 
   it("verifies every MCP resource template before reporting success", async () => {
-    const networkFetch = vi.fn().mockResolvedValue({
-      ok: true,
-      status: 200,
-      url: "https://edgemneme-test.workers.dev/mcp"
-    });
+    const networkFetch = vi.fn().mockImplementation(() =>
+      Promise.resolve(gatewayResponse())
+    );
     vi.stubGlobal("fetch", networkFetch);
     vi.stubEnv("EDGEMNEME_GATEWAY_URL", "https://edgemneme-test.workers.dev/mcp");
     vi.stubEnv("EDGEMNEME_GATEWAY_EXPECTED_HOST", "edgemneme-test.workers.dev");
+    vi.stubEnv("EDGEMNEME_GATEWAY_EXPECTED_VERSION", GATEWAY_VERSION);
     vi.stubEnv("EDGEMNEME_CANARY_TOKEN", "synthetic-token");
     vi.stubEnv("EDGEMNEME_CANARY_PROJECT_REF", PROJECT_REF);
     vi.stubEnv("EDGEMNEME_CANARY_PROJECT_ID", PROJECT_ID);
@@ -275,15 +275,28 @@ describe("synthetic MCP canary client", () => {
         transportFetch(input, { method })
       ).resolves.toMatchObject({ ok: true });
     }
-    expect(
-      networkFetch.mock.calls.slice(0, 3).map(([, init]) => ({
-        method: init?.method,
-        redirect: init?.redirect
-      }))
-    ).toEqual([
-      { method: "GET", redirect: "manual" },
-      { method: "POST", redirect: "manual" },
-      { method: "DELETE", redirect: "manual" }
+    expect(networkFetch.mock.calls.slice(0, 3).map(([, init]) => ({
+      method: init?.method,
+      override: new Headers(init?.headers).get(
+        "Cloudflare-Workers-Version-Overrides"
+      ),
+      redirect: init?.redirect
+    }))).toEqual([
+      {
+        method: "GET",
+        override: `edgemneme-memory-gateway="${GATEWAY_VERSION}"`,
+        redirect: "manual"
+      },
+      {
+        method: "POST",
+        override: `edgemneme-memory-gateway="${GATEWAY_VERSION}"`,
+        redirect: "manual"
+      },
+      {
+        method: "DELETE",
+        override: `edgemneme-memory-gateway="${GATEWAY_VERSION}"`,
+        redirect: "manual"
+      }
     ]);
 
     const networkCallCount = networkFetch.mock.calls.length;
@@ -323,6 +336,18 @@ describe("synthetic MCP canary client", () => {
       transportFetch("https://edgemneme-test.workers.dev/mcp", { method: "DELETE" })
     ).rejects.toThrow(/unexpected URL/iu);
 
+    networkFetch.mockResolvedValueOnce(gatewayResponse(null));
+    await expect(
+      transportFetch("https://edgemneme-test.workers.dev/mcp", { method: "POST" })
+    ).rejects.toThrow(/expected Worker version/iu);
+
+    networkFetch.mockResolvedValueOnce(
+      gatewayResponse("987e6543-e21b-43d3-b654-426614174111")
+    );
+    await expect(
+      transportFetch("https://edgemneme-test.workers.dev/mcp", { method: "POST" })
+    ).rejects.toThrow(/expected Worker version/iu);
+
     expect(
       canaryState.events.filter((event) => event.startsWith("resource:"))
     ).toEqual(expectedResourceUris.map((uri) => `resource:${uri}`));
@@ -336,3 +361,15 @@ describe("synthetic MCP canary client", () => {
     );
   });
 });
+
+function gatewayResponse(version: string | null = GATEWAY_VERSION): Response {
+  const headers = new Headers();
+  if (version !== null) {
+    headers.set("x-edgemneme-worker-version", version);
+  }
+  const response = new Response("", { status: 200, headers });
+  Object.defineProperty(response, "url", {
+    value: "https://edgemneme-test.workers.dev/mcp"
+  });
+  return response;
+}

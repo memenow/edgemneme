@@ -278,8 +278,16 @@ gateway deploy, the workflow proves that the active 100-percent version has this
 run's exact tag, re-reads every remote gateway trigger, and derives the HTTPS
 `/mcp` endpoint from that verified workers.dev hostname or custom domain. It
 checks the same active version, tag, and trigger fingerprint again after canary
-cleanup. A self-consistent URL and host variable therefore cannot redirect the
-canary to another Worker or an older deployment.
+cleanup. Every canary request carries Cloudflare's
+[version-override header](https://developers.cloudflare.com/workers/versions-and-deployments/version-overrides/)
+for that exact active version, and the gateway's
+[version-metadata binding](https://developers.cloudflare.com/workers/runtime-apis/bindings/version-metadata/)
+returns
+the actual executing version in a response header that the client verifies.
+The initial readiness gate requires a stable consecutive-success window because
+a recent deployment can take several seconds to become globally available. A
+self-consistent URL and host variable therefore cannot redirect the canary to
+another Worker or let an older deployment satisfy the release gate.
 
 An ordinary code deployment cannot change gateway routing. The rendered
 `workers_dev`/custom-domain contract must exactly match the independently
@@ -310,18 +318,24 @@ query implementation only after rebuild verification. The release gate
 reconstructs projections even when an unchanged target's previous execution
 completed successfully.
 
-A normal push to `main`, or a manual run with `bootstrap_expected_empty=false`,
-requires both dedicated core Workers to exist. The workflow captures the current
+A normal push to `main`, or a manual run with `deployment_mode=normal`, requires
+both dedicated core Workers to exist. The workflow captures the current
 single-version, 100-percent deployment for `memory-orchestrator` and
 `memory-gateway` before changing either Worker. If either Worker is absent, the
 run stops instead of inferring that this is a first deployment.
 
-Use `bootstrap_expected_empty=true` only in a manual `workflow_dispatch` run and
-only when both dedicated core Workers are expected to be absent. The workflow
-confirms both absences through the Cloudflare API before deploying. The flag does
-not authorize replacement or deletion of an existing Worker, and it is rejected
-if either Worker exists. When GitHub synchronization is enabled for the same
-bootstrap, the workflow also requires `github-sync` to be absent.
+The other deployment modes are accepted only for manual `workflow_dispatch`
+runs and assert one exact greenfield state:
+
+- `deployment_mode=bootstrap-empty` requires both dedicated core Workers to be
+  absent and captures no prior core version.
+- `deployment_mode=bootstrap-recover-gateway` requires `memory-orchestrator` to
+  exist and `memory-gateway` to be absent. It retains the active orchestrator as
+  the rollback target while treating only the gateway as a first deployment.
+
+Neither bootstrap mode authorizes replacement or deletion of an unexpected
+Worker. When GitHub synchronization is enabled for the same run, both modes
+also require `github-sync` to be absent.
 
 Every core deployment is tagged with the GitHub run and attempt; orchestrator
 tags also carry the `edgemneme-ledger-` capability prefix. After a failed normal
@@ -569,11 +583,16 @@ secret and revoke the PAT through GitHub. Grant the
 Cloudflare CI token only the permissions required by these Workers and
 resources. The current `workers.dev` deployment requires an
 [account-owned token](https://developers.cloudflare.com/fundamentals/api/get-started/account-owned-tokens/)
-limited to the target account with Workers Scripts Edit, D1 Edit, Workers R2
-Storage Edit, Vectorize Edit, Queues Edit, Zone Read, and Workers Routes Read.
+limited to the target account with Workers Scripts Write, D1 Write, Workers R2
+Storage Write, Vectorize Write, Queues Write, Zone Read, and Workers Routes Read.
 The rollback token additionally requires Workers Routes Edit so it can remove
 or restore only gateway-owned route resources after a failed deployment. The
-trigger gate uses the official
+expected-absent Worker cleanup uses the direct
+[Workers Scripts delete API](https://developers.cloudflare.com/api/resources/workers/subresources/scripts/methods/delete/)
+after the run tag, version, and detached-trigger checks; it does not enumerate
+or mutate unrelated KV namespaces, and it does not set Cloudflare's `force`
+option, so an unexpected incoming Worker, Durable Object, or tail reference
+blocks deletion. The trigger gate uses the official
 [Workers domains](https://developers.cloudflare.com/api/resources/workers/subresources/domains/),
 [Workers routes](https://developers.cloudflare.com/api/resources/workers/subresources/routes/),
 and [per-script workers.dev](https://developers.cloudflare.com/api/resources/workers/subresources/scripts/subresources/subdomain/)

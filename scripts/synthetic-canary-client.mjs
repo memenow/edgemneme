@@ -11,7 +11,16 @@ import {
   requireGatewayUrl
 } from "./canary-process.mjs";
 
-const gatewayUrl = requireGatewayUrl("EDGEMNEME_GATEWAY_URL");
+const gatewayExpectedHost = requiredEnvironment(
+  "EDGEMNEME_GATEWAY_EXPECTED_HOST"
+);
+const gatewayExpectedVersion = requiredEnvironment(
+  "EDGEMNEME_GATEWAY_EXPECTED_VERSION"
+);
+const gatewayUrl = requireGatewayUrl(
+  "EDGEMNEME_GATEWAY_URL",
+  gatewayExpectedHost
+);
 const token = requiredEnvironment("EDGEMNEME_CANARY_TOKEN");
 const projectRef = requiredEnvironment("EDGEMNEME_CANARY_PROJECT_REF");
 const projectId = requiredEnvironment("EDGEMNEME_CANARY_PROJECT_ID");
@@ -37,7 +46,11 @@ const client = new Client(
   { capabilities: {} }
 );
 const transport = new StreamableHTTPClientTransport(new URL(gatewayUrl), {
-  fetch: createPinnedGatewayFetch(gatewayUrl),
+  fetch: createPinnedGatewayFetch(
+    gatewayUrl,
+    gatewayExpectedHost,
+    gatewayExpectedVersion
+  ),
   requestInit: { headers: { authorization: `Bearer ${token}` } }
 });
 
