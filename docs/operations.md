@@ -269,7 +269,10 @@ Vectorize through query-mode hybrid search, reads the checksummed R2 manifest,
 and closes the session with CAS. Cleanup first claims a durable D1 admission
 fence, derives exact Vectorize IDs and the exact R2 snapshot object set, removes
 and verifies the external projections, and only then deletes authoritative D1
-rows child-first.
+rows child-first. After complete cross-store verification, it atomically
+renames the exact identity-scoped cleanup ledger into a completion receipt. An
+interrupted recovery can replay the retained ledger even after authority has
+already been removed, while a missing ledger and receipt still fails closed.
 It fails if authoritative or search rows remain. Never persist or log the
 one-time token.
 

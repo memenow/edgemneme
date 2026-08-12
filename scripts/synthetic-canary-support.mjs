@@ -416,6 +416,10 @@ export function validateSyntheticCleanupLedger(
   if (
     typeof ledger !== "object" ||
     ledger === null ||
+    Array.isArray(ledger) ||
+    Object.keys(ledger).sort().join(",") !==
+      "principal_id,project_id,r2_keys,schema_version,vector_ids" ||
+    ledger.schema_version !== 1 ||
     ledger.project_id !== expectedProjectId ||
     ledger.principal_id !== expectedPrincipalId ||
     !Array.isArray(ledger.vector_ids) ||
@@ -450,7 +454,7 @@ export async function executeSyntheticCleanup(steps) {
   await steps.verifyProjectionCleanup(ledger);
   await steps.deleteAuthority();
   await steps.verifyAuthorityCleanup();
-  steps.removeLedger();
+  await steps.publishCompletionReceipt(ledger);
 }
 
 export function expectedProjectionObjectKeys(projectId, projectVersion, rows) {

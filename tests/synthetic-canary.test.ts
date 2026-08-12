@@ -441,6 +441,7 @@ describe("synthetic production canary support", () => {
 
   it("rejects cleanup ledgers that escape the exact synthetic project prefix", () => {
     const ledger = {
+      schema_version: 1,
       project_id: "project-1",
       principal_id: "principal-1",
       vector_ids: ["a".repeat(64)],
@@ -456,6 +457,20 @@ describe("synthetic production canary support", () => {
         "principal-1"
       )
     ).toThrow(/exact project scope/iu);
+    for (const invalid of [
+      { ...ledger, schema_version: 2 },
+      { ...ledger, unexpected: true },
+      {
+        project_id: ledger.project_id,
+        principal_id: ledger.principal_id,
+        vector_ids: ledger.vector_ids,
+        r2_keys: ledger.r2_keys
+      }
+    ]) {
+      expect(() =>
+        validateSyntheticCleanupLedger(invalid, "project-1", "principal-1")
+      ).toThrow(/exact project scope/iu);
+    }
   });
 
   it("never deletes authority when external projection cleanup fails", async () => {
@@ -465,7 +480,13 @@ describe("synthetic production canary support", () => {
         claimAdmissionFence: async () => calls.push("fence"),
         waitForQuiescence: async () => calls.push("quiescence"),
         loadLedger: () => null,
-        createLedger: () => ({ vector_ids: [], r2_keys: [] }),
+        createLedger: () => ({
+          schema_version: 1,
+          project_id: "project-1",
+          principal_id: "principal-1",
+          vector_ids: [],
+          r2_keys: []
+        }),
         writeLedger: () => calls.push("ledger"),
         deleteSearchVectors: () => calls.push("delete vectors"),
         verifySearchVectors: () => calls.push("verify vectors"),
@@ -477,7 +498,7 @@ describe("synthetic production canary support", () => {
         verifyProjectionCleanup: () => calls.push("verify projection"),
         deleteAuthority: () => calls.push("authority"),
         verifyAuthorityCleanup: () => calls.push("verify authority"),
-        removeLedger: () => calls.push("remove ledger")
+        publishCompletionReceipt: () => calls.push("publish receipt")
       })
     ).rejects.toThrow(/R2 unavailable/iu);
     expect(calls).toEqual([
@@ -501,7 +522,13 @@ describe("synthetic production canary support", () => {
         },
         waitForQuiescence: async () => calls.push("quiescence"),
         loadLedger: () => null,
-        createLedger: () => ({ vector_ids: [], r2_keys: [] }),
+        createLedger: () => ({
+          schema_version: 1,
+          project_id: "project-1",
+          principal_id: "principal-1",
+          vector_ids: [],
+          r2_keys: []
+        }),
         writeLedger: () => calls.push("ledger"),
         deleteSearchVectors: () => calls.push("delete vectors"),
         verifySearchVectors: () => calls.push("verify vectors"),
@@ -510,9 +537,80 @@ describe("synthetic production canary support", () => {
         verifyProjectionCleanup: () => calls.push("verify projection"),
         deleteAuthority: () => calls.push("authority"),
         verifyAuthorityCleanup: () => calls.push("verify authority"),
-        removeLedger: () => calls.push("remove ledger")
+        publishCompletionReceipt: () => calls.push("publish receipt")
       })
     ).rejects.toThrow(/claim conflict/iu);
     expect(calls).toEqual(["fence"]);
+  });
+
+  it("publishes the cleanup receipt only after verified authority deletion", async () => {
+    const calls: string[] = [];
+    const ledger = {
+      schema_version: 1,
+      project_id: "project-1",
+      principal_id: "principal-1",
+      vector_ids: [],
+      r2_keys: []
+    };
+    await executeSyntheticCleanup({
+      claimAdmissionFence: async () => calls.push("fence"),
+      waitForQuiescence: async () => calls.push("quiescence"),
+      loadLedger: () => ledger,
+      createLedger: () => ledger,
+      writeLedger: () => calls.push("ledger"),
+      deleteSearchVectors: () => calls.push("delete vectors"),
+      verifySearchVectors: () => calls.push("verify vectors"),
+      deleteSearchState: () => calls.push("search state"),
+      deleteR2Projections: () => calls.push("r2"),
+      verifyProjectionCleanup: () => calls.push("verify projection"),
+      deleteAuthority: () => calls.push("authority"),
+      verifyAuthorityCleanup: () => calls.push("verify authority"),
+      publishCompletionReceipt: () => calls.push("publish receipt")
+    });
+
+    expect(calls).toEqual([
+      "fence",
+      "quiescence",
+      "ledger",
+      "delete vectors",
+      "verify vectors",
+      "search state",
+      "r2",
+      "verify projection",
+      "authority",
+      "verify authority",
+      "publish receipt"
+    ]);
+  });
+
+  it("does not publish a cleanup receipt when authority verification fails", async () => {
+    const calls: string[] = [];
+    await expect(
+      executeSyntheticCleanup({
+        claimAdmissionFence: async () => undefined,
+        waitForQuiescence: async () => undefined,
+        loadLedger: () => null,
+        createLedger: () => ({
+          schema_version: 1,
+          project_id: "project-1",
+          principal_id: "principal-1",
+          vector_ids: [],
+          r2_keys: []
+        }),
+        writeLedger: () => undefined,
+        deleteSearchVectors: () => undefined,
+        verifySearchVectors: () => undefined,
+        deleteSearchState: () => undefined,
+        deleteR2Projections: () => undefined,
+        verifyProjectionCleanup: () => undefined,
+        deleteAuthority: () => calls.push("authority"),
+        verifyAuthorityCleanup: () => {
+          calls.push("verify authority");
+          throw new Error("authority remains");
+        },
+        publishCompletionReceipt: () => calls.push("publish receipt")
+      })
+    ).rejects.toThrow(/authority remains/iu);
+    expect(calls).toEqual(["authority", "verify authority"]);
   });
 });

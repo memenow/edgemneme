@@ -34,6 +34,7 @@ export function mergeSyntheticCleanupLedgers(
     }
   }
   const merged = {
+    schema_version: 1,
     project_id: expectedProjectId,
     principal_id: expectedPrincipalId,
     vector_ids: [...vectorIds].sort(),

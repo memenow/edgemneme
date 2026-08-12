@@ -33,7 +33,7 @@ afterEach(() => {
 });
 
 describe("synthetic canary cleanup completion", () => {
-  it("writes a scoped mode-0600 marker and revalidates a completed cleanup without reclaiming it", () => {
+  it("atomically publishes a scoped mode-0600 receipt and revalidates it without reclaiming", () => {
     const harness = createHarness({ allowCleanupFence: true });
 
     const initialCleanup = runCleanupOnly(harness);
@@ -45,7 +45,9 @@ describe("synthetic canary cleanup completion", () => {
     expect(JSON.parse(readFileSync(harness.markerPath, "utf8"))).toEqual({
       schema_version: 1,
       project_id: PROJECT_ID,
-      principal_id: PRINCIPAL_ID
+      principal_id: PRINCIPAL_ID,
+      vector_ids: [],
+      r2_keys: []
     });
     expect(statSync(harness.markerPath).mode & 0o777).toBe(0o600);
 
@@ -56,7 +58,7 @@ describe("synthetic canary cleanup completion", () => {
       "Synthetic cleanup completion revalidated."
     );
     const repeatedCommands = readCommands(harness.commandLogPath);
-    expect(repeatedCommands).toHaveLength(3);
+    expect(repeatedCommands).toHaveLength(5);
     expect(repeatedCommands.every((command) => command.includes("--command"))).toBe(
       true
     );
@@ -64,6 +66,41 @@ describe("synthetic canary cleanup completion", () => {
     expect(
       repeatedCommands.some((command) => command.join(" ").includes("cleanup_claim_id"))
     ).toBe(false);
+  });
+
+  it("recovers a verified authority-absent interruption from the retained ledger", () => {
+    const harness = createHarness({ allowCleanupFence: false });
+    writeFileSync(
+      harness.ledgerPath,
+      `${JSON.stringify({
+        schema_version: 1,
+        project_id: PROJECT_ID,
+        principal_id: PRINCIPAL_ID,
+        vector_ids: [],
+        r2_keys: []
+      })}\n`,
+      { mode: 0o600 }
+    );
+
+    const result = runCleanupOnly(harness);
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain(
+      "Synthetic D1, Vectorize, and R2 records cleaned."
+    );
+    expect(existsSync(harness.ledgerPath)).toBe(false);
+    expect(JSON.parse(readFileSync(harness.markerPath, "utf8"))).toEqual({
+      schema_version: 1,
+      project_id: PROJECT_ID,
+      principal_id: PRINCIPAL_ID,
+      vector_ids: [],
+      r2_keys: []
+    });
+    const commands = readCommands(harness.commandLogPath);
+    expect(
+      commands.some((command) => command.join(" ").includes("cleanup_claim_id"))
+    ).toBe(true);
+    expect(commands.some((command) => command.includes("--file"))).toBe(true);
   });
 
   it("fails closed when exact authority is empty but no completion marker exists", () => {
@@ -88,7 +125,9 @@ describe("synthetic canary cleanup completion", () => {
       `${JSON.stringify({
         schema_version: 1,
         project_id: "33333333-3333-4333-8333-333333333333",
-        principal_id: PRINCIPAL_ID
+        principal_id: PRINCIPAL_ID,
+        vector_ids: [],
+        r2_keys: []
       })}\n`,
       { mode: 0o600 }
     );
@@ -183,8 +222,11 @@ const database = args[args.indexOf("execute") + 1];
 const commandIndex = args.indexOf("--command");
 const command = commandIndex < 0 ? "" : args[commandIndex + 1];
 let rows = [];
-if (command.includes("SELECT cleanup_claim_id FROM synthetic_cleanup_registry")) {
-  rows = ${input.allowCleanupFence ? `[{ cleanup_claim_id: ${JSON.stringify(input.cleanupClaimId)} }]` : "[]"};
+if (
+  command.includes("SELECT cleanup_claim_id, cleanup_fenced_at") &&
+  command.includes("FROM synthetic_cleanup_registry")
+) {
+  rows = ${input.allowCleanupFence ? `[{ cleanup_claim_id: ${JSON.stringify(input.cleanupClaimId)}, cleanup_fenced_at: "2026-08-12T00:00:00.000Z" }]` : "[]"};
 } else if (command.includes("AS pending_outbox")) {
   rows = [{ pending_outbox: 0, pending_workflows: 0 }];
 } else if (
