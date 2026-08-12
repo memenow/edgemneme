@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import { readFileSync, readdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -9,10 +10,15 @@ const MIGRATION_DIRECTORIES = Object.freeze({
   SEARCH_DB: "migrations/search"
 });
 const EXPECTED_SCHEMAS = new Map();
+const REMOTE_SCHEMA_PROBES = new Map();
 const MAX_SCHEMA_OBJECTS = 4_096;
 const MAX_SCHEMA_DETAILS = 32_768;
+const MAX_REMOTE_SCHEMA_SQL_BYTES = 100_000;
+const MAX_REMOTE_SCHEMA_BATCH_STATEMENTS = 64;
+const MAX_REMOTE_SCHEMA_COMPOUND_TERMS = 5;
+const REMOTE_SCHEMA_RESERVED_STATEMENTS = 2;
 
-export const SCHEMA_PROBE_SQL = Object.freeze({
+const LOCAL_SCHEMA_PROBE_SQL = Object.freeze({
   objects: `SELECT type, name, tbl_name AS table_name, sql AS definition
     FROM sqlite_master
     WHERE type IN ('index', 'table', 'trigger', 'view') AND sql IS NOT NULL
@@ -389,10 +395,10 @@ function normalizeIndexes(rows, database, tableNames, schemaObjects) {
 
 function readReferenceProbe(reference) {
   return {
-    objects: reference.prepare(SCHEMA_PROBE_SQL.objects).all(),
-    columns: reference.prepare(SCHEMA_PROBE_SQL.columns).all(),
-    foreignKeys: reference.prepare(SCHEMA_PROBE_SQL.foreignKeys).all(),
-    indexes: reference.prepare(SCHEMA_PROBE_SQL.indexes).all()
+    objects: reference.prepare(LOCAL_SCHEMA_PROBE_SQL.objects).all(),
+    columns: reference.prepare(LOCAL_SCHEMA_PROBE_SQL.columns).all(),
+    foreignKeys: reference.prepare(LOCAL_SCHEMA_PROBE_SQL.foreignKeys).all(),
+    indexes: reference.prepare(LOCAL_SCHEMA_PROBE_SQL.indexes).all()
   };
 }
 
@@ -452,6 +458,116 @@ function expectedSchema(database, migrationCount) {
   } finally {
     reference.close();
   }
+}
+
+function sqlStringLiteral(value, label) {
+  return `'${requireName(value, label).replaceAll("'", "''")}'`;
+}
+
+function boundedRemoteSchemaSql(parts, orderBy, limit, label) {
+  if (!Array.isArray(parts) || parts.length === 0) {
+    throw new Error(`${label} has no known schema identities.`);
+  }
+  const statements = [];
+  for (let offset = 0; offset < parts.length; offset += MAX_REMOTE_SCHEMA_COMPOUND_TERMS) {
+    const sql = `${parts.slice(offset, offset + MAX_REMOTE_SCHEMA_COMPOUND_TERMS)
+      .join("\nUNION ALL\n")}\nORDER BY ${orderBy} LIMIT ${limit}`;
+    if (Buffer.byteLength(sql, "utf8") > MAX_REMOTE_SCHEMA_SQL_BYTES) {
+      throw new Error(`${label} exceeds the remote D1 statement bound.`);
+    }
+    statements.push(sql);
+  }
+  return Object.freeze(statements);
+}
+
+function knownRemoteSchemaIdentities(database) {
+  const tables = new Set();
+  const indexes = new Map();
+  const migrationCount = localMigrationFiles(database).length;
+  for (let count = 1; count <= migrationCount; count += 1) {
+    const probe = expectedSchema(database, count).probe;
+    for (const row of probe.objects) {
+      if (row.type === "table" && !isD1PlatformObject(row.name)) tables.add(row.name);
+    }
+    for (const row of probe.indexes) {
+      if (isD1PlatformObject(row.table_name)) continue;
+      indexes.set(`${row.table_name}\0${row.index_name}`, {
+        table_name: row.table_name,
+        index_name: row.index_name
+      });
+    }
+  }
+  if (tables.size === 0 || tables.size > MAX_SCHEMA_OBJECTS || indexes.size > MAX_SCHEMA_DETAILS) {
+    throw new Error(`${database} known remote schema identities exceed their bounds.`);
+  }
+  return {
+    tables: [...tables].sort(),
+    indexes: [...indexes.values()].sort((left, right) =>
+      `${left.table_name}\0${left.index_name}`.localeCompare(
+        `${right.table_name}\0${right.index_name}`
+      )
+    )
+  };
+}
+
+export function remoteSchemaProbeSql(database) {
+  const cached = REMOTE_SCHEMA_PROBES.get(database);
+  if (cached !== undefined) return cached;
+  const { tables, indexes } = knownRemoteSchemaIdentities(database);
+  const columns = boundedRemoteSchemaSql(
+    tables.map((tableName) => {
+      const table = sqlStringLiteral(tableName, `${database} known table`);
+      return `SELECT ${table} AS table_name, p.cid, p.name AS column_name,
+          p.type AS declared_type, p."notnull" AS not_null,
+          p.dflt_value AS default_value, p.pk AS primary_key, p.hidden
+        FROM pragma_table_xinfo(${table}) AS p`;
+    }),
+    "table_name, cid",
+    MAX_SCHEMA_DETAILS + 1,
+    `${database} remote column probe`
+  );
+  const foreignKeys = boundedRemoteSchemaSql(
+    tables.map((tableName) => {
+      const table = sqlStringLiteral(tableName, `${database} known table`);
+      return `SELECT ${table} AS table_name, p.id, p.seq,
+          p."table" AS referenced_table, p."from" AS from_column,
+          p."to" AS to_column, p.on_update, p.on_delete, p.match
+        FROM pragma_foreign_key_list(${table}) AS p`;
+    }),
+    "table_name, id, seq",
+    MAX_SCHEMA_DETAILS + 1,
+    `${database} remote foreign-key probe`
+  );
+  const indexDetails = boundedRemoteSchemaSql(
+    indexes.map(({ table_name: tableName, index_name: indexName }) => {
+      const table = sqlStringLiteral(tableName, `${database} known index table`);
+      const index = sqlStringLiteral(indexName, `${database} known index`);
+      return `SELECT ${table} AS table_name, il.name AS index_name,
+          il."unique" AS is_unique, il.origin, il.partial,
+          ix.seqno, ix.cid, ix.name AS column_name,
+          ix.desc AS is_descending, ix.coll AS collation, ix.key AS is_key
+        FROM pragma_index_list(${table}) AS il
+        JOIN pragma_index_xinfo(${index}) AS ix
+        WHERE il.name = ${index}`;
+    }),
+    "table_name, index_name, seqno",
+    MAX_SCHEMA_DETAILS + 1,
+    `${database} remote index probe`
+  );
+  if (
+    columns.length + foreignKeys.length + indexDetails.length >
+    MAX_REMOTE_SCHEMA_BATCH_STATEMENTS - REMOTE_SCHEMA_RESERVED_STATEMENTS
+  ) {
+    throw new Error(`${database} remote schema probe exceeds the D1 batch statement bound.`);
+  }
+  const probe = Object.freeze({
+    objects: LOCAL_SCHEMA_PROBE_SQL.objects,
+    columns,
+    foreignKeys,
+    indexes: indexDetails
+  });
+  REMOTE_SCHEMA_PROBES.set(database, probe);
+  return probe;
 }
 
 export function expectedSchemaObjects(database, migrationCount) {
