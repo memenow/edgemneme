@@ -2,6 +2,7 @@ import {
   createCloudflareMaintenanceClient,
   requirePage
 } from "./d1-maintenance-cloudflare-client.mjs";
+import { validateSinglePageList } from "./cloudflare-list-integrity.mjs";
 import {
   maintenanceBindingTargets,
   readActiveWorkerBindings,
@@ -138,19 +139,11 @@ async function readGatewayIngress(client, gatewayPresent) {
   const domainEnvelope = await client.get(`${domainsUrl.pathname}${domainsUrl.search}`, {
     label: "Gateway custom domain query"
   });
-  const domains = domainEnvelope.result;
-  const domainInfo = domainEnvelope.result_info;
-  if (
-    !Array.isArray(domains) ||
-    !Number.isSafeInteger(domainInfo?.count) ||
-    domainInfo.count !== domains.length ||
-    !Number.isSafeInteger(domainInfo?.total_count) ||
-    domainInfo.total_count !== domains.length ||
-    !Number.isSafeInteger(domainInfo?.total_pages) ||
-    ![0, 1].includes(domainInfo.total_pages)
-  ) {
-    throw new Error("Gateway custom domain inventory is incomplete.");
-  }
+  const domains = validateSinglePageList(
+    domainEnvelope,
+    "Gateway custom domain inventory",
+    { allowZeroPerPageWithUnfilteredTotals: true }
+  );
   const normalizedDomains = domains.map((domain) => {
     if (domain?.service !== GATEWAY) throw new Error("Gateway domain query returned another Worker.");
     return identifier(domain?.hostname, "Gateway custom domain hostname");
