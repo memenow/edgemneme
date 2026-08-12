@@ -5,7 +5,7 @@ import {
   localMigrationFiles,
   parseMigrationHistory,
   parseSchemaInventory,
-  SCHEMA_PROBE_SQL
+  remoteSchemaProbeSql
 } from "./d1-maintenance-schema.mjs";
 
 const SEARCH_0005_MIGRATION = "0005_memory_fts_chunk_ledger.sql";
@@ -64,6 +64,40 @@ function requireRows(result, label) {
     throw new Error(`${label} returned an invalid D1 result set.`);
   }
   return result.results;
+}
+
+async function readRemoteSchemaProbe(runtime, database, trailingStatement, label) {
+  const probeSql = remoteSchemaProbeSql(database);
+  const detailStatements = [
+    ...probeSql.columns,
+    ...probeSql.foreignKeys,
+    ...probeSql.indexes
+  ];
+  const results = await runtime.batch(
+    [statement(probeSql.objects), ...detailStatements.map((sql) => statement(sql)), trailingStatement],
+    label
+  );
+  let offset = 0;
+  const objects = requireRows(results[offset], `${database} schema object probe`);
+  offset += 1;
+  const takeDetailRows = (statements, detailLabel) => {
+    const rows = [];
+    for (let index = 0; index < statements.length; index += 1) {
+      rows.push(...requireRows(
+        results[offset],
+        `${database} ${detailLabel} probe part ${index + 1}`
+      ));
+      offset += 1;
+    }
+    return rows;
+  };
+  const columns = takeDetailRows(probeSql.columns, "column");
+  const foreignKeys = takeDetailRows(probeSql.foreignKeys, "foreign-key");
+  const indexes = takeDetailRows(probeSql.indexes, "index");
+  const trailingRows = requireRows(results[offset], `${database} trailing schema probe`);
+  offset += 1;
+  if (offset !== results.length) throw new Error(`${database} schema probe returned extra results.`);
+  return { objects, columns, foreignKeys, indexes, trailingRows };
 }
 
 function exactCount(result, label) {
@@ -159,39 +193,29 @@ function requireExpectedMemorySchema(tables) {
 }
 
 export async function observeMemoryD1(runtime) {
-  const [
-    schemaObjects,
-    schemaColumns,
-    schemaForeignKeys,
-    schemaIndexes,
-    consolidationColumnResult
-  ] = await runtime.batch(
-    [
-      statement(SCHEMA_PROBE_SQL.objects),
-      statement(SCHEMA_PROBE_SQL.columns),
-      statement(SCHEMA_PROBE_SQL.foreignKeys),
-      statement(SCHEMA_PROBE_SQL.indexes),
-      statement(
-        `SELECT name FROM pragma_table_xinfo('session_consolidations')
-         WHERE name IN (
-           'status', 'lease_owner', 'lease_claim_id', 'lease_expires_at',
-           'lease_operation_id'
-         ) ORDER BY cid`
-      )
-    ],
+  const schemaProbe = await readRemoteSchemaProbe(
+    runtime,
+    "MEMORY_DB",
+    statement(
+      `SELECT name FROM pragma_table_xinfo('session_consolidations')
+       WHERE name IN (
+         'status', 'lease_owner', 'lease_claim_id', 'lease_expires_at',
+         'lease_operation_id'
+       ) ORDER BY cid`
+    ),
     "Probe MEMORY_DB maintenance schema"
   );
   const inventory = parseSchemaInventory(
     {
-      objects: requireRows(schemaObjects, "MEMORY_DB schema object probe"),
-      columns: requireRows(schemaColumns, "MEMORY_DB schema column probe"),
-      foreignKeys: requireRows(schemaForeignKeys, "MEMORY_DB schema foreign-key probe"),
-      indexes: requireRows(schemaIndexes, "MEMORY_DB schema index probe")
+      objects: schemaProbe.objects,
+      columns: schemaProbe.columns,
+      foreignKeys: schemaProbe.foreignKeys,
+      indexes: schemaProbe.indexes
     },
     "MEMORY_DB"
   );
   const consolidationColumns = uniqueNames(
-    requireRows(consolidationColumnResult, "MEMORY_DB consolidation column probe"),
+    schemaProbe.trailingRows,
     new Set([
       "status",
       "lease_owner",
@@ -347,36 +371,26 @@ export async function observeMemoryD1(runtime) {
 }
 
 export async function observeSearchD1(runtime) {
-  const [
-    schemaObjects,
-    schemaColumns,
-    schemaForeignKeys,
-    schemaIndexes,
-    columnResult
-  ] = await runtime.batch(
-    [
-      statement(SCHEMA_PROBE_SQL.objects),
-      statement(SCHEMA_PROBE_SQL.columns),
-      statement(SCHEMA_PROBE_SQL.foreignKeys),
-      statement(SCHEMA_PROBE_SQL.indexes),
-      statement(
-        `SELECT name FROM pragma_table_xinfo('memory_projection_heads')
-         WHERE name = 'chunk_count' ORDER BY cid`
-      )
-    ],
+  const schemaProbe = await readRemoteSchemaProbe(
+    runtime,
+    "SEARCH_DB",
+    statement(
+      `SELECT name FROM pragma_table_xinfo('memory_projection_heads')
+       WHERE name = 'chunk_count' ORDER BY cid`
+    ),
     "Probe SEARCH_DB migration 0005 schema"
   );
   const inventory = parseSchemaInventory(
     {
-      objects: requireRows(schemaObjects, "SEARCH_DB schema object probe"),
-      columns: requireRows(schemaColumns, "SEARCH_DB schema column probe"),
-      foreignKeys: requireRows(schemaForeignKeys, "SEARCH_DB schema foreign-key probe"),
-      indexes: requireRows(schemaIndexes, "SEARCH_DB schema index probe")
+      objects: schemaProbe.objects,
+      columns: schemaProbe.columns,
+      foreignKeys: schemaProbe.foreignKeys,
+      indexes: schemaProbe.indexes
     },
     "SEARCH_DB"
   );
   const columns = uniqueNames(
-    requireRows(columnResult, "SEARCH_DB chunk_count probe"),
+    schemaProbe.trailingRows,
     new Set(["chunk_count"]),
     "SEARCH_DB chunk_count probe"
   );

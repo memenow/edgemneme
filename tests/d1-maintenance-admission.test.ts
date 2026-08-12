@@ -142,6 +142,41 @@ function addMigrationTable(probe: SchemaProbe): SchemaProbe {
   return probe;
 }
 
+function quotedPragmaArguments(sql: string, pragma: string): Set<string> {
+  const names = new Set<string>();
+  const pattern = new RegExp(`${pragma}\\('((?:[^']|'')*)'\\)`, "giu");
+  for (const match of sql.matchAll(pattern)) {
+    const argument = match[1];
+    if (argument === undefined) throw new Error("Missing quoted pragma argument");
+    names.add(argument.replaceAll("''", "'"));
+  }
+  return names;
+}
+
+function remoteSchemaBatchResults(
+  requests: D1Statement[],
+  probe: SchemaProbe,
+  trailingRows: Record<string, unknown>[]
+) {
+  return requests.map((request, index) => {
+    if (index === 0) return result(probe.objects);
+    if (index === requests.length - 1) return result(trailingRows);
+    if (request.sql.includes("pragma_foreign_key_list")) {
+      const tables = quotedPragmaArguments(request.sql, "pragma_foreign_key_list");
+      return result(probe.foreignKeys.filter((row) => tables.has(String(row.table_name))));
+    }
+    if (request.sql.includes("pragma_index_xinfo")) {
+      const indexes = quotedPragmaArguments(request.sql, "pragma_index_xinfo");
+      return result(probe.indexes.filter((row) => indexes.has(String(row.index_name))));
+    }
+    if (request.sql.includes("pragma_table_xinfo")) {
+      const tables = quotedPragmaArguments(request.sql, "pragma_table_xinfo");
+      return result(probe.columns.filter((row) => tables.has(String(row.table_name))));
+    }
+    throw new Error("Unexpected remote schema probe statement");
+  });
+}
+
 function searchRuntime(options: {
   appliedMigrations?: string[];
   schemaObjects?: string[];
@@ -170,13 +205,11 @@ function searchRuntime(options: {
       async batch(requests: D1Statement[], label: string) {
         statements.push(...requests);
         if (label === "Probe SEARCH_DB migration 0005 schema") {
-          return [
-            result(observedSchema.objects),
-            result(observedSchema.columns),
-            result(observedSchema.foreignKeys),
-            result(observedSchema.indexes),
-            result((options.columns ?? []).map((name) => ({ name })))
-          ];
+          return remoteSchemaBatchResults(
+            requests,
+            observedSchema,
+            (options.columns ?? []).map((name) => ({ name }))
+          );
         }
         if (label === "Observe SEARCH_DB maintenance counts") {
           return requests.map((request) => {
@@ -259,21 +292,17 @@ function memoryRuntime(
       async batch(requests: D1Statement[], label: string) {
         statements.push(...requests);
         if (label === "Probe MEMORY_DB maintenance schema") {
-          return [
-            result([
-              ...observedSchema.objects
-            ]),
-            result(observedSchema.columns),
-            result(observedSchema.foreignKeys),
-            result(observedSchema.indexes),
-            result((options.consolidationColumns ?? (appliedMigrations.length === 0 ? [] : [
+          return remoteSchemaBatchResults(
+            requests,
+            observedSchema,
+            (options.consolidationColumns ?? (appliedMigrations.length === 0 ? [] : [
               "status",
               "lease_owner",
               "lease_claim_id",
               "lease_expires_at",
               "lease_operation_id"
-            ])).map((name) => ({ name })))
-          ];
+            ])).map((name) => ({ name }))
+          );
         }
         if (label === "Observe MEMORY_DB maintenance counts") {
           return requests.map((request) => {
@@ -525,6 +554,34 @@ describe("SEARCH_DB migration 0005 maintenance preflight", () => {
 });
 
 describe("MEMORY_DB maintenance state", () => {
+  it("uses only fixed schema identities in remote pragma probes", async () => {
+    const observed = memoryRuntime({});
+    const authorizerRuntime = {
+      async batch(requests: D1Statement[], label: string) {
+        for (const request of requests) {
+          const pragmaCalls = request.sql.matchAll(
+            /\bpragma_(?:foreign_key_list|index_list|index_xinfo|table_xinfo)\(([^)]*)\)/giu
+          );
+          for (const match of pragmaCalls) {
+            const argument = match[1];
+            if (argument === undefined || !/^'(?:[^']|'')*'$/u.test(argument.trim())) {
+              throw new Error("not authorized: SQLITE_AUTH");
+            }
+          }
+        }
+        return observed.runtime.batch(requests, label);
+      }
+    };
+
+    await expect(observeMemoryD1(authorizerRuntime)).resolves.toMatchObject({
+      state: "initialized"
+    });
+    const sql = observed.statements.map((statement) => statement.sql).join("\n");
+    expect(sql).toContain("pragma_table_xinfo('projects')");
+    expect(sql).toContain("pragma_index_list('session_consolidations')");
+    expect(sql).not.toMatch(/pragma_[a-z_]+\(\s*(?:m|il)\.name\s*\)/iu);
+  });
+
   it("accepts only an exact object-free database or exact empty Wrangler history as fresh", async () => {
     await expect(observeMemoryD1(memoryRuntime({}, {
       appliedMigrations: [],
