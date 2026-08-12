@@ -73,7 +73,8 @@ const emptyPage = (page: number, perPage: number) => envelope([], {
 function workerControlPlane(
   bindings: Record<string, unknown>[],
   percentages = [100],
-  activeVersionIds = [VERSION_ID]
+  activeVersionIds = [VERSION_ID],
+  queueConsumer?: Record<string, unknown>
 ) {
   const requests: URL[] = [];
   let deploymentQueryCount = 0;
@@ -116,7 +117,25 @@ function workerControlPlane(
       return response(envelope([], { count: 0, total_count: 0, total_pages: 0 }));
     }
     if (path === "/client/v4/zones") return response(emptyPage(1, 50));
-    if (path.endsWith("/queues")) return response(emptyPage(1, 100));
+    if (path.endsWith("/queues")) {
+      if (queueConsumer === undefined) return response(emptyPage(1, 100));
+      return response(envelope([{
+        queue_id: "b".repeat(32),
+        queue_name: "dev-yinyang-agent-email-delivery",
+        consumers_total_count: 1,
+        producers_total_count: 0,
+        producers: []
+      }], {
+        count: 1,
+        page: 1,
+        per_page: 100,
+        total_count: 1,
+        total_pages: 1
+      }));
+    }
+    if (path.endsWith("/consumers") && queueConsumer !== undefined) {
+      return response(envelope([queueConsumer]));
+    }
     if (path.endsWith("/workflows")) return response(emptyPage(1, 100));
     throw new Error(`Unexpected maintenance request ${url}`);
   });
@@ -237,6 +256,81 @@ describe("Cloudflare production maintenance observation", () => {
     expect(requests.filter((url) => url.pathname.endsWith("/deployments"))).toHaveLength(2);
     expect(requests.filter((url) => url.pathname.includes("/versions/"))).toHaveLength(1);
     expect(requests.some((url) => url.pathname.endsWith("/settings"))).toBe(false);
+  });
+
+  it.each([
+    ["live", { script: "dev-yinyang-agent" }],
+    ["service", { service: "dev-yinyang-agent", environment: "production" }],
+    ["documented", { script_name: "dev-yinyang-agent" }],
+    ["consistent", {
+      script: "dev-yinyang-agent",
+      service: "dev-yinyang-agent",
+      script_name: "dev-yinyang-agent"
+    }]
+  ])("records the %s Queue worker consumer identity shape", async (_shape, identity) => {
+    const { fetchMock } = workerControlPlane([], [100], [VERSION_ID], {
+      consumer_id: "c".repeat(32),
+      type: "worker",
+      ...identity
+    });
+
+    await expect(observeCloudflareMaintenance(environment, fetchMock)).resolves.toMatchObject({
+      queues: [{
+        name: "dev-yinyang-agent-email-delivery",
+        consumers: [{
+          id: "c".repeat(32),
+          type: "worker",
+          script: "dev-yinyang-agent"
+        }]
+      }]
+    });
+  });
+
+  it("rejects conflicting Queue worker consumer identities", async () => {
+    const { fetchMock } = workerControlPlane([], [100], [VERSION_ID], {
+      consumer_id: "c".repeat(32),
+      type: "worker",
+      script: "dev-yinyang-agent",
+      script_name: "another-worker"
+    });
+
+    await expect(observeCloudflareMaintenance(environment, fetchMock)).rejects.toThrow(
+      "consumer script is invalid"
+    );
+  });
+
+  it("rejects a Queue worker consumer without an identity", async () => {
+    const { fetchMock } = workerControlPlane([], [100], [VERSION_ID], {
+      consumer_id: "c".repeat(32),
+      type: "worker"
+    });
+
+    await expect(observeCloudflareMaintenance(environment, fetchMock)).rejects.toThrow(
+      "consumer script is invalid"
+    );
+  });
+
+  it("detects a core Worker through the Queue service identity shape", async () => {
+    const { fetchMock } = workerControlPlane([], [100], [VERSION_ID], {
+      consumer_id: "c".repeat(32),
+      type: "worker",
+      service: "edgemneme-memory-orchestrator",
+      environment: "production"
+    });
+
+    const observation = await observeCloudflareMaintenance(environment, fetchMock);
+    expect(violationCodes(observation)).toContain("QUEUE_CONSUMER_ACTIVE");
+  });
+
+  it("records an HTTP pull Queue consumer without a Worker identity", async () => {
+    const { fetchMock } = workerControlPlane([], [100], [VERSION_ID], {
+      consumer_id: "c".repeat(32),
+      type: "http_pull"
+    });
+
+    await expect(observeCloudflareMaintenance(environment, fetchMock)).resolves.toMatchObject({
+      queues: [{ consumers: [{ type: "http_pull", script: null }] }]
+    });
   });
 
   it("validates the backup-only R2 target before reading the live inventory", async () => {

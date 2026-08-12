@@ -689,7 +689,13 @@ ${capabilityClient}
     ]) {
       expect(lifecycle).toContain("/queues");
       expect(lifecycle).toContain("consumers_total_count");
-      expect(lifecycle).toContain('consumer?.script_name === "edgemneme-github-sync"');
+      expect(lifecycle).toContain(
+        "[consumer?.script, consumer?.service, consumer?.script_name]"
+      );
+      expect(lifecycle).toContain("workerScripts.every(validWorkerScript)");
+      expect(lifecycle).toContain("value.trim() === value");
+      expect(lifecycle).toContain("new Set(workerScripts).size === 1");
+      expect(lifecycle).toContain('workerScript === "edgemneme-github-sync"');
       expect(lifecycle).toContain("producers_total_count");
       expect(lifecycle).toContain('producer?.script === "edgemneme-github-sync"');
     }
