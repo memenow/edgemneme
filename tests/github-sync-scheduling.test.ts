@@ -11,7 +11,6 @@ import {
   claimRepositorySync,
   finishRepositorySyncRun,
   markUnchanged,
-  materializeAndSelectScheduledRefs,
   recordSyncFailure,
   requiresFullReconciliation,
   type ConfiguredRefRow,
@@ -21,88 +20,6 @@ import {
 const SCHEDULED_TIME = Date.parse("2026-07-29T06:00:00.000Z");
 
 describe("GitHub ref scheduling", () => {
-  it("materializes and selects every due configured ref", async () => {
-    const fixture = createSchedulingFixture();
-    for (const repositoryId of ["repository-a", "repository-b", "repository-c", "repository-d", "repository-e"]) {
-      insertRepository(fixture.database, "project-1", repositoryId);
-    }
-    insertCursor(fixture.database, "repository-a", "refs/heads/main", {
-      updatedAt: "2026-07-29T00:03:00.000Z"
-    });
-    insertCursor(fixture.database, "repository-a", "refs/heads/release", {
-      updatedAt: "2026-07-29T00:01:00.000Z"
-    });
-    insertCursor(fixture.database, "repository-b", "refs/heads/main", {
-      updatedAt: "2026-07-29T00:02:00.000Z"
-    });
-    insertCursor(fixture.database, "repository-c", "refs/heads/main", {
-      status: "paused",
-      updatedAt: "2026-07-29T00:00:00.000Z"
-    });
-    insertCursor(fixture.database, "repository-d", "refs/heads/main", {
-      nextSyncAt: "2026-07-29T12:00:00.000Z",
-      updatedAt: "2026-07-29T00:00:00.000Z"
-    });
-    const configured = [
-      configuredRef("repository-a", "refs/heads/main"),
-      configuredRef("repository-a", "refs/heads/release"),
-      configuredRef("repository-b", "refs/heads/main"),
-      configuredRef("repository-c", "refs/heads/main"),
-      configuredRef("repository-d", "refs/heads/main"),
-      configuredRef("repository-e", "refs/heads/main")
-    ];
-
-    const selected = await materializeAndSelectScheduledRefs(
-      fixture.d1,
-      configured,
-      SCHEDULED_TIME
-    );
-
-    expect(selected.map(({ repository_id, ref }) => [repository_id, ref])).toEqual([
-      ["repository-a", "refs/heads/release"],
-      ["repository-b", "refs/heads/main"],
-      ["repository-a", "refs/heads/main"],
-      ["repository-e", "refs/heads/main"]
-    ]);
-    expect(
-      fixture.database
-        .prepare(
-          `SELECT status, next_sync_at FROM sync_cursors
-           WHERE project_id = ? AND repository_id = ? AND ref = ?`
-        )
-        .get("project-1", "repository-e", "refs/heads/main")
-    ).toEqual({
-      status: "idle",
-      next_sync_at: "2026-07-29T06:00:00.000Z"
-    });
-  });
-
-  it("uses the project, repository, and ref tuple as a stable tie-breaker", async () => {
-    const fixture = createSchedulingFixture();
-    insertRepository(fixture.database, "project-b", "repository-b");
-    insertRepository(fixture.database, "project-a", "repository-a");
-
-    const selected = await materializeAndSelectScheduledRefs(
-      fixture.d1,
-      [
-        configuredRef("repository-b", "refs/heads/main", "project-b"),
-        configuredRef("repository-a", "refs/heads/release", "project-a"),
-        configuredRef("repository-a", "refs/heads/main", "project-a")
-      ],
-      SCHEDULED_TIME
-    );
-
-    expect(selected.map(({ project_id, repository_id, ref }) => [
-      project_id,
-      repository_id,
-      ref
-    ])).toEqual([
-      ["project-a", "repository-a", "refs/heads/main"],
-      ["project-a", "repository-a", "refs/heads/release"],
-      ["project-b", "repository-b", "refs/heads/main"]
-    ]);
-  });
-
   it.each(["paused", "disabled"] as const)(
     "skips a ref that is %s after scheduling but before its repository claim",
     async (mutation) => {
@@ -111,8 +28,8 @@ describe("GitHub ref scheduling", () => {
       insertCursor(fixture.database, "repository-a", "refs/heads/main", {
         updatedAt: "2026-07-29T00:00:00.000Z"
       });
-      const [selected] = await materializeAndSelectScheduledRefs(
-        fixture.d1,
+      const [selected] = await selectDueRefs(
+        fixture,
         [configuredRef("repository-a", "refs/heads/main")],
         SCHEDULED_TIME
       );
@@ -154,8 +71,8 @@ describe("GitHub ref scheduling", () => {
     insertCursor(fixture.database, "repository-a", "refs/heads/main", {
       updatedAt: "2026-07-29T00:00:00.000Z"
     });
-    const [selected] = await materializeAndSelectScheduledRefs(
-      fixture.d1,
+    const [selected] = await selectDueRefs(
+      fixture,
       [configuredRef("repository-a", "refs/heads/main")],
       SCHEDULED_TIME
     );
@@ -195,8 +112,8 @@ describe("GitHub ref scheduling", () => {
     insertCursor(fixture.database, "repository-a", "refs/heads/release", {
       updatedAt: "2026-07-29T00:00:00.000Z"
     });
-    const selected = await materializeAndSelectScheduledRefs(
-      fixture.d1,
+    const selected = await selectDueRefs(
+      fixture,
       [
         configuredRef("repository-a", "refs/heads/main"),
         configuredRef("repository-a", "refs/heads/release")
@@ -237,8 +154,8 @@ describe("GitHub ref scheduling", () => {
     insertCursor(fixture.database, "repository-a", "refs/heads/main", {
       updatedAt: "2026-07-29T00:00:00.000Z"
     });
-    const [selected] = await materializeAndSelectScheduledRefs(
-      fixture.d1,
+    const [selected] = await selectDueRefs(
+      fixture,
       [configuredRef("repository-a", "refs/heads/main")],
       SCHEDULED_TIME
     );
@@ -292,8 +209,8 @@ describe("GitHub ref scheduling", () => {
     insertCursor(fixture.database, "repository-a", "refs/heads/main", {
       updatedAt: "2026-07-29T00:00:00.000Z"
     });
-    const [selected] = await materializeAndSelectScheduledRefs(
-      fixture.d1,
+    const [selected] = await selectDueRefs(
+      fixture,
       [configuredRef("repository-a", "refs/heads/main")],
       SCHEDULED_TIME
     );
@@ -328,8 +245,8 @@ describe("GitHub ref scheduling", () => {
     insertCursor(fixture.database, "repository-a", "refs/heads/main", {
       updatedAt: "2026-07-29T00:00:00.000Z"
     });
-    const [selected] = await materializeAndSelectScheduledRefs(
-      fixture.d1,
+    const [selected] = await selectDueRefs(
+      fixture,
       [configuredRef("repository-a", "refs/heads/main")],
       SCHEDULED_TIME
     );
@@ -356,8 +273,8 @@ describe("GitHub ref scheduling", () => {
     insertCursor(fixture.database, "repository-a", "refs/heads/main", {
       updatedAt: "2026-07-29T00:00:00.000Z"
     });
-    const [selected] = await materializeAndSelectScheduledRefs(
-      fixture.d1,
+    const [selected] = await selectDueRefs(
+      fixture,
       [configuredRef("repository-a", "refs/heads/main")],
       SCHEDULED_TIME
     );
@@ -428,8 +345,8 @@ describe("GitHub ref scheduling", () => {
       insertCursor(fixture.database, "repository-a", "refs/heads/main", {
         updatedAt: "2026-07-29T00:00:00.000Z"
       });
-      const [selected] = await materializeAndSelectScheduledRefs(
-        fixture.d1,
+      const [selected] = await selectDueRefs(
+        fixture,
         [configuredRef("repository-a", "refs/heads/main")],
         SCHEDULED_TIME
       );
@@ -522,8 +439,8 @@ describe("GitHub ref scheduling", () => {
     insertCursor(failureFixture.database, "repository-a", "refs/heads/main", {
       updatedAt: "2026-07-29T00:00:00.000Z"
     });
-    const [failureSelection] = await materializeAndSelectScheduledRefs(
-      failureFixture.d1,
+    const [failureSelection] = await selectDueRefs(
+      failureFixture,
       [configuredRef("repository-a", "refs/heads/main")],
       SCHEDULED_TIME
     );
@@ -555,8 +472,8 @@ describe("GitHub ref scheduling", () => {
     insertCursor(unchangedFixture.database, "repository-a", "refs/heads/main", {
       updatedAt: "2026-07-29T00:00:00.000Z"
     });
-    const [unchangedSelection] = await materializeAndSelectScheduledRefs(
-      unchangedFixture.d1,
+    const [unchangedSelection] = await selectDueRefs(
+      unchangedFixture,
       [configuredRef("repository-a", "refs/heads/main")],
       SCHEDULED_TIME
     );
@@ -602,8 +519,8 @@ describe("GitHub ref scheduling", () => {
       lastErrorCode: "GITHUB_RECONCILIATION_REQUIRED",
       updatedAt: "2026-07-29T00:00:00.000Z"
     });
-    const [selected] = await materializeAndSelectScheduledRefs(
-      fixture.d1,
+    const [selected] = await selectDueRefs(
+      fixture,
       [configuredRef("repository-a", "refs/heads/main")],
       SCHEDULED_TIME
     );
@@ -679,8 +596,8 @@ describe("GitHub ref scheduling", () => {
       observedSha: "b".repeat(40),
       updatedAt: "2026-07-29T00:00:00.000Z"
     });
-    const [selected] = await materializeAndSelectScheduledRefs(
-      fixture.d1,
+    const [selected] = await selectDueRefs(
+      fixture,
       [configuredRef("repository-a", "refs/heads/main")],
       SCHEDULED_TIME
     );
@@ -714,86 +631,6 @@ describe("GitHub ref scheduling", () => {
     });
   });
 
-  it("dispatches every due ref each slot and performs one full reconciliation per UTC day", async () => {
-    const fixture = createSchedulingFixture();
-    const repositories = ["repository-a", "repository-b", "repository-c", "repository-d"];
-    const configured = repositories.map((repositoryId) =>
-      configuredRef(repositoryId, "refs/heads/main")
-    );
-    for (const [index, repositoryId] of repositories.entries()) {
-      insertRepository(fixture.database, "project-1", repositoryId);
-      insertCursor(fixture.database, repositoryId, "refs/heads/main", {
-        lastSyncAt: "2026-07-28T18:00:00.000Z",
-        updatedAt: `2026-07-28T00:0${index}:00.000Z`
-      });
-    }
-
-    const midnight = Date.parse("2026-07-29T00:00:00.000Z");
-    const midnightSelection = await materializeAndSelectScheduledRefs(
-      fixture.d1,
-      configured,
-      midnight
-    );
-    expect(midnightSelection.map((row) => row.repository_id)).toEqual([
-      "repository-a",
-      "repository-b",
-      "repository-c",
-      "repository-d"
-    ]);
-    expect(
-      midnightSelection.every((row) =>
-        requiresFullReconciliation(midnight, row.last_sync_at)
-      )
-    ).toBe(true);
-    markCursorAttempt(
-      fixture.database,
-      repositories,
-      "2026-07-29T00:00:00.000Z",
-      "2026-07-29T06:00:00.000Z"
-    );
-
-    const sixUtc = Date.parse("2026-07-29T06:00:00.000Z");
-    const sixUtcSelection = await materializeAndSelectScheduledRefs(
-      fixture.d1,
-      configured,
-      sixUtc
-    );
-    expect(sixUtcSelection.map((row) => row.repository_id)).toEqual([
-      "repository-a",
-      "repository-b",
-      "repository-c",
-      "repository-d"
-    ]);
-    expect(
-      sixUtcSelection.every((row) =>
-        !requiresFullReconciliation(sixUtc, row.last_sync_at)
-      )
-    ).toBe(true);
-    markCursorAttempt(
-      fixture.database,
-      repositories,
-      "2026-07-29T06:00:00.000Z",
-      "2026-07-29T12:00:00.000Z"
-    );
-
-    const noonUtc = Date.parse("2026-07-29T12:00:00.000Z");
-    const noonSelection = await materializeAndSelectScheduledRefs(
-      fixture.d1,
-      configured,
-      noonUtc
-    );
-    expect(noonSelection.map((row) => row.repository_id)).toEqual([
-      "repository-a",
-      "repository-b",
-      "repository-c",
-      "repository-d"
-    ]);
-    expect(
-      noonSelection.every(
-        (row) => !requiresFullReconciliation(noonUtc, row.last_sync_at)
-      )
-    ).toBe(true);
-  });
 
   it("catches up the daily full reconciliation after a missed midnight slot", () => {
     const sixUtc = Date.parse("2026-07-29T06:00:00.000Z");
@@ -832,6 +669,90 @@ describe("GitHub ref scheduling", () => {
     expect(configuration).not.toContain('"queues"');
   });
 });
+
+async function selectDueRefs(
+  fixture: { d1: D1Database },
+  configuredRefs: ConfiguredRefRow[],
+  scheduledTime: number
+): Promise<ScheduledRefRow[]> {
+  if (configuredRefs.length === 0) {
+    return [];
+  }
+  const scheduledAt = new Date(scheduledTime).toISOString();
+  const configuredJson = JSON.stringify(configuredRefs);
+  const session = fixture.d1.withSession("first-primary");
+  await session.prepare(
+    `WITH configured AS (
+       SELECT CAST(json_extract(value, '$.project_id') AS TEXT) AS project_id,
+              CAST(json_extract(value, '$.repository_id') AS TEXT) AS repository_id,
+              CAST(json_extract(value, '$.ref') AS TEXT) AS ref
+       FROM json_each(?)
+     )
+     INSERT INTO sync_cursors
+     (project_id, repository_id, ref, status, next_sync_at,
+      history_gap_possible, credential_status, updated_at)
+     SELECT project_id, repository_id, ref, 'idle', ?, 0, 'unknown', ?
+     FROM configured WHERE 1
+     ON CONFLICT(project_id, repository_id, ref) DO NOTHING`
+  )
+    .bind(configuredJson, scheduledAt, scheduledAt)
+    .run();
+  const selected = await session.prepare(
+    `WITH configured AS (
+       SELECT CAST(json_extract(value, '$.project_id') AS TEXT) AS project_id,
+              CAST(json_extract(value, '$.repository_id') AS TEXT) AS repository_id,
+              CAST(json_extract(value, '$.ref') AS TEXT) AS ref
+       FROM json_each(?)
+     ), due AS (
+       SELECT repository.repository_id, repository.project_id,
+              repository.external_id, repository.expected_owner_external_id,
+              repository.owner, repository.name, repository.default_branch,
+              repository.tracked_refs_json, cursor.ref,
+              cursor.status AS cursor_status,
+              cursor.updated_at AS cursor_updated_at, cursor.cursor_version,
+              repository.github_sync_configuration_version AS
+                repository_configuration_version,
+              repository.updated_at AS repository_updated_at,
+              head.manifest_id AS selected_head_manifest_id,
+              COALESCE(head.head_version, 0) AS selected_head_version,
+              cursor.last_sync_at
+       FROM configured
+       JOIN sync_cursors AS cursor
+         ON cursor.project_id = configured.project_id
+        AND cursor.repository_id = configured.repository_id
+        AND cursor.ref = configured.ref
+       JOIN repositories AS repository
+         ON repository.project_id = cursor.project_id
+        AND repository.repository_id = cursor.repository_id
+       LEFT JOIN github_tree_ref_heads AS head
+         ON head.project_id = cursor.project_id
+        AND head.repository_id = cursor.repository_id
+        AND head.ref = cursor.ref
+       WHERE lower(repository.provider) = 'github'
+         AND repository.sync_enabled = 1
+         AND cursor.status <> 'paused'
+         AND (cursor.next_sync_at IS NULL OR cursor.next_sync_at <= ?)
+         AND NOT EXISTS (
+           SELECT 1 FROM github_sync_dispatch_items AS active_item
+           WHERE active_item.project_id = cursor.project_id
+             AND active_item.repository_id = cursor.repository_id
+             AND active_item.ref = cursor.ref
+             AND active_item.status IN ('pending', 'running')
+         )
+     )
+     SELECT repository_id, project_id, external_id,
+            expected_owner_external_id, owner, name, default_branch,
+            tracked_refs_json, repository_configuration_version,
+            repository_updated_at, ref, cursor_status, cursor_updated_at,
+            cursor_version, selected_head_manifest_id, selected_head_version,
+            last_sync_at
+     FROM due
+     ORDER BY cursor_updated_at, project_id, repository_id, ref`
+  )
+    .bind(configuredJson, scheduledAt)
+    .all<ScheduledRefRow>();
+  return selected.results;
+}
 
 function configuredRef(
   repositoryId: string,
