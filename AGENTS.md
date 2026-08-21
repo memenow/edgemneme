@@ -27,8 +27,6 @@
 - `workers/github-sync/` owns the private scheduled GitHub reader and its
   Workflow entrypoints. Preserve its disabled-by-default credential and
   schedule gates.
-- `workers/claude-runner/` is a disabled boundary. It must not gain authority or
-  enter the default deployment path without an explicit architecture change.
 - The directories under `src/` own the shared domain named by the directory:
   contracts, security, storage, gateway, GitHub synchronization, quality,
   search, projection, and workflows. Worker entrypoints may depend on these

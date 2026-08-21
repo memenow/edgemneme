@@ -16,7 +16,7 @@
     "projection:rebuild:plan": "node scripts/enqueue-projection-rebuild.mjs plan",
     "projection:rebuild:enqueue": "node scripts/enqueue-projection-rebuild.mjs enqueue",
     "projection:rebuild:verify": "node scripts/enqueue-projection-rebuild.mjs verify",
-    "wrangler:check": "wrangler deploy --dry-run --config wrangler/memory-gateway.jsonc && wrangler deploy --dry-run --config wrangler/memory-orchestrator.jsonc && wrangler deploy --dry-run --config wrangler/github-sync.jsonc && wrangler deploy --dry-run --config wrangler/claude-runner.jsonc"
+    "wrangler:check": "wrangler deploy --dry-run --config wrangler/memory-gateway.jsonc && wrangler deploy --dry-run --config wrangler/memory-orchestrator.jsonc && wrangler deploy --dry-run --config wrangler/github-sync.jsonc"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.29.0",

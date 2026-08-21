@@ -21,11 +21,9 @@ vi.mock("node:fs", async (importOriginal) => {
 
 // The deployment runtime is plain ESM so GitHub Actions can run it without a TS runtime.
 // @ts-expect-error The JavaScript module has no separate declaration file.
-import { createD1RestRuntime } from "../scripts/github-sync-quiescence-runtime.mjs";
-// @ts-expect-error The JavaScript module has no separate declaration file.
-import { batchWithVerification } from "../scripts/github-sync-quiescence-contracts.mjs";
+import { createD1RestRuntime } from "../scripts/d1-rest-runtime.mjs";
 
-describe("GitHub sync quiescence D1 REST runtime", () => {
+describe("D1 REST runtime", () => {
   beforeEach(() => {
     vi.stubEnv("CLOUDFLARE_ACCOUNT_ID", ACCOUNT_ID);
     vi.stubEnv("CLOUDFLARE_API_TOKEN", TOKEN);
@@ -191,32 +189,19 @@ describe("GitHub sync quiescence D1 REST runtime", () => {
     ).rejects.toThrow("oversized Cloudflare D1 response");
   });
 
-  it("recovers an ambiguous mutation response only through an exact primary read", async () => {
+  it("executes a batch against the primary unchanged", async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(response({
         success: true,
-        result: [{ success: true, meta: { served_by_primary: true } }]
-      }))
-      .mockResolvedValueOnce(response({
-        success: true,
-        result: [primaryResult([{ matches: 1 }])]
+        result: [{ success: true, results: [], meta: { served_by_primary: true } }]
       }));
     vi.stubGlobal("fetch", fetchMock);
     const runtime = createD1RestRuntime(CONFIG);
-    await expect(batchWithVerification(
-      runtime,
+    await expect(runtime.batch(
       [{ sql: "UPDATE synthetic SET value = 1", params: [] }],
-      "Ambiguous mutation",
-      async () => {
-        const exact = await runtime.query(
-          "SELECT 1 AS matches",
-          [],
-          "Verify ambiguous mutation"
-        );
-        return exact.results.length === 1 && exact.results[0]?.matches === 1;
-      }
-    )).resolves.toBeUndefined();
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+      "Primary batch"
+    )).resolves.toHaveLength(1);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it("enforces batch, SQL, scalar, and aggregate request bounds before fetch", async () => {

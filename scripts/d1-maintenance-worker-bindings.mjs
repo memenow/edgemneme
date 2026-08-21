@@ -1,4 +1,4 @@
-import { readGeneratedD1DatabaseId } from "./github-sync-quiescence-runtime.mjs";
+import { readGeneratedD1DatabaseId } from "./d1-rest-runtime.mjs";
 import { d1MigrationBackupBucketName } from "./verify-d1-backup-bucket.mjs";
 
 const GATEWAY = "edgemneme-memory-gateway";

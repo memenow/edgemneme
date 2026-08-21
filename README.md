@@ -26,8 +26,6 @@ bundle checks. A deployment requires provisioned Cloudflare resources, remote
 migrations, Worker secrets, the isolated end-to-end synthetic canary, and the
 quality gates in [Operations](docs/operations.md). GitHub synchronization remains disabled until
 a separately approved credential and repository-access baseline are present.
-The optional Claude conflict advisor is deliberately disabled and is never part
-of the default deployment path.
 
 ## Architecture
 
@@ -88,9 +86,6 @@ of the default deployment path.
   writes it at order zero when present. The orchestrator reserves 1,500,000
   subrequests against a retry-aware minimum of 1,152,068 for the full admitted
   boundary.
-- `claude-runner` is present as a disabled boundary only. It is not part of the
-  default deployment path.
-
 See [Architecture](docs/architecture.md), [MCP API](docs/mcp-api.md), and
 [Security](docs/security.md).
 
@@ -323,7 +318,6 @@ tests/                       Deterministic unit and security contract tests
 workers/memory-gateway/      Public Streamable HTTP MCP Worker
 workers/memory-orchestrator/ Queue, Workflow, and Durable Object Worker
 workers/github-sync/         Private Workflow-backed GitHub reader
-workers/claude-runner/       Disabled optional escalation boundary
 wrangler/                    One source-of-truth configuration per Worker
 .github/workflows/           Validation, deployment, and manual migration workflows
 docs/                        Architecture, API, security, and operations

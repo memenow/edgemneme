@@ -1,4 +1,4 @@
-import { createD1BindingRestRuntime } from "./github-sync-quiescence-runtime.mjs";
+import { createD1BindingRestRuntime } from "./d1-rest-runtime.mjs";
 import {
   assertMigrationTableContract,
   assertExpectedSchemaInventory,

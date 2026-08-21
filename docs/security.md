@@ -7,8 +7,6 @@
 - `github-sync` is the only Worker that receives `GITHUB_CLASSIC_TOKEN`.
 - `memory-orchestrator` receives D1, R2, Vectorize, Workers AI, Queue, Workflow,
   and Durable Object bindings, but no GitHub or MCP credential.
-- `claude-runner` is disabled and receives no D1 write, GitHub, or MCP
-  credential.
 
 Secrets are configured through Worker secrets or protected GitHub environment
 secrets. Cloudflare resource identifiers and rate-limit namespace identifiers
