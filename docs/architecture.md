@@ -279,10 +279,13 @@ ACL and cannot browse the project manifest or project indexes.
 
 D1 Sessions provide sequential consistency, not snapshot isolation. Operations
 that must start from the newest state use `first-primary`. Pagination tokens
-bind the project, principal, optional session, resolved repository ceiling,
-normalized query digest, snapshot version, cursor, and expiry with HMAC-SHA-256.
-The gateway rejects a token when the principal or session changes or after the
-project version changes.
+are opaque, unsigned continuation markers binding the project, query digest,
+snapshot version, and sort cursor. Every field is revalidated server-side:
+the project must match the authenticated principal, the query digest must
+match the current query, and the snapshot version must match the live project
+version, so the gateway rejects a token when the project changes. Temporal
+validity filtering always uses the server's current time, never a
+client-supplied timestamp.
 
 Durable Object input gates do not keep requests serialized while arbitrary
 external I/O is awaited. Correctness therefore remains in D1 constraints and

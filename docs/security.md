@@ -12,6 +12,17 @@ Consequence: generic MCP clients that require OAuth discovery
 EdgeMneme ever serves such clients, add an OAuth 2.1 resource-server layer in
 front of the gateway rather than weakening the token contract.
 
+## Pagination cursors
+
+Pagination tokens are unsigned opaque continuation markers. A cursor only
+contains the project, query digest, snapshot version, and sort key; the
+gateway revalidates every field against the authenticated principal, the
+current query, and the live project version on each page. Temporal validity
+filtering always uses the server's current time, so a client cannot select a
+validity window. A replayed cursor can therefore only re-read data the
+principal is already authorized to see, and only while the project version
+remains unchanged.
+
 ## Credential boundaries
 
 - `memory-gateway` receives only its token-digest pepper and page-token HMAC

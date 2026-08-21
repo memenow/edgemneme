@@ -6,31 +6,23 @@ export interface PageTokenPayload {
   queryDigest: string;
   snapshotVersion: number;
   lastSortKey: string;
-  validAt: string;
-  expiresAt: number;
 }
 
 interface PageTokenContext {
   projectId: string;
   queryDigest: string;
-  nowEpochSeconds: number;
 }
 
-const PAGE_TOKEN_VERSION = 3;
+const PAGE_TOKEN_VERSION = 4;
 
 export function createPageToken(payload: PageTokenPayload): string {
-  if (!isCanonicalTimestamp(payload.validAt)) {
-    throw new TypeError("The page validity timestamp must be a canonical ISO timestamp.");
-  }
   const body = new TextEncoder().encode(
     JSON.stringify({
       v: PAGE_TOKEN_VERSION,
       p: payload.projectId,
       q: payload.queryDigest,
       s: payload.snapshotVersion,
-      c: payload.lastSortKey,
-      t: payload.validAt,
-      e: payload.expiresAt
+      c: payload.lastSortKey
     })
   );
   return encodeBase64Url(body);
@@ -51,12 +43,7 @@ export function readPageToken(
       typeof parsed.s !== "number" ||
       !Number.isSafeInteger(parsed.s) ||
       parsed.s < 0 ||
-      typeof parsed.c !== "string" ||
-      typeof parsed.t !== "string" ||
-      !isCanonicalTimestamp(parsed.t) ||
-      typeof parsed.e !== "number" ||
-      !Number.isSafeInteger(parsed.e) ||
-      parsed.e < context.nowEpochSeconds
+      typeof parsed.c !== "string"
     ) {
       throw new Error("Token context mismatch.");
     }
@@ -64,16 +51,9 @@ export function readPageToken(
       projectId: parsed.p as string,
       queryDigest: parsed.q as string,
       snapshotVersion: parsed.s,
-      lastSortKey: parsed.c,
-      validAt: parsed.t,
-      expiresAt: parsed.e
+      lastSortKey: parsed.c
     };
   } catch {
-    throw new EdgeMnemeError("PAGE_TOKEN_INVALID", "The page token is invalid or expired.");
+    throw new EdgeMnemeError("PAGE_TOKEN_INVALID", "The page token is invalid.");
   }
-}
-
-function isCanonicalTimestamp(value: string): boolean {
-  const milliseconds = Date.parse(value);
-  return Number.isFinite(milliseconds) && new Date(milliseconds).toISOString() === value;
 }

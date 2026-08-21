@@ -351,7 +351,6 @@ jobs:
       - name: Create ephemeral gateway secret file
         env:
           TOKEN_DIGEST_PEPPER: ${{ secrets.TOKEN_DIGEST_PEPPER }}
-          PAGE_TOKEN_HMAC_KEY: ${{ secrets.PAGE_TOKEN_HMAC_KEY }}
         shell: bash
         run: |
           set -euo pipefail
@@ -360,7 +359,7 @@ jobs:
 
           const directory = "wrangler/.wrangler";
           mkdirSync(directory, { recursive: true, mode: 0o700 });
-          const entries = ["TOKEN_DIGEST_PEPPER", "PAGE_TOKEN_HMAC_KEY"].map((name) => {
+          const entries = ["TOKEN_DIGEST_PEPPER"].map((name) => {
             const value = process.env[name];
             if (!value) {
               throw new Error(`Required Worker secret ${name} is missing.`);
@@ -867,6 +866,16 @@ jobs:
           }
           NODE
           assert_active_tagged_version "$deployed_version" "$expected_tag"
+
+      - name: Deploy disabled GitHub sync
+        if: vars.ENABLE_GITHUB_SYNC == 'false'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: >-
+          pnpm exec wrangler deploy --strict
+          --tag "github-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-github-sync-disabled"
+          --config wrangler/.wrangler/github-sync.generated.jsonc
 
       - name: Remove GitHub sync secret file
         if: always() && vars.ENABLE_GITHUB_SYNC == 'true'

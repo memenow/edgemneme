@@ -358,15 +358,14 @@ export class GatewayService {
         authorizedRepositoryIds: authorizedRepositoryIds ?? null
       })
     );
-    let validAt = new Date().toISOString();
+    const validAt = new Date().toISOString();
     let cursor: PageTokenPayload | undefined;
     if (input.pageToken !== undefined) {
       cursor = readPageToken(
         input.pageToken,
         {
           projectId: this.principal.projectId,
-          queryDigest,
-          nowEpochSeconds: Math.floor(Date.now() / 1000)
+          queryDigest
         }
       );
       if (cursor.snapshotVersion !== snapshotVersion) {
@@ -375,7 +374,6 @@ export class GatewayService {
           "The page token no longer matches the project snapshot."
         );
       }
-      validAt = cursor.validAt;
     }
     conditions.push("(v.valid_from IS NULL OR julianday(v.valid_from) <= julianday(?))");
     conditions.push("(v.valid_until IS NULL OR julianday(v.valid_until) > julianday(?))");
@@ -419,9 +417,7 @@ export class GatewayService {
             projectId: this.principal.projectId,
             queryDigest,
             snapshotVersion,
-            lastSortKey: `${last.updated_at}|${last.memory_id}`,
-            validAt,
-            expiresAt: Math.floor(Date.now() / 1000) + 15 * 60
+            lastSortKey: `${last.updated_at}|${last.memory_id}`
           })
         : null;
     return {

@@ -18,7 +18,7 @@ describe("GatewayService memory browse", () => {
     vi.useRealTimers();
   });
 
-  it("uses one signed validity instant across every page", async () => {
+  it("uses the server's current validity instant on every page", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-07-25T12:00:00.000Z"));
     const records: QueryRecord[] = [];
@@ -125,8 +125,8 @@ describe("GatewayService memory browse", () => {
     expect(browseRecords[1]?.bindings).toEqual([
       "project-1",
       "principal-1",
-      "2026-07-25T12:00:00.000Z",
-      "2026-07-25T12:00:00.000Z",
+      "2026-07-25T12:05:00.000Z",
+      "2026-07-25T12:05:00.000Z",
       "2026-07-25T11:00:00.000Z",
       "2026-07-25T11:00:00.000Z",
       "memory-1",
