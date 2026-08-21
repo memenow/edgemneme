@@ -231,7 +231,7 @@ async function main(argv) {
   process.stderr.write(`${JSON.stringify({
     status: "ready",
     mode: "greenfield-only",
-    search_0005: result.observation.d1.search.state,
+    search_state: result.observation.d1.search.state,
     queue_metrics_are_approximate_corroboration_only: true,
     queues: queueEvidence
   })}\n`);

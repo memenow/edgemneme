@@ -8,8 +8,6 @@ import {
   remoteSchemaProbeSql
 } from "./d1-maintenance-schema.mjs";
 
-const SEARCH_0005_MIGRATION = "0005_memory_fts_chunk_ledger.sql";
-
 const MEMORY_TABLES = Object.freeze([
   "github_credential_sync_lane",
   "github_repository_sync_runs",
@@ -36,10 +34,10 @@ const SEARCH_TABLES = Object.freeze([
 
 const SELECT_ONLY = /^\s*(?:SELECT|WITH\s+[^;]+\s+SELECT)\b/iu;
 
-export class Search0005AdmissionError extends Error {
+export class SearchAdmissionError extends Error {
   constructor(code, message) {
     super(`${code}: ${message}`);
-    this.name = "Search0005AdmissionError";
+    this.name = "SearchAdmissionError";
     this.code = code;
   }
 }
@@ -378,7 +376,7 @@ export async function observeSearchD1(runtime) {
       `SELECT name FROM pragma_table_xinfo('memory_projection_heads')
        WHERE name = 'chunk_count' ORDER BY cid`
     ),
-    "Probe SEARCH_DB migration 0005 schema"
+    "Probe SEARCH_DB chunk ledger schema"
   );
   const inventory = parseSchemaInventory(
     {
@@ -398,8 +396,8 @@ export async function observeSearchD1(runtime) {
   let state;
   if (!inventory.hasMigrationTable) {
     if (inventory.objects.length !== 0 || columns.length !== 0) {
-      throw new Search0005AdmissionError(
-        "SEARCH_0005_MIXED_SCHEMA",
+      throw new SearchAdmissionError(
+        "SEARCH_MIXED_SCHEMA",
         "SEARCH_DB is neither exact fresh nor backed by a migration history"
       );
     }
@@ -410,22 +408,18 @@ export async function observeSearchD1(runtime) {
     assertExpectedSchemaInventory("SEARCH_DB", appliedMigrations.length, inventory.schema);
     if (appliedMigrations.length === 0) {
       if (columns.length !== 0) {
-        throw new Search0005AdmissionError(
-          "SEARCH_0005_MIXED_SCHEMA",
+        throw new SearchAdmissionError(
+          "SEARCH_MIXED_SCHEMA",
           "an empty migration history has residual chunk-ledger columns"
         );
       }
       state = "fresh";
-    } else if (appliedMigrations.length < 4) {
-      throw new Search0005AdmissionError(
-        "SEARCH_0005_MIGRATION_HISTORY_INCOMPLETE",
-        "SEARCH_DB must be exact fresh or have the complete 0001-0004 migration prefix"
-      );
     } else {
-      state = appliedMigrations.includes(SEARCH_0005_MIGRATION) ? "post0005" : "pre0005";
-      if ((state === "post0005") !== (columns.length === 1)) {
-        throw new Search0005AdmissionError(
-          "SEARCH_0005_MIXED_SCHEMA",
+      // parseMigrationHistory already proved the exact local prefix.
+      state = "installed";
+      if (columns.length !== 1) {
+        throw new SearchAdmissionError(
+          "SEARCH_MIXED_SCHEMA",
           "the migration history and chunk_count column do not form one complete state"
         );
       }
@@ -447,7 +441,7 @@ export async function observeSearchD1(runtime) {
     "memory_projection_heads",
     "SELECT COUNT(*) AS count FROM memory_projection_heads"
   );
-  if (state === "post0005") {
+  if (state === "installed") {
     addCount(
       "chunk_ledger",
       "memory_fts_chunk_ledger",
@@ -493,13 +487,6 @@ export async function observeSearchD1(runtime) {
   const counts = Object.fromEntries(
     countChecks.map(([name], index) => [name, exactCount(countResults[index], `SEARCH_DB ${name}`)])
   );
-  const legacyRows = (counts.legacy_fts ?? 0) + (counts.legacy_heads ?? 0);
-  if (state === "pre0005" && legacyRows !== 0) {
-    throw new Search0005AdmissionError(
-      "SEARCH_0005_LEGACY_PROJECTION_NOT_EMPTY",
-      "clear the rebuildable memory_fts and memory_projection_heads projections under maintenance before retrying; admission never deletes them"
-    );
-  }
   const inflightNames = [
     "write_leases",
     "projection_deletions",
@@ -520,7 +507,7 @@ export async function observeSearchD1(runtime) {
     applied_migrations: appliedMigrations,
     tables,
     objects: inventory.objects,
-    migration_count: appliedMigrations.includes(SEARCH_0005_MIGRATION) ? 1 : 0,
+    migration_count: appliedMigrations.length,
     counts: Object.freeze(counts),
     inflight,
     production_rows: productionRows

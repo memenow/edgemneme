@@ -10,11 +10,7 @@ import {
 import { reapSearchVectorCleanupReceipts } from "../src/search/vector-cleanup-janitor";
 
 const SEARCH_MIGRATIONS = [
-  "migrations/search/0001_fts.sql",
-  "migrations/search/0002_activate_qwen_generation.sql",
-  "migrations/search/0003_projection_heads.sql",
-  "migrations/search/0004_repository_partition.sql",
-  "migrations/search/0005_memory_fts_chunk_ledger.sql"
+  "migrations/search/0001_initial.sql"
 ] as const;
 const GENERATION_ID = "qwen3-embedding-0.6b-chunk-2026-07-25";
 

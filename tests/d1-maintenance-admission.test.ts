@@ -14,7 +14,7 @@ const {
   runMaintenanceAdmission
 } = maintenanceAdmissionModule;
 const {
-  Search0005AdmissionError,
+  SearchAdmissionError,
   assertReadOnlyD1Statement,
   observeMemoryD1,
   observeSearchD1
@@ -204,7 +204,7 @@ function searchRuntime(options: {
     runtime: {
       async batch(requests: D1Statement[], label: string) {
         statements.push(...requests);
-        if (label === "Probe SEARCH_DB migration 0005 schema") {
+        if (label === "Probe SEARCH_DB chunk ledger schema") {
           return remoteSchemaBatchResults(
             requests,
             observedSchema,
@@ -375,7 +375,7 @@ function greenfieldObservation(): any {
     d1: {
       memory: { state: "fresh", tables: [], counts: {}, inflight: 0, production_rows: 0 },
       search: {
-        state: "pre0005",
+        state: "installed",
         tables: [],
         objects: [],
         migration_count: 0,
@@ -387,7 +387,7 @@ function greenfieldObservation(): any {
   };
 }
 
-describe("SEARCH_DB migration 0005 maintenance preflight", () => {
+describe("SEARCH_DB maintenance preflight", () => {
   const searchMigrations = localMigrationFiles("SEARCH_DB");
 
   it("accepts only an exact fresh database when no migrations have run", async () => {
@@ -406,43 +406,22 @@ describe("SEARCH_DB migration 0005 maintenance preflight", () => {
     });
   });
 
-  it("allows a complete pre-0005 schema only when both legacy projections are empty", async () => {
+  it("rejects any migration history that is not the exact local prefix", async () => {
     const { runtime, statements } = searchRuntime({
-      appliedMigrations: searchMigrations.slice(0, 4),
+      appliedMigrations: searchMigrations,
+      columns: ["chunk_count"],
+      historyRows: [
+        { id: 1, name: searchMigrations[0], count: 1 },
+        { id: 2, name: "0002_legacy.sql", count: 1 }
+      ],
       counts: { legacy_fts: 0, legacy_heads: 0 }
     });
-    await expect(observeSearchD1(runtime)).resolves.toMatchObject({
-      state: "pre0005",
-      migration_count: 0,
-      inflight: 0,
-      production_rows: 0
-    });
+    await expect(observeSearchD1(runtime)).rejects.toThrow("exact local prefix");
     expect(statements.length).toBeGreaterThan(0);
     expect(() => statements.forEach(({ sql }) => assertReadOnlyD1Statement(sql))).not.toThrow();
     expect(statements.map(({ sql }) => sql).join("\n")).not.toMatch(
       /\b(?:DELETE|INSERT|UPDATE|ALTER|CREATE|DROP)\b/iu
     );
-  });
-
-  it.each([
-    ["memory_fts", { legacy_fts: 1, legacy_heads: 0 }],
-    ["memory_projection_heads", { legacy_fts: 0, legacy_heads: 1 }]
-  ])("blocks non-empty legacy projection %s without deleting it", async (_name, counts) => {
-    const { runtime } = searchRuntime({
-      appliedMigrations: searchMigrations.slice(0, 4),
-      counts
-    });
-    let caught: unknown;
-    try {
-      await observeSearchD1(runtime);
-    } catch (error) {
-      caught = error;
-    }
-    expect(caught).toBeInstanceOf(Search0005AdmissionError);
-    expect((caught as Error & { readonly code: string }).code).toBe(
-      "SEARCH_0005_LEGACY_PROJECTION_NOT_EMPTY"
-    );
-    expect((caught as Error).message).toContain("admission never deletes them");
   });
 
   it("accepts the complete installed chunk-ledger contract and counts its in-flight state", async () => {
@@ -452,7 +431,7 @@ describe("SEARCH_DB migration 0005 maintenance preflight", () => {
       counts: { write_leases: 1 }
     });
     await expect(observeSearchD1(runtime)).resolves.toMatchObject({
-      state: "post0005",
+      state: "installed",
       migration_count: 1,
       inflight: 1
     });
@@ -461,22 +440,16 @@ describe("SEARCH_DB migration 0005 maintenance preflight", () => {
   it("fails closed on a migration record with a partial installed schema", async () => {
     const { runtime } = searchRuntime({
       appliedMigrations: searchMigrations,
-      schemaObjects: expectedSchemaObjects("SEARCH_DB", 4),
+      schemaObjects: expectedSchemaObjects("SEARCH_DB", 1)
+        .filter((identity: string) => identity !== "table:memory_fts"),
       columns: ["chunk_count"],
     });
     await expect(observeSearchD1(runtime)).rejects.toThrow(/partial|migration history/iu);
   });
 
-  it.each([1, 2, 3])("rejects incomplete pre-0005 migration prefix length %s", async (length) => {
-    const { runtime } = searchRuntime({ appliedMigrations: searchMigrations.slice(0, length) });
-    await expect(observeSearchD1(runtime)).rejects.toThrow(
-      "SEARCH_0005_MIGRATION_HISTORY_INCOMPLETE"
-    );
-  });
-
-  it("rejects missing legacy schema, unknown objects, history gaps, and duplicate records", async () => {
-    const prefix = searchMigrations.slice(0, 4);
-    const expected = expectedSchemaObjects("SEARCH_DB", 4);
+  it("rejects missing schema, unknown objects, history gaps, and duplicate records", async () => {
+    const prefix = searchMigrations;
+    const expected = expectedSchemaObjects("SEARCH_DB", 1);
     await expect(observeSearchD1(searchRuntime({
       appliedMigrations: prefix,
       schemaObjects: expected.filter((identity: string) => identity !== "table:memory_fts")
@@ -488,12 +461,8 @@ describe("SEARCH_DB migration 0005 maintenance preflight", () => {
     }).runtime)).rejects.toThrow(/exact fresh|column inventory/iu);
     await expect(observeSearchD1(searchRuntime({
       appliedMigrations: prefix,
-      historyRows: [prefix[0], prefix[2], prefix[3]].map((name, index) => ({
-        id: index + 1,
-        name,
-        count: 1
-      }))
-    }).runtime)).rejects.toThrow("exact local prefix");
+      historyRows: [{ id: 2, name: prefix[0], count: 1 }]
+    }).runtime)).rejects.toThrow("malformed");
     await expect(observeSearchD1(searchRuntime({
       appliedMigrations: prefix,
       historyRows: prefix.map((name: string, index: number) => ({
@@ -517,19 +486,19 @@ describe("SEARCH_DB migration 0005 maintenance preflight", () => {
     }).runtime)).rejects.toThrow("residual sequence");
   });
 
-  it("rejects same-name legacy, ledger, and trigger definition changes", async () => {
-    const legacyProbe = schemaProbe("SEARCH_DB", 4);
+  it("rejects same-name table, ledger, and trigger definition changes", async () => {
+    const legacyProbe = schemaProbe("SEARCH_DB", 1);
     const legacyHeads = legacyProbe.objects.find((row) =>
       row.type === "table" && row.name === "memory_projection_heads"
     );
     if (legacyHeads === undefined) throw new Error("Missing legacy heads fixture.");
     legacyHeads.definition = `${legacyHeads.definition} WITHOUT ROWID`;
     await expect(observeSearchD1(searchRuntime({
-      appliedMigrations: searchMigrations.slice(0, 4),
+      appliedMigrations: searchMigrations,
       schemaProbe: legacyProbe
     }).runtime)).rejects.toThrow("schema definition");
 
-    const ledgerProbe = schemaProbe("SEARCH_DB", 5);
+    const ledgerProbe = schemaProbe("SEARCH_DB", 1);
     const ledger = ledgerProbe.objects.find((row) =>
       row.type === "table" && row.name === "memory_fts_chunk_ledger"
     );
@@ -541,7 +510,7 @@ describe("SEARCH_DB migration 0005 maintenance preflight", () => {
       schemaProbe: ledgerProbe
     }).runtime)).rejects.toThrow("schema definition");
 
-    const triggerProbe = schemaProbe("SEARCH_DB", 5);
+    const triggerProbe = schemaProbe("SEARCH_DB", 1);
     const trigger = triggerProbe.objects.find((row) => row.type === "trigger");
     if (trigger === undefined) throw new Error("Missing Search trigger fixture.");
     trigger.definition = `${trigger.definition} SELECT 1`;
@@ -628,11 +597,7 @@ describe("MEMORY_DB maintenance state", () => {
     const migrations = localMigrationFiles("MEMORY_DB");
     await expect(observeMemoryD1(memoryRuntime({}, {
       appliedMigrations: migrations,
-      historyRows: [migrations[0], migrations[2]].map((name, index) => ({
-        id: index + 1,
-        name,
-        count: 1
-      }))
+      historyRows: [{ id: 1, name: "0000_unknown.sql", count: 1 }]
     }).runtime)).rejects.toThrow("exact local prefix");
     await expect(observeMemoryD1(memoryRuntime({}, {
       appliedMigrations: [],

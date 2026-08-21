@@ -29,26 +29,7 @@ import {
   buildStableSyncEvent
 } from "../workers/github-sync/index";
 
-const MIGRATIONS = [
-  ...Array.from({ length: 11 }, (_, index) => {
-  const number = String(index + 1).padStart(4, "0");
-  const names = [
-    "initial",
-    "allow_synthetic_cleanup",
-    "validity_interval_guard",
-    "synthetic_cleanup_registry_and_validity_preflight",
-    "synthetic_cleanup_fence",
-    "repository_scope_context",
-    "repository_scope_hardening",
-    "canonical_repository_scope_ownership",
-    "repository_scope_runtime_guards",
-    "github_credential_expiry_and_repository_identity",
-    "github_tree_manifests"
-  ];
-    return `migrations/${number}_${names[index]}.sql`;
-  }),
-  "migrations/0017_github_sync_activation_receipts.sql"
-];
+const MIGRATIONS = ["migrations/0001_initial.sql"];
 
 const NOW = "2026-07-28T00:00:00.000Z";
 const PROJECT_ID = "project-a";
@@ -491,7 +472,11 @@ describe("GitHub tree manifest reconciliation", () => {
       failed_at: null,
       next_attempt_at: null,
       last_error_code: null,
-      attempt: 0
+      attempt: 0,
+      projection_unknown_alerted_at: null,
+      projection_unknown_count: 0,
+      projection_unknown_first_observed_at: null,
+      projection_unknown_last_observed_at: null
     });
     expect(new Date(String(secondSyncCreatedAt)).toISOString()).toBe(
       secondSyncCreatedAt

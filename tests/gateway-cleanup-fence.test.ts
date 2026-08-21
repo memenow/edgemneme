@@ -1004,12 +1004,7 @@ describe("GatewayService synthetic cleanup fence", () => {
 function createFixture() {
   const database = new DatabaseSync(":memory:");
   for (const migration of [
-    "migrations/0001_initial.sql",
-    "migrations/0002_allow_synthetic_cleanup.sql",
-    "migrations/0003_validity_interval_guard.sql",
-    "migrations/0004_synthetic_cleanup_registry_and_validity_preflight.sql",
-    "migrations/0005_synthetic_cleanup_fence.sql",
-    "migrations/0006_repository_scope_context.sql"
+    "migrations/0001_initial.sql"
   ]) {
     database.exec(readFileSync(migration, "utf8"));
   }

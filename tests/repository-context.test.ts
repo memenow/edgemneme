@@ -10,12 +10,7 @@ import {
 } from "../src/contracts/repository-context";
 
 const MIGRATIONS = [
-  "migrations/0001_initial.sql",
-  "migrations/0002_allow_synthetic_cleanup.sql",
-  "migrations/0003_validity_interval_guard.sql",
-  "migrations/0004_synthetic_cleanup_registry_and_validity_preflight.sql",
-  "migrations/0005_synthetic_cleanup_fence.sql",
-  "migrations/0006_repository_scope_context.sql"
+  "migrations/0001_initial.sql"
 ] as const;
 
 describe("trusted repository context", () => {
@@ -177,6 +172,11 @@ function contextDatabase(): DatabaseSync {
   for (const migration of MIGRATIONS) {
     database.exec(readFileSync(migration, "utf8"));
   }
+  // The canonical guards make the deliberately mismatched
+  // memory-invalid-ref context row impossible to persist; drop them in this
+  // fixture so the runtime mismatch path remains observable.
+  database.exec("DROP TRIGGER memory_repository_context_canonical_insert_guard");
+  database.exec("DROP TRIGGER memory_repository_context_no_update");
   const now = "2026-07-27T00:00:00.000Z";
   const refScopeId = createRefScopeId("repository-a", "refs/heads/main");
   const worktreeScopeId = createWorktreeScopeId("session-a", "worktree-a");
@@ -197,13 +197,13 @@ function contextDatabase(): DatabaseSync {
     VALUES ('principal-1', 'test', 'principal-1', 'digest-1', '${now}');
     INSERT INTO sessions
       (session_id, project_id, principal_id, status, agent_meta_json,
-       repository_id, repository_ref, worktree_id, opened_at)
+       repository_id, repository_ref, worktree_id, worktree_scope_id, opened_at)
     VALUES
       ('session-a', 'project-1', 'principal-1', 'open', '{}',
-       'repository-a', 'refs/heads/feature-a', 'worktree-a', '${now}');
+       'repository-a', 'refs/heads/feature-a', 'worktree-a', '${worktreeScopeId}', '${now}');
     INSERT INTO sync_cursors
-      (project_id, repository_id, ref, updated_at)
-    VALUES ('project-1', 'repository-a', 'refs/heads/main', '${now}');
+      (project_id, repository_id, ref, ref_scope_id, updated_at)
+    VALUES ('project-1', 'repository-a', 'refs/heads/main', '${refScopeId}', '${now}');
     INSERT INTO evidence
       (evidence_id, project_id, source_type, locator, repository_id,
        repository_ref, repository_path, repository_authority, excerpt_hash,
@@ -228,14 +228,9 @@ function contextDatabase(): DatabaseSync {
        '${worktreeScopeId}', 'active', '${now}', '${now}'),
       ('memory-invalid-ref', 'project-1', 'fact', 'semantic', 'ref',
        '${refScopeId}', 'active', '${now}', '${now}');
-    INSERT INTO memory_repository_contexts
-      (project_id, memory_id, repository_id, created_at)
-    VALUES
-      ('project-1', 'memory-repository-a', 'repository-a', '${now}'),
-      ('project-1', 'memory-ref-a', 'repository-a', '${now}'),
-      ('project-1', 'memory-session-a', 'repository-a', '${now}'),
-      ('project-1', 'memory-worktree-a', 'repository-a', '${now}'),
-      ('project-1', 'memory-invalid-ref', 'repository-b', '${now}');
+    UPDATE memory_repository_contexts
+    SET repository_id = 'repository-b'
+    WHERE project_id = 'project-1' AND memory_id = 'memory-invalid-ref';
   `);
   return database;
 }

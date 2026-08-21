@@ -26,26 +26,7 @@ const VECTOR_ID = testVectorId(GENERATION_ID, PROJECT_ID, REVISION_ID, "chunk-0"
 const RETIRED_GENERATION_ID = "retired-generation";
 const PREFIX = `projects/${PROJECT_ID}/projections/`;
 const MEMORY_MIGRATIONS = [
-  "migrations/0001_initial.sql",
-  "migrations/0002_allow_synthetic_cleanup.sql",
-  "migrations/0003_validity_interval_guard.sql",
-  "migrations/0004_synthetic_cleanup_registry_and_validity_preflight.sql",
-  "migrations/0005_synthetic_cleanup_fence.sql",
-  "migrations/0006_repository_scope_context.sql",
-  "migrations/0007_repository_scope_hardening.sql",
-  "migrations/0008_canonical_repository_scope_ownership.sql",
-  "migrations/0009_repository_scope_runtime_guards.sql",
-  "migrations/0010_github_credential_expiry_and_repository_identity.sql",
-  "migrations/0011_github_tree_manifests.sql",
-  "migrations/0012_projection_rebuild_outbox_index.sql",
-  "migrations/0013_projection_rebuild_unknown_status.sql",
-  "migrations/0014_ordinary_workflow_reconciliation_index.sql",
-  "migrations/0015_github_sync_default_branch.sql",
-  "migrations/0016_consolidation_lease.sql",
-  "migrations/0017_github_sync_activation_receipts.sql",
-  "migrations/0018_consolidation_batch_receipts.sql",
-  "migrations/0019_github_sync_workflows.sql",
-  "migrations/0020_consolidation_input_shape.sql"
+  "migrations/0001_initial.sql"
 ] as const;
 
 describe("scheduled synthetic cleanup", () => {
@@ -655,11 +636,7 @@ function createFixture() {
     memory.exec(readFileSync(migration, "utf8"));
   }
   for (const migration of [
-    "migrations/search/0001_fts.sql",
-    "migrations/search/0002_activate_qwen_generation.sql",
-    "migrations/search/0003_projection_heads.sql",
-    "migrations/search/0004_repository_partition.sql",
-    "migrations/search/0005_memory_fts_chunk_ledger.sql"
+    "migrations/search/0001_initial.sql"
   ]) {
     search.exec(readFileSync(migration, "utf8"));
   }

@@ -6,17 +6,7 @@ describe("synthetic cleanup policy", () => {
   it("allows every exact synthetic immutable-row deletion and preserves real rows", () => {
     const database = new DatabaseSync(":memory:");
     for (const migration of [
-      "migrations/0001_initial.sql",
-      "migrations/0002_allow_synthetic_cleanup.sql",
-      "migrations/0003_validity_interval_guard.sql",
-      "migrations/0004_synthetic_cleanup_registry_and_validity_preflight.sql",
-      "migrations/0005_synthetic_cleanup_fence.sql",
-      "migrations/0006_repository_scope_context.sql",
-      "migrations/0007_repository_scope_hardening.sql",
-      "migrations/0008_canonical_repository_scope_ownership.sql",
-      "migrations/0009_repository_scope_runtime_guards.sql",
-      "migrations/0010_github_credential_expiry_and_repository_identity.sql",
-      "migrations/0011_github_tree_manifests.sql"
+      "migrations/0001_initial.sql"
     ]) {
       database.exec(readFileSync(migration, "utf8"));
     }

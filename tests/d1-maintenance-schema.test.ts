@@ -56,7 +56,6 @@ describe("remote D1 maintenance schema probes", () => {
     ["MEMORY_DB", 0],
     ["MEMORY_DB", localMigrationFiles("MEMORY_DB").length],
     ["SEARCH_DB", 0],
-    ["SEARCH_DB", 4],
     ["SEARCH_DB", localMigrationFiles("SEARCH_DB").length]
   ] as const)("matches the local %s schema after %s migrations", (database, migrationCount) => {
     const expected = parseSchemaInventory(

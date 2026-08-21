@@ -208,7 +208,6 @@ describe("authorization policy", () => {
     const repositoryPrincipal = principal("principal-repository-a", "reader");
     const refPrincipal = principal("principal-ref-a", "reader");
     const otherRepositoryPrincipal = principal("principal-repository-b", "reader");
-    const contextlessPrincipal = principal("principal-contextless", "reader");
 
     await expect(hasMemoryRole(d1, projectPrincipal, "reader", "memory-repository-b"))
       .resolves.toBe(true);
@@ -229,8 +228,6 @@ describe("authorization policy", () => {
     await expect(hasMemoryRole(d1, refPrincipal, "reader", "memory-ref-other"))
       .resolves.toBe(false);
     await expect(hasMemoryRole(d1, otherRepositoryPrincipal, "reader", "memory-repository-a"))
-      .resolves.toBe(false);
-    await expect(hasMemoryRole(d1, contextlessPrincipal, "reader", "memory-project"))
       .resolves.toBe(false);
     await expect(hasMemoryRole(d1, repositoryPrincipal, "writer", "memory-repository-a"))
       .resolves.toBe(false);
@@ -275,12 +272,7 @@ function principal(
 function authorizationDatabase(): DatabaseSync {
   const database = new DatabaseSync(":memory:");
   for (const migration of [
-    "migrations/0001_initial.sql",
-    "migrations/0002_allow_synthetic_cleanup.sql",
-    "migrations/0003_validity_interval_guard.sql",
-    "migrations/0004_synthetic_cleanup_registry_and_validity_preflight.sql",
-    "migrations/0005_synthetic_cleanup_fence.sql",
-    "migrations/0006_repository_scope_context.sql"
+    "migrations/0001_initial.sql"
   ]) {
     database.exec(readFileSync(migration, "utf8"));
   }
@@ -307,6 +299,10 @@ function authorizationDatabase(): DatabaseSync {
       ('principal-ref-a', 'test', 'ref-a', 'digest-ref-a', '${now}'),
       ('principal-repository-b', 'test', 'repository-b', 'digest-repository-b', '${now}'),
       ('principal-contextless', 'test', 'contextless', 'digest-contextless', '${now}');
+    INSERT INTO sync_cursors (project_id, repository_id, ref, ref_scope_id, updated_at)
+    VALUES
+      ('project-1', 'repository-a', 'refs/heads/main', '${refScope}', '${now}'),
+      ('project-1', 'repository-a', 'refs/heads/other', '${otherRefScope}', '${now}');
     INSERT INTO project_grants
       (grant_id, project_id, principal_id, role, scope_kind, scope_id, created_at)
     VALUES
@@ -317,9 +313,7 @@ function authorizationDatabase(): DatabaseSync {
       ('grant-ref-a', 'project-1', 'principal-ref-a', 'reader', 'ref',
        '${refScope}', '${now}'),
       ('grant-repository-b', 'project-1', 'principal-repository-b', 'reader',
-       'repository', 'repository-b', '${now}'),
-      ('grant-contextless', 'project-1', 'principal-contextless', 'reader', 'ref',
-       '${otherRefScope}', '${now}');
+       'repository', 'repository-b', '${now}');
     INSERT INTO project_grant_repository_contexts
       (project_id, grant_id, repository_id, created_at)
     VALUES
