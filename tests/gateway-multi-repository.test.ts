@@ -789,7 +789,6 @@ function createFixture(): {
       new GatewayService(
         {
           MEMORY_DB: memoryDb as unknown as D1Database,
-          PAGE_TOKEN_HMAC_KEY: "multi-repository-page-token-test-key",
           PROJECT_COORDINATOR: projectCoordinator
         } as unknown as GatewayEnv,
         principal

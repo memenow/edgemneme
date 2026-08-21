@@ -82,7 +82,6 @@ describe("synthetic canary process boundary", () => {
   it("does not pass Cloudflare or application secrets to the MCP client", () => {
     vi.stubEnv("CLOUDFLARE_API_TOKEN", "cloudflare-secret");
     vi.stubEnv("TOKEN_DIGEST_PEPPER", "pepper-secret");
-    vi.stubEnv("PAGE_TOKEN_HMAC_KEY", "page-secret");
     vi.stubEnv("HOME", "/credential-bearing-home");
     vi.stubEnv("XDG_CONFIG_HOME", "/credential-bearing-config");
     vi.stubEnv("PNPM_HOME", "/package-manager-home");
@@ -93,7 +92,6 @@ describe("synthetic canary process boundary", () => {
     expect(environment.EDGEMNEME_GATEWAY_URL).toBe("safe");
     expect(environment).not.toHaveProperty("CLOUDFLARE_API_TOKEN");
     expect(environment).not.toHaveProperty("TOKEN_DIGEST_PEPPER");
-    expect(environment).not.toHaveProperty("PAGE_TOKEN_HMAC_KEY");
     expect(environment).not.toHaveProperty("HOME");
     expect(environment).not.toHaveProperty("XDG_CONFIG_HOME");
     expect(environment).not.toHaveProperty("PNPM_HOME");

@@ -15,7 +15,7 @@ import {
 } from "../quality/sensitive-content";
 import { sha256 } from "../security/crypto";
 import { canonicalJson } from "../security/canonical-json";
-import { createPageToken, readPageToken } from "../security/page-token";
+import { createPageToken, readPageToken, type PageTokenPayload } from "../security/page-token";
 import { createCloudflareSearchPipeline } from "../search/cloudflare";
 import { readGatewayResource } from "./resources";
 import type { GatewayEnv } from "./types";
@@ -359,11 +359,10 @@ export class GatewayService {
       })
     );
     let validAt = new Date().toISOString();
-    let cursor: Awaited<ReturnType<typeof readPageToken>> | undefined;
+    let cursor: PageTokenPayload | undefined;
     if (input.pageToken !== undefined) {
-      cursor = await readPageToken(
+      cursor = readPageToken(
         input.pageToken,
-        new TextEncoder().encode(this.env.PAGE_TOKEN_HMAC_KEY),
         {
           projectId: this.principal.projectId,
           queryDigest,
@@ -416,17 +415,14 @@ export class GatewayService {
       result.results.length === limit &&
       typeof last?.updated_at === "string" &&
       typeof last.memory_id === "string"
-        ? await createPageToken(
-            {
-              projectId: this.principal.projectId,
-              queryDigest,
-              snapshotVersion,
-              lastSortKey: `${last.updated_at}|${last.memory_id}`,
-              validAt,
-              expiresAt: Math.floor(Date.now() / 1000) + 15 * 60
-            },
-            new TextEncoder().encode(this.env.PAGE_TOKEN_HMAC_KEY)
-          )
+        ? createPageToken({
+            projectId: this.principal.projectId,
+            queryDigest,
+            snapshotVersion,
+            lastSortKey: `${last.updated_at}|${last.memory_id}`,
+            validAt,
+            expiresAt: Math.floor(Date.now() / 1000) + 15 * 60
+          })
         : null;
     return {
       snapshot_version: snapshotVersion,

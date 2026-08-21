@@ -1887,98 +1887,15 @@ async function expireStaleRepositorySyncRuns(
     .run();
 }
 
-async function hasExactRecoveredRepositorySyncClaim(
+async function hasCommittedRepositorySyncClaim(
   database: D1Database,
-  input: {
-    repository: ScheduledRefRow;
-    runId: string;
-    scheduledFor: string;
-    fullReconciliation: boolean;
-    claimedAt: string;
-    leaseExpiresAt: string;
-  }
+  runId: string
 ): Promise<boolean> {
   try {
-    const observedAt = new Date().toISOString();
-    const result = await database.withSession("first-primary").prepare(
-      `SELECT 1 AS matches
-       FROM github_repository_sync_runs AS claimed_run
-       JOIN repositories AS repository
-         ON repository.project_id = claimed_run.project_id
-        AND repository.repository_id = claimed_run.repository_id
-       JOIN sync_cursors AS cursor
-         ON cursor.project_id = claimed_run.project_id
-        AND cursor.repository_id = claimed_run.repository_id
-        AND cursor.ref = claimed_run.claimed_ref
-       LEFT JOIN github_tree_ref_heads AS head
-         ON head.project_id = claimed_run.project_id
-        AND head.repository_id = claimed_run.repository_id
-        AND head.ref = claimed_run.claimed_ref
-       WHERE claimed_run.run_id = ?
-         AND claimed_run.project_id = ?
-         AND claimed_run.repository_id = ?
-         AND claimed_run.scheduled_for = ?
-         AND claimed_run.full_reconciliation = ?
-         AND claimed_run.status = 'running'
-         AND claimed_run.started_at = ?
-         AND claimed_run.lease_expires_at = ?
-         AND claimed_run.lease_expires_at > ?
-         AND claimed_run.claimed_ref = ?
-         AND claimed_run.claimed_head_manifest_id IS ?
-         AND claimed_run.claimed_head_version = ?
-         AND claimed_run.repository_configuration_version = ?
-         AND claimed_run.cursor_version = ?
-         AND claimed_run.claim_contract_version = 1
-         AND claimed_run.completed_at IS NULL
-         AND claimed_run.last_error_code IS NULL
-         AND lower(repository.provider) = 'github'
-         AND repository.sync_enabled = 1
-         AND repository.external_id = ?
-         AND repository.expected_owner_external_id IS ?
-         AND repository.owner = ?
-         AND repository.name = ?
-         AND repository.default_branch IS ?
-         AND repository.tracked_refs_json = ?
-         AND repository.github_sync_configuration_version = ?
-         AND repository.updated_at = ?
-         AND cursor.status = ?
-         AND cursor.status <> 'paused'
-         AND cursor.updated_at = ?
-         AND cursor.cursor_version = ?
-         AND head.manifest_id IS ?
-         AND COALESCE(head.head_version, 0) = ?
-       LIMIT 1`
-    )
-      .bind(
-        input.runId,
-        input.repository.project_id,
-        input.repository.repository_id,
-        input.scheduledFor,
-        input.fullReconciliation ? 1 : 0,
-        input.claimedAt,
-        input.leaseExpiresAt,
-        observedAt,
-        input.repository.ref,
-        input.repository.selected_head_manifest_id,
-        input.repository.selected_head_version,
-        input.repository.repository_configuration_version,
-        input.repository.cursor_version,
-        input.repository.external_id,
-        input.repository.expected_owner_external_id,
-        input.repository.owner,
-        input.repository.name,
-        input.repository.default_branch,
-        input.repository.tracked_refs_json,
-        input.repository.repository_configuration_version,
-        input.repository.repository_updated_at,
-        input.repository.cursor_status,
-        input.repository.cursor_updated_at,
-        input.repository.cursor_version,
-        input.repository.selected_head_manifest_id,
-        input.repository.selected_head_version
-      )
-      .all<{ matches: number }>();
-    return result.results.length === 1 && result.results[0]?.matches === 1;
+    const row = await database.withSession("first-primary").prepare(
+      `SELECT 1 AS matches FROM github_repository_sync_runs WHERE run_id = ? LIMIT 1`
+    ).bind(runId).first<{ matches: number }>();
+    return row !== null;
   } catch {
     return false;
   }
@@ -2090,16 +2007,7 @@ export async function claimRepositorySync(
   try {
     result = await claimStatement.run();
   } catch (error) {
-    if (
-      await hasExactRecoveredRepositorySyncClaim(database, {
-        repository,
-        runId,
-        scheduledFor,
-        fullReconciliation,
-        claimedAt,
-        leaseExpiresAt
-      })
-    ) {
+    if (await hasCommittedRepositorySyncClaim(database, runId)) {
       return runId;
     }
     throw error;
@@ -2107,16 +2015,7 @@ export async function claimRepositorySync(
   if ((result.meta.changes ?? 0) === 1) {
     return runId;
   }
-  return (await hasExactRecoveredRepositorySyncClaim(database, {
-    repository,
-    runId,
-    scheduledFor,
-    fullReconciliation,
-    claimedAt,
-    leaseExpiresAt
-  }))
-    ? runId
-    : null;
+  return (await hasCommittedRepositorySyncClaim(database, runId)) ? runId : null;
 }
 
 export async function finishRepositorySyncRun(
@@ -2457,113 +2356,27 @@ async function readExactCursorObservedSha(
   return result.results.length === 1 ? (result.results[0] ?? null) : null;
 }
 
-async function hasExactRecoveredUnchangedCursor(
+async function hasCommittedUnchangedCursor(
   database: D1Database,
-  input: {
-    repository: ScheduledRefRow;
-    ref: string;
-    expectedRunId: string;
-    scheduledFor: string;
-    nextSyncAt: string;
-    etag: string | null;
-    credentialStatus: "active" | "expiring";
-    terminalAt: string;
-    observedSha: string | null;
-    expectedCursorVersion: number;
-  }
+  repository: ScheduledRefRow,
+  ref: string,
+  terminalAt: string,
+  expectedCursorVersion: number
 ): Promise<boolean> {
   try {
-    const observedAt = new Date().toISOString();
-    const result = await database.withSession("first-primary").prepare(
-      `SELECT 1 AS matches
-       FROM github_repository_sync_runs AS claimed_run
-       JOIN repositories AS repository
-         ON repository.project_id = claimed_run.project_id
-        AND repository.repository_id = claimed_run.repository_id
-       JOIN sync_cursors AS cursor
-         ON cursor.project_id = claimed_run.project_id
-        AND cursor.repository_id = claimed_run.repository_id
-        AND cursor.ref = claimed_run.claimed_ref
-       LEFT JOIN github_tree_ref_heads AS head
-         ON head.project_id = claimed_run.project_id
-        AND head.repository_id = claimed_run.repository_id
-        AND head.ref = claimed_run.claimed_ref
-       WHERE claimed_run.run_id = ?
-         AND claimed_run.project_id = ?
-         AND claimed_run.repository_id = ?
-         AND claimed_run.scheduled_for = ?
-         AND claimed_run.full_reconciliation = ?
-         AND claimed_run.claimed_ref = ?
-         AND claimed_run.claimed_head_manifest_id IS ?
-         AND claimed_run.claimed_head_version = ?
-         AND claimed_run.repository_configuration_version = ?
-         AND claimed_run.cursor_version = ?
-         AND claimed_run.claim_contract_version = 1
-         AND claimed_run.status = 'running'
-         AND claimed_run.lease_expires_at > ?
-         AND claimed_run.completed_at IS NULL
-         AND claimed_run.last_error_code IS NULL
-         AND cursor.observed_sha IS ?
-         AND cursor.status = 'complete'
-         AND cursor.last_sync_at = ?
-         AND cursor.next_sync_at = ?
-         AND cursor.history_gap_possible = 0
-         AND cursor.credential_status = ?
-         AND cursor.etag IS ?
-         AND cursor.last_error_code IS NULL
-         AND cursor.updated_at = ?
-         AND cursor.cursor_version = ?
-         AND lower(repository.provider) = 'github'
-         AND repository.sync_enabled = 1
-         AND repository.external_id = ?
-         AND repository.expected_owner_external_id IS ?
-         AND repository.owner = ?
-         AND repository.name = ?
-         AND repository.default_branch IS ?
-         AND repository.tracked_refs_json = ?
-         AND repository.github_sync_configuration_version = ?
-         AND repository.updated_at = ?
-         AND head.manifest_id IS ?
-         AND COALESCE(head.head_version, 0) = ?
+    const row = await database.withSession("first-primary").prepare(
+      `SELECT 1 AS matches FROM sync_cursors
+       WHERE project_id = ? AND repository_id = ? AND ref = ?
+         AND updated_at = ? AND cursor_version = ?
        LIMIT 1`
-    )
-      .bind(
-        input.expectedRunId,
-        input.repository.project_id,
-        input.repository.repository_id,
-        input.scheduledFor,
-        requiresFullReconciliation(
-          Date.parse(input.scheduledFor),
-          input.repository.last_sync_at
-        )
-          ? 1
-          : 0,
-        input.ref,
-        input.repository.selected_head_manifest_id,
-        input.repository.selected_head_version,
-        input.repository.repository_configuration_version,
-        input.repository.cursor_version,
-        observedAt,
-        input.observedSha,
-        input.scheduledFor,
-        input.nextSyncAt,
-        input.credentialStatus,
-        input.etag,
-        input.terminalAt,
-        input.expectedCursorVersion,
-        input.repository.external_id,
-        input.repository.expected_owner_external_id,
-        input.repository.owner,
-        input.repository.name,
-        input.repository.default_branch,
-        input.repository.tracked_refs_json,
-        input.repository.repository_configuration_version,
-        input.repository.repository_updated_at,
-        input.repository.selected_head_manifest_id,
-        input.repository.selected_head_version
-      )
-      .all<{ matches: number }>();
-    return result.results.length === 1 && result.results[0]?.matches === 1;
+    ).bind(
+      repository.project_id,
+      repository.repository_id,
+      ref,
+      terminalAt,
+      expectedCursorVersion
+    ).first<{ matches: number }>();
+    return row !== null;
   } catch {
     return false;
   }
@@ -2697,18 +2510,13 @@ export async function markUnchanged(
     result = await statement.run();
   } catch (error) {
     if (
-      await hasExactRecoveredUnchangedCursor(database, {
+      await hasCommittedUnchangedCursor(
+        database,
         repository,
         ref,
-        expectedRunId,
-        scheduledFor,
-        nextSyncAt,
-        etag: normalizedEtag,
-        credentialStatus,
         terminalAt,
-        observedSha: cursorSnapshot.observed_sha,
         expectedCursorVersion
-      })
+      )
     ) {
       return;
     }

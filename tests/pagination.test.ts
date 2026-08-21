@@ -2,91 +2,78 @@ import { describe, expect, it } from "vitest";
 import { createPageToken, readPageToken } from "../src/security/page-token";
 import { decodeBase64Url } from "../src/security/crypto";
 
-const key = new TextEncoder().encode("synthetic-test-key-with-at-least-32-bytes");
-
 describe("page tokens", () => {
-  it("round-trips a query-bound snapshot cursor", async () => {
-    const token = await createPageToken(
-      {
-        projectId: "project-1",
-        queryDigest: "query-digest",
-        snapshotVersion: 7,
-        lastSortKey: "2026-07-25T00:00:00.000Z|memory-1",
-        validAt: "2026-07-25T12:00:00.000Z",
-        expiresAt: 2_000_000_000
-      },
-      key
-    );
+  it("round-trips a query-bound snapshot cursor", () => {
+    const token = createPageToken({
+      projectId: "project-1",
+      queryDigest: "query-digest",
+      snapshotVersion: 7,
+      lastSortKey: "2026-07-25T00:00:00.000Z|memory-1",
+      validAt: "2026-07-25T12:00:00.000Z",
+      expiresAt: 2_000_000_000
+    });
 
-    await expect(
-      readPageToken(token, key, {
+    expect(
+      readPageToken(token, {
         projectId: "project-1",
         queryDigest: "query-digest",
         nowEpochSeconds: 1_900_000_000
       })
-    ).resolves.toMatchObject({
+    ).toMatchObject({
       snapshotVersion: 7,
       lastSortKey: expect.any(String),
       validAt: "2026-07-25T12:00:00.000Z"
     });
 
     const body = JSON.parse(
-      new TextDecoder().decode(
-        decodeBase64Url(token.slice(0, token.indexOf(".")))
-      )
+      new TextDecoder().decode(decodeBase64Url(token))
     ) as Record<string, unknown>;
-    expect(body).toMatchObject({ v: 2, t: "2026-07-25T12:00:00.000Z" });
+    expect(body).toMatchObject({ v: 3, t: "2026-07-25T12:00:00.000Z" });
   });
 
-  it("rejects tampering, query reuse, and expiration", async () => {
-    const token = await createPageToken(
-      {
-        projectId: "project-1",
-        queryDigest: "query-a",
-        snapshotVersion: 2,
-        lastSortKey: "cursor",
-        validAt: "2026-07-25T12:00:00.000Z",
-        expiresAt: 100
-      },
-      key
-    );
+  it("rejects malformed tokens, query reuse, and expiration", () => {
+    const token = createPageToken({
+      projectId: "project-1",
+      queryDigest: "query-a",
+      snapshotVersion: 2,
+      lastSortKey: "cursor",
+      validAt: "2026-07-25T12:00:00.000Z",
+      expiresAt: 100
+    });
 
-    await expect(
-      readPageToken(`${token.slice(0, -1)}x`, key, {
+    expect(() =>
+      readPageToken(`${token.slice(0, -1)}x`, {
         projectId: "project-1",
         queryDigest: "query-a",
         nowEpochSeconds: 1
       })
-    ).rejects.toMatchObject({ code: "PAGE_TOKEN_INVALID" });
-    await expect(
-      readPageToken(token, key, {
+    ).toThrow(expect.objectContaining({ code: "PAGE_TOKEN_INVALID" }));
+    expect(() =>
+      readPageToken(token, {
         projectId: "project-1",
         queryDigest: "query-b",
         nowEpochSeconds: 1
       })
-    ).rejects.toMatchObject({ code: "PAGE_TOKEN_INVALID" });
-    await expect(
-      readPageToken(token, key, {
+    ).toThrow(expect.objectContaining({ code: "PAGE_TOKEN_INVALID" }));
+    expect(() =>
+      readPageToken(token, {
         projectId: "project-1",
         queryDigest: "query-a",
         nowEpochSeconds: 101
       })
-    ).rejects.toMatchObject({ code: "PAGE_TOKEN_INVALID" });
+    ).toThrow(expect.objectContaining({ code: "PAGE_TOKEN_INVALID" }));
   });
 
-  it("rejects an invalid validity timestamp before signing", async () => {
-    await expect(
-      createPageToken(
-        {
-          projectId: "project-1",
-          queryDigest: "query-digest",
-          snapshotVersion: 7,
-          lastSortKey: "cursor",
-          validAt: "not-a-timestamp",
-          expiresAt: 2_000_000_000
-        },
-        key
-      )
-    ).rejects.toThrow("validity timestamp");
+  it("rejects an invalid validity timestamp", () => {
+    expect(() =>
+      createPageToken({
+        projectId: "project-1",
+        queryDigest: "query-digest",
+        snapshotVersion: 7,
+        lastSortKey: "cursor",
+        validAt: "not-a-timestamp",
+        expiresAt: 2_000_000_000
+      })
+    ).toThrow("validity timestamp");
   });
 });

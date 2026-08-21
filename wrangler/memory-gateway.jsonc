@@ -13,7 +13,7 @@
     "binding": "CF_VERSION_METADATA"
   },
   "secrets": {
-    "required": ["TOKEN_DIGEST_PEPPER", "PAGE_TOKEN_HMAC_KEY"]
+    "required": ["TOKEN_DIGEST_PEPPER"]
   },
   "ratelimits": [
     {

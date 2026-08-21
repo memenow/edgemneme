@@ -93,7 +93,6 @@ describe("GatewayService memory browse", () => {
     const service = new GatewayService(
       {
         MEMORY_DB: memoryDatabase,
-        PAGE_TOKEN_HMAC_KEY: "synthetic-test-key-with-at-least-32-bytes"
       } as unknown as GatewayEnv,
       principal
     );
@@ -156,7 +155,6 @@ describe("GatewayService memory browse", () => {
       const service = new GatewayService(
         {
           MEMORY_DB: memoryDatabase,
-          PAGE_TOKEN_HMAC_KEY: "synthetic-test-key-with-at-least-32-bytes"
         } as unknown as GatewayEnv,
         principal
       );
@@ -212,7 +210,6 @@ describe("GatewayService memory browse", () => {
         SEARCH_DB: { prepare: searchPrepare } as unknown as D1Database,
         MEMORY_VECTORS: { query: vectorQuery } as unknown as VectorizeIndex,
         AI: { run: aiRun } as unknown as Ai,
-        PAGE_TOKEN_HMAC_KEY: "synthetic-test-key-with-at-least-32-bytes"
       } as unknown as GatewayEnv,
       principal
     );

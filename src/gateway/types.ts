@@ -5,5 +5,4 @@ export interface GatewayEnv {
   PROJECTIONS: R2Bucket;
   MEMORY_VECTORS: VectorizeIndex;
   AI: Ai;
-  PAGE_TOKEN_HMAC_KEY: string;
 }

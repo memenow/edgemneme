@@ -459,9 +459,7 @@ export async function consolidateSession(
 }
 
 export function createConsolidationClaimId(): string {
-  const claimId = crypto.randomUUID();
-  assertConsolidationClaimId(claimId);
-  return claimId;
+  return crypto.randomUUID();
 }
 
 export async function listConsolidationBatchIndexes(
@@ -494,7 +492,6 @@ export async function listConsolidationBatchIndexes(
       );
     }
     const batchIndex = input.batch_index as number;
-    assertConsolidationBatchIndex(batchIndex);
     batchIndexes.push(batchIndex);
   }
   return validateConsolidationWorkflowBatchIndexes(batchIndexes);
@@ -521,8 +518,6 @@ export async function consolidateSessionBatch(
   lease: ConsolidationLeaseToken,
   batchIndex: number
 ): Promise<void> {
-  assertConsolidationLeaseToken(lease);
-  assertConsolidationBatchIndex(batchIndex);
   const {
     inputs,
     batchInputDigest,
@@ -709,7 +704,6 @@ async function loadConsolidationBatchInputs(
   firstInputOrder: number;
   lastInputOrder: number;
 }> {
-  assertConsolidationBatchIndex(batchIndex);
   const firstInputOrder = batchIndex * CONSOLIDATION_BATCH_SIZE;
   const lastInputOrder = firstInputOrder + CONSOLIDATION_BATCH_SIZE - 1;
   if (!Number.isSafeInteger(lastInputOrder)) {
@@ -774,7 +768,6 @@ export function validateConsolidationBatchInputShape(
   batchIndex: number,
   inputs: readonly Pick<ConsolidationInputRow, "input_order" | "input_kind">[]
 ): void {
-  assertConsolidationBatchIndex(batchIndex);
   let summaryCount = 0;
   for (const input of inputs) {
     if (input.input_kind === "summary") {
@@ -804,8 +797,6 @@ export async function claimConsolidationLease(
   leaseOwner: string,
   claimId: string
 ): Promise<ConsolidationLeaseToken | null> {
-  assertConsolidationLeaseOwner(leaseOwner);
-  assertConsolidationClaimId(claimId);
   const session = database.withSession("first-primary");
   let claimResults: D1Result<ConsolidationLeaseStateRow>[];
   try {
@@ -959,7 +950,6 @@ async function renewConsolidationLease(
   consolidationId: string,
   lease: ConsolidationLeaseToken
 ): Promise<void> {
-  assertConsolidationLeaseToken(lease);
   const currentLease = await database.withSession("first-primary").prepare(
     `SELECT lease_expires_at
      FROM session_consolidations
@@ -1074,61 +1064,8 @@ async function hasExactLiveConsolidationLease(
   return state !== null;
 }
 
-function assertConsolidationBatchIndex(batchIndex: number): void {
-  if (
-    !Number.isSafeInteger(batchIndex) ||
-    batchIndex < 0 ||
-    batchIndex > MAX_CONSOLIDATION_BATCH_INDEX
-  ) {
-    throw new EdgeMnemeError(
-      "WORKFLOW_FAILED",
-      "The consolidation batch index is invalid."
-    );
-  }
-}
-
-function assertConsolidationClaimId(claimId: string): void {
-  if (!CONSOLIDATION_OPERATION_ID_PATTERN.test(claimId)) {
-    throw new EdgeMnemeError(
-      "WORKFLOW_FAILED",
-      "The consolidation claim identifier is invalid."
-    );
-  }
-}
-
-function assertConsolidationLeaseToken(lease: ConsolidationLeaseToken): void {
-  assertConsolidationLeaseOwner(lease.owner);
-  assertConsolidationClaimId(lease.claimId);
-  if (!Number.isSafeInteger(lease.epoch) || lease.epoch < 1) {
-    throw new EdgeMnemeError(
-      "WORKFLOW_FAILED",
-      "The consolidation lease epoch is invalid."
-    );
-  }
-}
-
-function assertConsolidationLeaseOwner(leaseOwner: string): void {
-  if (
-    leaseOwner.length < 1 ||
-    leaseOwner.length > 512 ||
-    leaseOwner.trim() !== leaseOwner
-  ) {
-    throw new EdgeMnemeError(
-      "WORKFLOW_FAILED",
-      "The consolidation lease owner is invalid."
-    );
-  }
-}
-
 function createConsolidationOperationId(): string {
-  const operationId = crypto.randomUUID();
-  if (!CONSOLIDATION_OPERATION_ID_PATTERN.test(operationId)) {
-    throw new EdgeMnemeError(
-      "WORKFLOW_FAILED",
-      "The consolidation operation identifier is invalid."
-    );
-  }
-  return operationId;
+  return crypto.randomUUID();
 }
 
 function validateConsolidationModelInput(
@@ -1522,8 +1459,6 @@ async function recoverExactConsolidationBatchReceipt(
     outputManifestDigest?: string;
   }
 ): Promise<boolean> {
-  assertConsolidationLeaseToken(input.lease);
-  assertConsolidationBatchIndex(input.batchIndex);
   const session = database.withSession("first-primary");
   const receipt = await session.prepare(
     `SELECT lease_owner, lease_claim_id, lease_epoch, lease_operation_id,
@@ -1748,8 +1683,6 @@ async function persistConsolidationBatch(
     now: string;
   }
 ): Promise<void> {
-  assertConsolidationLeaseToken(input.lease);
-  assertConsolidationBatchIndex(input.batchIndex);
   const operationId = createConsolidationOperationId();
   const statements: D1PreparedStatement[] = [
     database.prepare(
@@ -2248,7 +2181,6 @@ export async function finishConsolidation(
   lease: ConsolidationLeaseToken,
   batchIndexes: readonly number[]
 ): Promise<void> {
-  assertConsolidationLeaseToken(lease);
   const expectedBatchIndexes = validateConsolidationWorkflowBatchIndexes(batchIndexes);
   if (
     await isExactTerminalConsolidation(
@@ -2351,7 +2283,16 @@ export async function finishConsolidation(
 function normalizeConsolidationBatchIndexes(batchIndexes: readonly number[]): number[] {
   const normalized = [...batchIndexes];
   for (const batchIndex of normalized) {
-    assertConsolidationBatchIndex(batchIndex);
+    if (
+      !Number.isSafeInteger(batchIndex) ||
+      batchIndex < 0 ||
+      batchIndex > MAX_CONSOLIDATION_BATCH_INDEX
+    ) {
+      throw new EdgeMnemeError(
+        "WORKFLOW_FAILED",
+        "The consolidation batch index is invalid."
+      );
+    }
   }
   if (
     new Set(normalized).size !== normalized.length ||
@@ -2372,7 +2313,6 @@ async function verifyConsolidationReceiptSet(
   lease: ConsolidationLeaseToken,
   expectedBatchIndexes: readonly number[]
 ): Promise<void> {
-  assertConsolidationLeaseToken(lease);
   const postState = await database.withSession("first-primary").prepare(
     `WITH target(project_id, consolidation_id) AS (VALUES (?, ?)),
           expected_batches AS (
@@ -2559,7 +2499,6 @@ export async function failConsolidation(
   consolidationId: string,
   lease: ConsolidationLeaseToken
 ): Promise<void> {
-  assertConsolidationLeaseToken(lease);
   if (
     await isExactFailedConsolidation(
       database,

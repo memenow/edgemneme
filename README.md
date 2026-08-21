@@ -242,9 +242,8 @@ Cloudflare trigger after the workflow proves this run's exact active version
 and tag. Separately configured URL and host values are not accepted as
 deployment authority.
 
-Configure `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`,
-`TOKEN_DIGEST_PEPPER`, and `PAGE_TOKEN_HMAC_KEY` as protected environment
-secrets. `GITHUB_CLASSIC_TOKEN` is required only for an approved GitHub sync
+Configure `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, and
+`TOKEN_DIGEST_PEPPER` as protected environment secrets. `GITHUB_CLASSIC_TOKEN` is required only for an approved GitHub sync
 deployment. Never place secret values in tracked files, D1, R2, Queue messages,
 logs, artifacts, or issue comments.
 
@@ -253,8 +252,6 @@ secrets interactively on the existing gateway Worker:
 
 ```bash
 pnpm exec wrangler secret put TOKEN_DIGEST_PEPPER \
-  --config wrangler/.wrangler/memory-gateway.generated.jsonc
-pnpm exec wrangler secret put PAGE_TOKEN_HMAC_KEY \
   --config wrangler/.wrangler/memory-gateway.generated.jsonc
 ```
 

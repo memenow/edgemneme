@@ -224,7 +224,7 @@ describe("Wrangler deployment config renderer", () => {
 
     expect(source).toEqual(snapshot);
     expect(rendered).toMatchObject({
-      secrets: { required: ["TOKEN_DIGEST_PEPPER", "PAGE_TOKEN_HMAC_KEY"] },
+      secrets: { required: ["TOKEN_DIGEST_PEPPER"] },
       d1_databases: [{ binding: "MEMORY_DB" }, { binding: "SEARCH_DB" }]
     });
   });
@@ -294,7 +294,6 @@ describe("Wrangler deployment config renderer", () => {
     const rendered = renderConfig("memory-gateway", sourceConfig("memory-gateway"), {
       ...baseEnvironment,
       TOKEN_DIGEST_PEPPER: sensitiveValue,
-      PAGE_TOKEN_HMAC_KEY: sensitiveValue,
       GITHUB_CLASSIC_TOKEN: sensitiveValue
     });
 
