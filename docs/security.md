@@ -1,5 +1,17 @@
 # Security
 
+## MCP authorization decision
+
+EdgeMneme deliberately uses a revocable per-principal project bearer token
+(HMAC digest at rest) instead of the OAuth 2.1 flow described by the MCP
+authorization specification. The service targets Codex, Claude Code, and
+other coding agents that are configured with a static token; there is no
+human consent screen and no third-party client ecosystem to discover.
+Consequence: generic MCP clients that require OAuth discovery
+(`/.well-known/oauth-protected-resource`, RFC 9728) cannot connect. If
+EdgeMneme ever serves such clients, add an OAuth 2.1 resource-server layer in
+front of the gateway rather than weakening the token contract.
+
 ## Credential boundaries
 
 - `memory-gateway` receives only its token-digest pepper and page-token HMAC

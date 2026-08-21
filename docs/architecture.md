@@ -86,7 +86,7 @@ MCP client
            -> immutable R2 snapshot
            -> current-generation FTS and Vectorize projection
 
-Cloudflare Cron (* * * * * UTC)
+Cloudflare Cron (*/5 * * * * UTC)
   -> reconcile dispatched ordinary outbox events from D1
      -> recover Queue/DLQ deliveries that produced no Workflow run
      -> reuse the stable base Workflow or one of three repair IDs
@@ -208,7 +208,7 @@ consolidation complete.
 ## Workflow recovery
 
 The Queue, Workflow control plane, and D1 dispatch marker are separate failure
-domains. The one-minute orchestrator schedule therefore selects at most 20
+domains. The five-minute orchestrator schedule therefore selects at most 20
 eligible dispatched ordinary events from the D1 outbox. The covered events are
 `candidate.submitted`, `candidate.reviewed`,
 `session.consolidation.requested`, `github.sync.requested`, and

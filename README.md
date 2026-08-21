@@ -39,7 +39,7 @@ a separately approved credential and repository-access baseline are present.
 - `memory-orchestrator` is the only Queue consumer. It owns the
   `ProjectCoordinator` Durable Object and `MemoryWorkflow`, commits formal
   changes through guarded D1 batches, and creates immutable R2 projections. Its
-  one-minute maintenance pass reconciles dispatched ordinary outbox events even
+  five-minute maintenance pass reconciles dispatched ordinary outbox events even
   when Queue delivery reaches the dead-letter Queue before a Workflow starts.
   Unknown control-plane state is deferred without advancing a repair identity;
   explicit terminal failures may use the stable base Workflow ID plus three
@@ -285,8 +285,8 @@ resources, and the full normalized account binding inventory participates in
 the maintenance fingerprint. Queue metrics are approximate corroboration, not
 a drain proof. The workflow applies and validates SEARCH_DB before MEMORY_DB; a
 partial success remains in maintenance and is recovered only by roll-forward.
-See the operations runbook for the complete control-plane, SEARCH `0005`,
-backup, and future in-place-upgrade boundary.
+See the operations runbook for the complete control-plane and backup
+boundary.
 
 The deployment and migration workflows share the workflow-level
 `production-cloudflare` concurrency group with `queue: max`, so queued
