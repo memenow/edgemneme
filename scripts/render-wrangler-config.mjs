@@ -180,6 +180,19 @@ function rebaseRelativePaths(config) {
       }
     }
   }
+  if (Array.isArray(config.containers)) {
+    for (const container of config.containers) {
+      if (
+        typeof container?.image === "string" &&
+        container.image.startsWith("../")
+      ) {
+        container.image = rebaseParentPath(
+          container.image,
+          `${container.class_name ?? "unknown"}.image`
+        );
+      }
+    }
+  }
 }
 
 function rebaseParentPath(value, property) {
