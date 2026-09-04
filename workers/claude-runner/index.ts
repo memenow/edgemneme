@@ -1,6 +1,5 @@
 interface Env {
   ENABLED: string;
-  ANTHROPIC_API_KEY?: string;
 }
 
 export default {

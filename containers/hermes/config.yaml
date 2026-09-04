@@ -1,0 +1,27 @@
+# Hermes Agent profile configuration for the edgemneme container.
+#
+# Verified 2026-09-04 against hermes-agent 0.21.0 (official image,
+# `gateway run` + OpenAI-compatible API on :8642):
+#   - main-model custom endpoint shape below is accepted (provider: custom,
+#     base_url, api_mode: chat_completions, api_key as "${VAR}" reference).
+#   - meta-muse alias shape (provider: custom, base_url, key_env) per the
+#     custom-aliases docs.
+#   - Live test: PONG + JSON-only contract answer via muse-spark-1.3.
+#   - NOTE: base_url MUST include the /v1 suffix; without it Hermes calls
+#     https://api.meta.ai/chat/completions which Meta answers with 404.
+# MODEL_API_KEY / META_MODEL_API_KEY is injected at deploy time via the
+# container secret environment and never committed.
+
+model:
+  provider: custom
+  default: muse-spark-1.3
+  base_url: "https://api.meta.ai/v1"
+  api_mode: chat_completions
+  api_key: "${META_MODEL_API_KEY}"
+
+model_aliases:
+  meta-muse:
+    model: muse-spark-1.3
+    provider: custom
+    base_url: "https://api.meta.ai/v1"
+    key_env: META_MODEL_API_KEY

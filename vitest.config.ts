@@ -21,6 +21,7 @@ export default defineConfig({
         "src/projection/snapshot.ts",
         "src/projection/validation.ts",
         "src/quality/model-analysis.ts",
+        "src/quality/model-runner.ts",
         "src/quality/scope-options.ts",
         "src/quality/sensitive-content.ts",
         "src/search/chunking.ts",

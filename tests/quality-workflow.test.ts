@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { ModelResponseDecodeError } from "../src/quality/model-runner";
 import {
   consolidateSession,
   processCandidateSubmission
@@ -563,6 +564,47 @@ describe("quality workflow consolidation", () => {
     expect(fixture.state.status).toBe("failed");
     expect(fixture.state.outputs).toEqual([]);
     expect(fixture.state.observations).toEqual([]);
+  });
+
+  it("carries the decode failure identity when model responses never decode", async () => {
+    const fixture = createConsolidationFixture({
+      modelAttempts: [
+        { kind: "raw", response: modelFunctionResponse("wrong_function", { suggestions: [] }) },
+        { kind: "raw", response: modelFunctionResponse("wrong_function", { suggestions: [] }) },
+        { kind: "raw", response: modelFunctionResponse("wrong_function", { suggestions: [] }) }
+      ]
+    });
+
+    const failure = await consolidateSession(
+      fixture.env,
+      PROJECT_ID,
+      CONSOLIDATION_ID,
+      SESSION_ID,
+      LEASE_OWNER
+    ).catch((error: unknown) => error);
+
+    expect(failure).toMatchObject({ code: "WORKFLOW_FAILED" });
+    expect((failure as { cause?: unknown }).cause).toBeInstanceOf(ModelResponseDecodeError);
+  });
+
+  it("carries the transport failure identity when model calls never succeed", async () => {
+    const fixture = createConsolidationFixture({
+      modelAttempts: [{ kind: "throw" }, { kind: "throw" }, { kind: "throw" }]
+    });
+
+    const failure = await consolidateSession(
+      fixture.env,
+      PROJECT_ID,
+      CONSOLIDATION_ID,
+      SESSION_ID,
+      LEASE_OWNER
+    ).catch((error: unknown) => error);
+
+    expect(failure).toMatchObject({ code: "WORKFLOW_FAILED" });
+    expect((failure as { cause?: unknown }).cause).toBeInstanceOf(Error);
+    expect((failure as { cause?: unknown }).cause).not.toBeInstanceOf(
+      ModelResponseDecodeError
+    );
   });
 
   it("accepts an explicit empty suggestion list as a permanent noop", async () => {

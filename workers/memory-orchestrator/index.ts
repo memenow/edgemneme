@@ -40,6 +40,12 @@ import {
   type ConsolidationLeaseToken
 } from "../../src/workflows/quality";
 import {
+  HermesContainer,
+  resolveOrchestratorModelRunner
+} from "./hermes-container";
+
+export { HermesContainer };
+import {
   ensureWorkflowWithRepair,
   WorkflowControlPlaneStatusError,
   WorkflowRepairExhaustedError
@@ -139,6 +145,12 @@ interface Env {
   AI: Ai;
   MEMORY_WORKFLOW: Workflow<WorkflowPayload>;
   MEMORY_OUTBOX: Queue<MemoryEvent>;
+  PROJECT_COORDINATOR?: DurableObjectNamespace<ProjectCoordinator>;
+  HERMES?: DurableObjectNamespace<HermesContainer>;
+  MODEL_RUNNER?: string;
+  HERMES_PROFILE?: string;
+  HERMES_CREDENTIAL_VERSION?: string;
+  HERMES_SHARED_SECRET?: string;
 }
 
 
@@ -1463,7 +1475,10 @@ export class MemoryWorkflow extends WorkflowEntrypoint<Env, WorkflowPayload> {
                   event.payload.projectId
                 );
                 return consolidateSessionBatch(
-                  this.env,
+                  {
+                    ...this.env,
+                    modelRunner: resolveOrchestratorModelRunner(this.env)
+                  },
                   event.payload.projectId,
                   event.payload.eventId,
                   event.payload.subjectId,
@@ -1504,7 +1519,10 @@ export class MemoryWorkflow extends WorkflowEntrypoint<Env, WorkflowPayload> {
           }
           if (event.payload.type === "candidate.submitted") {
             return processCandidateSubmission(
-              this.env,
+              {
+                ...this.env,
+                modelRunner: resolveOrchestratorModelRunner(this.env)
+              },
               event.payload.projectId,
               event.payload.subjectId
             );

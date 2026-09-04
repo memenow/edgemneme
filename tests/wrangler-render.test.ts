@@ -127,6 +127,60 @@ describe("Wrangler deployment config renderer", () => {
     });
   });
 
+  it("rebases relative container image paths and preserves the Hermes binding", () => {
+    const rendered = renderConfig(
+      "memory-orchestrator",
+      sourceConfig("memory-orchestrator"),
+      baseEnvironment
+    );
+
+    expect(rendered).toMatchObject({
+      vars: {
+        MODEL_RUNNER: "workers-ai",
+        HERMES_PROFILE: "meta-muse",
+        HERMES_CREDENTIAL_VERSION: "unconfigured"
+      },
+      containers: [
+        {
+          class_name: "HermesContainer",
+          image: "../../containers/hermes/Dockerfile",
+          max_instances: 2
+        }
+      ],
+      durable_objects: {
+        bindings: [
+          { name: "PROJECT_COORDINATOR", class_name: "ProjectCoordinator" },
+          { name: "HERMES", class_name: "HermesContainer" }
+        ]
+      },
+      exports: {
+        ProjectCoordinator: {
+          type: "durable-object",
+          state: "created",
+          storage: "sqlite"
+        },
+        HermesContainer: {
+          type: "durable-object",
+          state: "created",
+          storage: "sqlite"
+        }
+      }
+    });
+  });
+
+  it("leaves registry container image references untouched", () => {
+    const config = sourceConfig("memory-orchestrator");
+    config.containers = [
+      { class_name: "HermesContainer", image: "registry.example.com/hermes:1.0" }
+    ];
+
+    const rendered = renderConfig("memory-orchestrator", config, baseEnvironment);
+
+    expect(rendered).toMatchObject({
+      containers: [{ image: "registry.example.com/hermes:1.0" }]
+    });
+  });
+
   it("uses workers.dev when no custom domain or browser origins are configured", () => {
     const rendered = renderConfig("memory-gateway", sourceConfig("memory-gateway"), {
       ...baseEnvironment,

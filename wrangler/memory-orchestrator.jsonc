@@ -38,6 +38,18 @@
   "ai": {
     "binding": "AI"
   },
+  "vars": {
+    "MODEL_RUNNER": "workers-ai",
+    "HERMES_PROFILE": "meta-muse",
+    "HERMES_CREDENTIAL_VERSION": "unconfigured"
+  },
+  "containers": [
+    {
+      "class_name": "HermesContainer",
+      "image": "../containers/hermes/Dockerfile",
+      "max_instances": 2
+    }
+  ],
   "queues": {
     "producers": [
       {
@@ -73,11 +85,20 @@
       {
         "name": "PROJECT_COORDINATOR",
         "class_name": "ProjectCoordinator"
+      },
+      {
+        "name": "HERMES",
+        "class_name": "HermesContainer"
       }
     ]
   },
   "exports": {
     "ProjectCoordinator": {
+      "type": "durable-object",
+      "state": "created",
+      "storage": "sqlite"
+    },
+    "HermesContainer": {
       "type": "durable-object",
       "state": "created",
       "storage": "sqlite"
