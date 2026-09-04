@@ -15,6 +15,7 @@ export interface ModelCompletionRequest {
   messages: ModelCompletionMessages;
   tools: readonly unknown[];
   toolChoice: unknown;
+  contractJson: string;
   maxCompletionTokens: number;
   temperature: number;
   functionName: string;
@@ -72,6 +73,26 @@ export interface HermesTransportRequest {
   system: string;
   user: string;
   functionName: string;
+  contractJson: string;
+  maxCompletionTokens: number;
+}
+
+export function hermesInstanceId(profile: string, projectId?: string): string {
+  return projectId === undefined || projectId === ""
+    ? `hermes-${profile}`
+    : `hermes-${profile}-${projectId}`;
+}
+
+export function serializeHermesBody(request: HermesTransportRequest): string {
+  return JSON.stringify({
+    profile: request.profile,
+    system: request.system,
+    user: request.user,
+    functionName: request.functionName,
+    idempotency_key: request.idempotencyKey,
+    contract: request.contractJson,
+    max_completion_tokens: request.maxCompletionTokens
+  });
 }
 
 export interface HermesTransportResponse {
@@ -92,8 +113,12 @@ export interface ModelRunnerEnv {
 }
 
 export function resolveModelRunner(env: ModelRunnerEnv): ModelRunner {
-  if ((env.runnerName ?? MODEL_RUNNER_WORKERS_AI) !== MODEL_RUNNER_HERMES) {
+  const selection = env.runnerName ?? MODEL_RUNNER_WORKERS_AI;
+  if (selection === MODEL_RUNNER_WORKERS_AI) {
     return new WorkersAiRunner(env.ai, env.model);
+  }
+  if (selection !== MODEL_RUNNER_HERMES) {
+    throw new Error(`Unknown model runner selection: ${selection}.`);
   }
   if (env.transport === undefined) {
     throw new Error("Hermes model runner selected but no transport is configured.");
@@ -108,11 +133,12 @@ export function resolveModelRunner(env: ModelRunnerEnv): ModelRunner {
 }
 
 // Non-default path: the Hermes container speaks plain text, so unlike the
-// Workers AI path there is no forced tool_choice, temperature, or token
-// budget — schema discipline comes from the downstream zod parsers and the
-// verbatim-evidence checks, with failures mapping to the existing deferred
-// diagnostic codes. Do not assume output parity with Workers AI; the shadow
-// comparison in Phase 1.5 measures the schema-valid rate before any cutover.
+// Workers AI path there is no forced tool_choice or temperature — the tool
+// contract is sent as prompt text and schema discipline comes from the
+// downstream zod parsers and the verbatim-evidence checks, with failures
+// mapping to the existing deferred diagnostic codes. Do not assume output
+// parity with Workers AI; the shadow comparison in Phase 1.5 measures the
+// schema-valid rate before any cutover.
 export class HermesRunner implements ModelRunner {
   readonly kind = MODEL_RUNNER_HERMES;
 
@@ -129,7 +155,9 @@ export class HermesRunner implements ModelRunner {
       idempotencyKey: request.idempotencyKey,
       system,
       user,
-      functionName: request.functionName
+      functionName: request.functionName,
+      contractJson: request.contractJson,
+      maxCompletionTokens: request.maxCompletionTokens
     });
     try {
       return readModelJson(response.text);

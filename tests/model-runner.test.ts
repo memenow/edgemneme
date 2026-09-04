@@ -6,7 +6,9 @@ import {
   HermesRunner,
   ModelResponseDecodeError,
   WorkersAiRunner,
+  hermesInstanceId,
   resolveModelRunner,
+  serializeHermesBody,
   type ModelCompletionRequest
 } from "../src/quality/model-runner";
 
@@ -18,6 +20,7 @@ function completionRequest(overrides: Partial<ModelCompletionRequest> = {}): Mod
     ],
     tools: [{ type: "function" }],
     toolChoice: { type: "function", function: { name: "candidate_analysis" } },
+    contractJson: "{\"tools\":[]}",
     maxCompletionTokens: 128,
     temperature: 0,
     functionName: "candidate_analysis",
@@ -102,7 +105,9 @@ describe("HermesRunner", () => {
       idempotencyKey: "candidate-analysis-project-0123456789abcdef",
       system: "system prompt",
       user: "{\"candidate\":\"hello\"}",
-      functionName: "candidate_analysis"
+      functionName: "candidate_analysis",
+      contractJson: "{\"tools\":[]}",
+      maxCompletionTokens: 128
     });
   });
 
@@ -141,6 +146,42 @@ describe("resolveModelRunner", () => {
     });
 
     expect(runner.kind).toBe("hermes");
+  });
+
+  it("rejects an unknown runner name instead of silently using Workers AI", () => {
+    expect(() =>
+      resolveModelRunner({ ai: ai(), model: ANALYSIS_MODEL, runnerName: "HERMES" })
+    ).toThrow(/unknown model runner/iu);
+  });
+
+  it("namespaces container instances by project", () => {
+    expect(hermesInstanceId("meta-muse")).toBe("hermes-meta-muse");
+    expect(hermesInstanceId("meta-muse", "")).toBe("hermes-meta-muse");
+    expect(hermesInstanceId("meta-muse", "project-1")).toBe("hermes-meta-muse-project-1");
+  });
+
+  it("serializes the full Hermes contract including idempotency key", () => {
+    const body = JSON.parse(
+      serializeHermesBody({
+        profile: "meta-muse",
+        idempotencyKey: "key-1",
+        system: "s",
+        user: "u",
+        functionName: "candidate_analysis",
+        contractJson: "{\"tools\":[]}",
+        maxCompletionTokens: 128
+      })
+    ) as Record<string, unknown>;
+
+    expect(body).toEqual({
+      profile: "meta-muse",
+      system: "s",
+      user: "u",
+      functionName: "candidate_analysis",
+      idempotency_key: "key-1",
+      contract: "{\"tools\":[]}",
+      max_completion_tokens: 128
+    });
   });
 
   it("uses the default profile when none is configured", async () => {

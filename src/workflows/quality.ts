@@ -1253,6 +1253,10 @@ async function analyzeCandidate(
   let lastDiagnosticCode: CandidateAnalysisDiagnosticCode =
     "AI_ANALYSIS_DEFERRED_MODEL_CALL";
   const idempotencyKey = `candidate-analysis-${projectId}-${(await sha256(canonicalJson(modelPayload))).slice(0, 16)}`;
+  const contractJson = canonicalJson({
+    tools: [analysisTool],
+    tool_choice: CANDIDATE_ANALYSIS_TOOL_CHOICE
+  });
   for (let attempt = 0; attempt < MODEL_ANALYSIS_MAX_ATTEMPTS; attempt += 1) {
     let response: unknown;
     try {
@@ -1260,6 +1264,7 @@ async function analyzeCandidate(
         messages,
         tools: [analysisTool],
         toolChoice: CANDIDATE_ANALYSIS_TOOL_CHOICE,
+        contractJson,
         maxCompletionTokens: maximumCompletionTokens(
           messages,
           [analysisTool],
@@ -1431,6 +1436,10 @@ async function analyzeConsolidation(
   ];
   const inputById = new Map(inputs.map((input) => [input.source_id, input.content]));
   const idempotencyKey = `consolidation-suggestions-${projectId}-${(await sha256(canonicalJson(compactInputs))).slice(0, 16)}`;
+  const contractJson = canonicalJson({
+    tools: [suggestionsTool],
+    tool_choice: CONSOLIDATION_SUGGESTIONS_TOOL_CHOICE
+  });
   let filteredCount = 0;
   let lastFilterReason: "scope-evidence" | "model-input" | "temporal-evidence" | null =
     null;
@@ -1443,6 +1452,7 @@ async function analyzeConsolidation(
         messages,
         tools: [suggestionsTool],
         toolChoice: CONSOLIDATION_SUGGESTIONS_TOOL_CHOICE,
+        contractJson,
         maxCompletionTokens: maximumCompletionTokens(
           messages,
           [suggestionsTool],

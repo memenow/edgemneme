@@ -1477,7 +1477,10 @@ export class MemoryWorkflow extends WorkflowEntrypoint<Env, WorkflowPayload> {
                 return consolidateSessionBatch(
                   {
                     ...this.env,
-                    modelRunner: resolveOrchestratorModelRunner(this.env)
+                    modelRunner: resolveOrchestratorModelRunner(
+                      this.env,
+                      event.payload.projectId
+                    )
                   },
                   event.payload.projectId,
                   event.payload.eventId,
@@ -1521,7 +1524,10 @@ export class MemoryWorkflow extends WorkflowEntrypoint<Env, WorkflowPayload> {
             return processCandidateSubmission(
               {
                 ...this.env,
-                modelRunner: resolveOrchestratorModelRunner(this.env)
+                modelRunner: resolveOrchestratorModelRunner(
+                  this.env,
+                  event.payload.projectId
+                )
               },
               event.payload.projectId,
               event.payload.subjectId
