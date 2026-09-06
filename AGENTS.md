@@ -36,8 +36,9 @@
 - Preserve the hard project boundary and normalized repository context across
   D1, Durable Objects, Queue and Workflow payloads, Vectorize namespaces, and
   R2 prefixes.
-- `scripts/` owns Node.js operational CLIs. `.github/workflows/` owns CI and
-  protected production orchestration. Do not extend the already oversized
+- `scripts/` owns Node.js operational CLIs. `.github/workflows/` owns CI only;
+  production deployment runs through Cloudflare Workers Builds and local
+  operator commands. Do not extend the already oversized
   Worker, workflow, gateway, or indexing files with a new responsibility;
   split only at a real domain boundary with focused tests.
 
@@ -56,7 +57,7 @@
   secret files, `coverage/`, `dist/`, `node_modules/`, or `.gitnexus/` output.
 - Keep Wrangler bindings, the matching Worker `Env` shape, runtime access,
   renderer tests, and dry-run bundles synchronized. Secrets belong in Worker
-  secrets or protected GitHub environments, never vars, source, fixtures,
+  secrets managed through the Cloudflare dashboard, never vars, source, fixtures,
   logs, D1, R2, Queue or Workflow payloads, or model input.
 
 ## Tests and validation

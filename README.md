@@ -17,9 +17,9 @@ authorization, repository-bound sessions and evidence, guarded formal-memory
 commits, candidate review and session consolidation, hybrid FTS/Vectorize
 retrieval and reranking, immutable R2 snapshots, durable recovery for dispatched
 Workflow-backed outbox events, and a fail-closed Workflow-backed GitHub reader. The
-open-source repository keeps only non-deployable Wrangler templates. GitHub
-Actions renders private deployment configuration from the protected
-`production` environment.
+open-source repository keeps only non-deployable Wrangler templates. Cloudflare
+Workers Builds renders private deployment configuration from build-only
+variables, and GitHub runs only the secret-free CI checks.
 
 The source is validated by strict type, test, coverage, migration, and Wrangler
 bundle checks. A deployment requires provisioned Cloudflare resources, remote
@@ -169,8 +169,8 @@ D1 and verify the backfill before serving the filtered semantic query path.
 Project namespace names, active generation IDs, and internal repository IDs
 must each fit within 64 UTF-8 bytes; runtime publication, query planning, and
 rebuild preflight reject wider values. Each project consumes one Vectorize
-namespace, so account plan namespace limits are a capacity boundary. The deploy
-workflow creates only missing required indexes, fails closed on incompatible or
+namespace, so account plan namespace limits are a capacity boundary. The release
+procedure verifies the exact required index set, fails closed on incompatible or
 unexpected index drift, and completes the D1-authoritative rebuild before
 deploying the public gateway.
 
@@ -195,8 +195,9 @@ pnpm exec wrangler d1 migrations apply SEARCH_DB \
 
 The committed Wrangler files contain non-deployable resource placeholders.
 Never replace them in tracked files. `scripts/render-wrangler-config.mjs`
-creates ignored, mode-`0600` configuration under `wrangler/.wrangler/` from the
-GitHub `production` environment.
+creates ignored, mode-`0600` configuration under `wrangler/.wrangler/` from
+deployment variables supplied by Cloudflare build settings or a local operator
+shell.
 
 Configure these environment variables for deployment and production migration:
 
@@ -212,7 +213,7 @@ Configure these environment variables for deployment and production migration:
 - `MEMORY_GATEWAY_CUSTOM_DOMAIN` (optional route only; an empty value uses `workers.dev`)
 - `SYNC_CREDENTIAL_VERSION` (required only when GitHub sync is enabled)
 
-The deployment workflow derives the production canary URL and hostname from
+The release procedure derives the production canary URL and hostname from
 the verified remote gateway trigger. Do not configure a separate canary URL or
 host as deployment authority.
 
@@ -221,7 +222,7 @@ custom domain registration or enabled `r2.dev` URL, and must never appear in a
 tracked or generated Worker `r2_buckets` binding. Configure exactly one enabled
 object-deletion lifecycle rule for `system/backups/d1-migrations/` with ID
 `edgemneme-d1-migration-backups-retention`; its age in seconds must equal
-`D1_MIGRATION_BACKUP_RETENTION_DAYS * 86400`. The migration workflow validates
+`D1_MIGRATION_BACKUP_RETENTION_DAYS * 86400`. The local migration run validates
 the bucket and lifecycle through the Cloudflare API before exporting and again
 immediately before uploading production data. It never creates or repairs this
 control-plane configuration. The maintenance gate also resolves every live
@@ -230,28 +231,23 @@ in that immutable version's resource bindings; the checked-out Wrangler scan is
 not treated as proof that a renamed or unrelated live Worker is isolated. See
 [Operations](docs/operations.md#provisioning-order) for the exact rule shape.
 
-Create a separate `production-rollback` environment for unattended recovery.
-Restrict it to `main`, configure no required reviewers or wait timer, copy the
-five `CF_*` identifiers plus `ENABLE_GITHUB_SYNC`, the conditional
-`SYNC_CREDENTIAL_VERSION`, and both optional gateway routing values exactly.
-Set `CF_ROLLBACK_ACCOUNT_ID` to the production account and
-`UNATTENDED_ROLLBACK_ENABLED=true`. Store a separately issued,
-account-scoped `CLOUDFLARE_ROLLBACK_API_TOKEN` as an environment-level secret;
-do not inherit the normal deployment token into this environment. Production
-capture emits only a SHA-256 configuration fingerprint. The rollback preflight
-must match that fingerprint and read the captured Worker state with the
-dedicated credential before deployment can continue.
+There is no unattended rollback environment. Recovery is an explicit operator
+action: roll a Worker back to a previous version from the Cloudflare dashboard
+or redeploy a known-good commit, then follow the manual roll-forward procedure
+in the operations runbook. Never run two production changes concurrently.
 
 The production canary URL and host are derived from the gateway's verified
-Cloudflare trigger after the workflow proves this run's exact active version
-and tag. Separately configured URL and host values are not accepted as
+Cloudflare trigger after the operator proves the exact deployed active version.
+Separately configured URL and host values are not accepted as
 deployment authority.
 
-Configure `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`,
-`TOKEN_DIGEST_PEPPER`, and `PAGE_TOKEN_HMAC_KEY` as protected environment
-secrets. `GITHUB_CLASSIC_TOKEN` is required only for an approved GitHub sync
-deployment. Never place secret values in tracked files, D1, R2, Queue messages,
-logs, artifacts, or issue comments.
+Configure `TOKEN_DIGEST_PEPPER` and `PAGE_TOKEN_HMAC_KEY` as dashboard Worker
+secrets on `memory-gateway`. `GITHUB_CLASSIC_TOKEN` is required only for an
+approved GitHub sync deployment. Local `wrangler` commands authenticate with
+`wrangler login`; the helper scripts additionally require a
+`CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID` pair in the environment, kept
+outside the repository. Never place secret values in tracked files, D1, R2,
+Queue messages, logs, artifacts, or issue comments.
 
 After rendering a deployment config locally, an operator can rotate the gateway
 secrets interactively on the existing gateway Worker:
@@ -268,47 +264,41 @@ binds every dispatch and recovery receipt to `SYNC_CREDENTIAL_VERSION`, so the
 token and its new version must be promoted together through the drained
 deployment procedure in the operations runbook.
 
-The deploy workflow validates source templates, renders ignored configuration,
+The release procedure validates source templates, renders ignored configuration,
 deploys `memory-orchestrator` before `memory-gateway`, and reconciles
 `github-sync` to the explicit lifecycle gate. Enabling sync installs exactly one
 six-hour Cron Trigger, three private Workflow definitions, and its Worker secret.
 Disabling sync leaves an absent Worker absent. An existing Worker is first
-redeployed inert with no Cron while retaining its secret. The workflow then
+redeployed inert with no Cron while retaining its secret. The operator then
 exhaustively drains Cloudflare Workflow instances. After proving the exact
-disabled Worker, empty schedule, and no nonterminal GitHub Workflow, the
-protected Action may reconcile only the GitHub synchronization ledgers through
-bounded, receipt-verified D1 transactions. It rechecks the control plane after
-every pass and requires two all-zero observations 60 seconds apart before
+disabled Worker, empty schedule, and no nonterminal GitHub Workflow, only the
+GitHub synchronization ledgers may be reconciled through bounded,
+receipt-verified D1 transactions. The control plane is rechecked after
+every pass and two all-zero observations 60 seconds apart are required before
 deleting the Worker secret. This operational writer cannot change formal memory.
 Unknown, malformed, rate-limited, or drifting control-plane state fails closed.
-Production D1 migrations use the separate manual workflow and require the exact
-confirmation value `APPLY`. The current admission is intentionally
-greenfield-only: it performs two stable, read-only observations before backup,
-repeats them against the captured fingerprint immediately before the first D1
-write, and fails with `MISSING_DURABLE_MAINTENANCE_FENCE` if any core Worker,
-core Workflow definition, production data, or live Worker binding to either
-generated D1 UUID exists. Any live binding to the backup-only R2 bucket also
-blocks the migration. Service, D1, and R2 checks use immutable active-version
-resources, and the full normalized account binding inventory participates in
-the maintenance fingerprint. Queue metrics are approximate corroboration, not
-a drain proof. The workflow applies and validates SEARCH_DB before MEMORY_DB; a
-partial success remains in maintenance and is recovered only by roll-forward.
-See the operations runbook for the complete control-plane, SEARCH `0005`,
-backup, and future in-place-upgrade boundary.
+Production D1 migrations run from an explicit local operator command, never from
+a push. The current admission is intentionally greenfield-only: it performs two
+stable, read-only observations before backup, repeats them against the captured
+fingerprint immediately before the first D1 write, and fails with
+`MISSING_DURABLE_MAINTENANCE_FENCE` if any core Worker, core Workflow
+definition, production data, or live Worker binding to either generated D1 UUID
+exists. Any live binding to the backup-only R2 bucket also blocks the migration.
+Service, D1, and R2 checks use immutable active-version resources, and the full
+normalized account binding inventory participates in the maintenance
+fingerprint. Queue metrics are approximate corroboration, not a drain proof. The
+run applies and validates SEARCH_DB before MEMORY_DB; a partial success remains
+in maintenance and is recovered only by roll-forward. See the operations runbook
+for the complete control-plane, SEARCH `0005`, backup, and future
+in-place-upgrade boundary.
 
-The deployment and migration workflows share the workflow-level
-`production-cloudflare` concurrency group with `queue: max`, so queued
-production changes are retained up to the platform queue limit and run
-serially. Queue order is not an ordering guarantee, so both workflows reject a
-run whose source is no longer the current `main` commit before any production
-mutation. Deployment first captures Worker state in an independent read-only
-job, then revalidates that baseline immediately before each Worker lifecycle
-mutation. The deploy job has a 240-minute ceiling with explicit bounds on its
-long-running steps. An ordinary deployment failure or cancellation starts
-rollback from the independent capture through the unattended
-`production-rollback` environment. A GitHub force-cancel can bypass `always()`
-rollback jobs; follow the manual roll-forward or recovery procedure in the
-operations runbook in that case.
+Deployments and migrations are serialized by operator discipline, not by a
+shared queue: never start a second production change while one is in flight,
+and never merge code that depends on a not-yet-applied migration. Before any
+production mutation, revalidate that the checkout is the current `main` commit.
+A failed deployment is recovered by an explicit dashboard rollback or a
+roll-forward redeploy, followed by the manual recovery procedure in the
+operations runbook.
 
 Each device or agent receives a separate random project token. Store only its
 HMAC digest in `principals.token_digest`; the plaintext token is shown once to
@@ -325,7 +315,7 @@ workers/memory-orchestrator/ Queue, Workflow, and Durable Object Worker
 workers/github-sync/         Private Workflow-backed GitHub reader
 workers/claude-runner/       Disabled optional escalation boundary
 wrangler/                    One source-of-truth configuration per Worker
-.github/workflows/           Validation, deployment, and manual migration workflows
+.github/workflows/           Secret-free CI validation only
 docs/                        Architecture, API, security, and operations
 ```
 
