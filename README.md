@@ -243,8 +243,9 @@ deployment authority.
 
 Configure `TOKEN_DIGEST_PEPPER` and `PAGE_TOKEN_HMAC_KEY` as dashboard Worker
 secrets on `memory-gateway`. `GITHUB_CLASSIC_TOKEN` is required only for an
-approved GitHub sync deployment. Local operator commands authenticate with
-`wrangler login` or a `CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID` pair kept
+approved GitHub sync deployment. Local `wrangler` commands authenticate with
+`wrangler login`; the helper scripts additionally require a
+`CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID` pair in the environment, kept
 outside the repository. Never place secret values in tracked files, D1, R2,
 Queue messages, logs, artifacts, or issue comments.
 

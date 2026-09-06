@@ -161,11 +161,20 @@ Export the deployment variables plus backup provenance for the manifest:
 ```bash
 export CF_D1_MEMORY_DATABASE_ID="..." CF_D1_SEARCH_DATABASE_ID="..."
 export D1_MIGRATION_BACKUP_R2_BUCKET="..." D1_MIGRATION_BACKUP_RETENTION_DAYS="..."
+export CLOUDFLARE_ACCOUNT_ID="..."
+read -rs CLOUDFLARE_API_TOKEN && export CLOUDFLARE_API_TOKEN
 export GITHUB_SHA="$(git rev-parse HEAD)" GITHUB_RUN_ID="local-$(date -u +%Y%m%dT%H%M%SZ)"
 export GITHUB_RUN_ATTEMPT="1"
 node scripts/render-wrangler-config.mjs memory-orchestrator
 node scripts/verify-d1-backup-bucket.mjs
 ```
+
+Raw `wrangler` commands authenticate with `wrangler login`, but every helper
+script that queries Cloudflare directly (`verify-d1-backup-bucket`,
+`d1-maintenance-*`, `delete-worker-script`, `github-sync-quiescence`,
+`gateway-deployment-target`) requires `CLOUDFLARE_ACCOUNT_ID` and
+`CLOUDFLARE_API_TOKEN` in the environment. Read the token with `read -rs` so
+it never lands in shell history.
 
 Then capture the maintenance fingerprint, retain the Time Travel bookmarks and
 the byte-verified private R2 export set, re-verify the fingerprint, and apply
@@ -240,7 +249,7 @@ For a local release instead of a push, export the same variables in an operator
 shell, render with `node scripts/render-wrangler-config.mjs
 memory-orchestrator memory-gateway github-sync`, and run the same
 `wrangler deploy --config ...` commands in dependency order: orchestrator,
-then gateway, then github-sync. Local deploys authenticate with
+then gateway, then github-sync. Local `wrangler` commands authenticate with
 `wrangler login`. Never deploy `claude-runner`; it is a disabled boundary and
 is not connected to Builds.
 
@@ -255,8 +264,10 @@ read -rs TOKEN_DIGEST_PEPPER && export TOKEN_DIGEST_PEPPER
 node scripts/run-synthetic-canary.mjs
 ```
 
-`scripts/gateway-deployment-target.mjs capture-canary-target` can derive the
-verified target into a `GITHUB_OUTPUT`-style file for scripting. The runner
+`GITHUB_OUTPUT=/tmp/edgemneme-canary-target node
+scripts/gateway-deployment-target.mjs capture-canary-target <rendered-config>`
+can derive the verified target into that file for scripting; it needs the
+`CLOUDFLARE_*` environment above. The runner
 creates an exact `system.synthetic.<uuid>` project and one-time principal,
 invokes `scripts/synthetic-canary-client.mjs`, and removes the registered
 synthetic records in a `finally` cleanup path. Its recoverable cleanup ledger
@@ -331,9 +342,9 @@ Keep `github-sync` disabled and absent until its entrypoints, credential, and
 repository-access baseline are separately verified. A bootstrap has no prior
 version to restore: if the gateway deploy fails, prove the exact active version
 before deleting the Worker script with
-`node scripts/delete-worker-script.mjs edgemneme-memory-gateway`, and retain
-the orchestrator for a reviewed roll-forward. Never rerun a bootstrap against
-a mixed state.
+`node scripts/delete-worker-script.mjs edgemneme-memory-gateway` (with the
+`CLOUDFLARE_*` environment exported), and retain the orchestrator for a
+reviewed roll-forward. Never rerun a bootstrap against a mixed state.
 
 Tag local releases for traceability, for example
 `wrangler deploy --tag "operator-<date>-<short-sha>-gateway"`. Rollback is an
@@ -388,6 +399,8 @@ node scripts/github-sync-quiescence.mjs reconcile --config <rendered-config> \
   --disabled-version <exact-version-id> \
   --schedule-state clear --workflow-state clear
 ```
+
+The helper needs the same `CLOUDFLARE_*` environment as the migration scripts.
 
 It processes, in order, unbound dispatch items, bound repository runs and
 items, unbound repository runs, closable dispatches, and credential lanes. It
