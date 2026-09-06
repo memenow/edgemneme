@@ -65,10 +65,6 @@ const validControlPlane = {
 };
 
 const temporaryDirectories: string[] = [];
-const migrationWorkflow = readFileSync(
-  join(process.cwd(), ".github", "workflows", "migrate-d1.yml"),
-  "utf8"
-);
 
 afterEach(() => {
   for (const directory of temporaryDirectories.splice(0)) {
@@ -296,74 +292,3 @@ describe("D1 migration backup bucket control-plane admission", () => {
     ).rejects.toThrow(/R2 lifecycle query failed with HTTP 403/iu);
   });
 });
-
-describe("production D1 migration backup workflow", () => {
-  it("retains exact recovery points only after backup-bucket admission", () => {
-    const backup = workflowStep(
-      migrationWorkflow,
-      "Capture and verify private pre-migration backups"
-    );
-    const settings = workflowStep(
-      migrationWorkflow,
-      "Validate and mask production resource settings"
-    );
-    const memoryMigration = migrationWorkflow.indexOf(
-      "      - name: Apply memory database migrations\n"
-    );
-    const backupStart = migrationWorkflow.indexOf(
-      "      - name: Capture and verify private pre-migration backups\n"
-    );
-
-    expect(settings).toContain(
-      "D1_MIGRATION_BACKUP_R2_BUCKET: ${{ vars.D1_MIGRATION_BACKUP_R2_BUCKET }}"
-    );
-    expect(settings).toContain(
-      "D1_MIGRATION_BACKUP_RETENTION_DAYS: ${{ vars.D1_MIGRATION_BACKUP_RETENTION_DAYS }}"
-    );
-    expect(backup).toContain(
-      "D1_MIGRATION_BACKUP_R2_BUCKET: ${{ vars.D1_MIGRATION_BACKUP_R2_BUCKET }}"
-    );
-    expect(backup).toContain(
-      "D1_MIGRATION_BACKUP_RETENTION_DAYS: ${{ vars.D1_MIGRATION_BACKUP_RETENTION_DAYS }}"
-    );
-    const admissions = [
-      ...backup.matchAll(/node scripts\/verify-d1-backup-bucket\.mjs/gu)
-    ];
-    expect(admissions).toHaveLength(2);
-    expect(backup).not.toContain('backup_bucket="edgemneme-projections"');
-    expect(backup).toContain('d1 time-travel info "$database" --json');
-    expect(backup).toContain("capture_bookmark MEMORY_DB");
-    expect(backup).toContain("capture_bookmark SEARCH_DB");
-    expect(backup).toContain("d1 export MEMORY_DB --remote");
-    expect(backup).not.toContain("d1 export SEARCH_DB");
-    expect(backup).toContain("search_generations");
-    expect(backup).toContain("memory_fts");
-    expect(backup).toContain("memory_projection_heads");
-    expect(backup).toContain("system/backups/d1-migrations/");
-    expect(backup).toContain("wrangler r2 object put");
-    expect(backup).toContain("wrangler r2 object get");
-    expect(backup).toContain("cmp --silent");
-    expect(backup).toContain("create-backup-manifest");
-    expect(backup).toContain("verify-backup");
-    expect(backup.indexOf('upload_and_verify "manifest.json"'))
-      .toBeGreaterThan(backup.indexOf('upload_and_verify "memory-projection-heads.jsonl"'));
-    expect(admissions[0]!.index!)
-      .toBeLessThan(backup.indexOf("d1 export MEMORY_DB --remote"));
-    expect(admissions[1]!.index!)
-      .toBeLessThan(backup.indexOf("wrangler r2 object put"));
-    expect(backupStart).toBeGreaterThan(-1);
-    expect(backupStart).toBeLessThan(memoryMigration);
-    expect(migrationWorkflow).not.toContain("actions/upload-artifact");
-    expect(migrationWorkflow).not.toContain("time-travel restore");
-  });
-});
-
-function workflowStep(source: string, name: string): string {
-  const marker = `      - name: ${name}\n`;
-  const start = source.indexOf(marker);
-  if (start === -1) {
-    throw new Error(`Workflow step ${name} was not found.`);
-  }
-  const next = source.indexOf("\n      - name: ", start + marker.length);
-  return source.slice(start, next === -1 ? undefined : next);
-}

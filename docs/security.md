@@ -10,8 +10,8 @@
 - `claude-runner` is disabled and receives no D1 write, GitHub, or MCP
   credential.
 
-Secrets are configured through Worker secrets or protected GitHub environment
-secrets. Cloudflare resource identifiers and rate-limit namespace identifiers
+Secrets are configured through Worker secrets managed in the Cloudflare
+dashboard. Cloudflare resource identifiers and rate-limit namespace identifiers
 are protected deployment variables and are rendered only into ignored runtime
 configuration. Secret values must never enter the repository, Wrangler vars,
 D1, R2, Queue messages, Workflow payloads, logs, exceptions, tests, or model
@@ -50,13 +50,13 @@ HTTP 429, unknown or malformed responses, repeated cursors, partial schema,
 version drift, or new work fails closed without secret deletion and without a
 silent API retry. Receipt verification makes a later reviewed rerun resumable.
 The initial migration drain may reconcile before backup; the final post-backup
-gate is read-only. GitHub environment-secret deletion and PAT revocation remain
+gate is read-only. Worker-secret deletion and PAT revocation remain
 explicit operator actions after reconciliation.
 
-Before the bearer-bearing production canary, the workflow derives the exact
+Before the bearer-bearing production canary, the operator derives the exact
 HTTPS `/mcp` endpoint and hostname from the gateway's verified Cloudflare
-workers.dev or custom-domain trigger. It also binds that target to this run's
-tagged 100-percent active version and rechecks both version and trigger after
+workers.dev or custom-domain trigger, binds that target to the exact deployed
+100-percent active version, and rechecks both version and trigger after
 cleanup. A separately configured URL or hostname is not deployment authority.
 
 ## MCP ingress boundary
