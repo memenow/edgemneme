@@ -1,3 +1,9 @@
+/**
+ * Workflow creation with roll-forward repair: when an instance id already
+ * exists, inspect the control plane and reuse the instance while it is still
+ * runnable, fork to a suffixed repair id after terminal failures, and fail
+ * closed on any status outside the known sets.
+ */
 interface WorkflowStatusLike {
   status: string;
 }

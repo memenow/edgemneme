@@ -1,3 +1,9 @@
+/**
+ * Builds the guarded D1 statement batch for memory mutations (correct,
+ * invalidate, rollback). Each statement carries the project-version guard,
+ * so the whole batch acts as a compare-and-swap: a stale version writes
+ * nothing instead of forking history.
+ */
 import { requireValidValidityInterval } from "../contracts/validity";
 
 export type MemoryChangeOperation = "correct" | "invalidate" | "rollback";

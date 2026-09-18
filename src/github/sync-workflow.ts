@@ -1,3 +1,9 @@
+/**
+ * D1 fencing for GitHub sync Workflows: the per-credential lane lease that
+ * serializes dispatch and ref holders, request reservations that cap API
+ * calls per run, and the dispatch materialization receipts that keep
+ * repeated Workflow steps idempotent.
+ */
 import { sha256 } from "../security/crypto";
 import { MAX_GITHUB_ANNOTATED_TAG_PEEL_REQUESTS } from "./client";
 

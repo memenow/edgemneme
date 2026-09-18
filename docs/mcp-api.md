@@ -73,6 +73,104 @@ atomic filter. Callers must provide both fields or omit both fields in query and
 browse modes. Supplying either field alone returns `VALIDATION_FAILED` before
 search authorization or projection access.
 
+### Tool inputs
+
+The tables below mirror the gateway's input schemas. Required fields reject
+the call when absent.
+
+`project_resolve`
+
+| Field | Required | Shape |
+| --- | --- | --- |
+| `locator` | yes | String, 1 to 2,048 characters |
+
+`session_open`
+
+| Field | Required | Shape |
+| --- | --- | --- |
+| `project_ref` | yes | String, 8 to 256 characters |
+| `agent_meta` | yes | Record of string keys to arbitrary values |
+| `worktree_meta` | no | Strict object; see Repository-bound sessions below |
+
+`memory_search`
+
+| Field | Required | Shape |
+| --- | --- | --- |
+| `project_ref` | yes | String, 8 to 256 characters |
+| `session_id` | no | UUID |
+| `query` | no | String, at most 4,096 characters |
+| `filters` | no | Object, defaults to `{}` |
+| `limit` | no | Positive integer, at most 50 |
+| `page_token` | no | String, at most 4,096 characters |
+
+`filters` accepts optional `kind`, `memory_class`, `scope`, and `status`
+taxonomy enums plus `scope_id`, a string of 1 to 2,048 characters. The enums
+are `decision`, `fact`, `convention`, `procedure`, `learning`, `incident`,
+`reference`, `feedback` (`kind`); `semantic`, `procedural`, `episodic`
+(`memory_class`); `project`, `repository`, `ref`, `worktree`, `session`
+(`scope`); and `active`, `contested`, `superseded`, `invalidated`, `archived`
+(`status`).
+
+`candidate_submit`
+
+| Field | Required | Shape |
+| --- | --- | --- |
+| `project_ref` | yes | String, 8 to 256 characters |
+| `session_id` | yes | UUID |
+| `content` | yes | String, 1 to 65,536 characters |
+| `evidence` | yes | Array of 1 to 50 evidence objects |
+| `idempotency_key` | yes | String, 8 to 256 characters |
+
+Every evidence object carries `source_type`, a string of 1 to 64 characters,
+and `locator`, a string of 1 to 2,048 characters, plus optional `commit_sha`
+(40 to 64 hexadecimal characters) and `excerpt_hash` (64 hexadecimal
+characters).
+
+`memory_change_submit`
+
+| Field | Required | Shape |
+| --- | --- | --- |
+| `operation` | yes | `correct`, `invalidate`, or `rollback` |
+| `target_memory_id` | yes | UUID |
+| `expected_memory_version` | yes | Positive integer |
+| `expected_project_version` | yes | Nonnegative integer |
+| `payload` | yes | Record of string keys to arbitrary values |
+| `evidence` | yes | Evidence array, same shape as `candidate_submit` |
+| `idempotency_key` | yes | String, 8 to 256 characters |
+
+`candidate_review`
+
+| Field | Required | Shape |
+| --- | --- | --- |
+| `candidate_id` | yes | String; UUID or deletion-review identifier |
+| `expected_candidate_version` | yes | Positive integer |
+| `decision` | yes | `approve`, `reject`, or `request_changes` |
+| `reason` | yes | String, 1 to 4,096 characters |
+| `edits` | no | Strict object, see below |
+| `idempotency_key` | yes | String, 8 to 256 characters |
+
+`edits` accepts only `content` (string, 1 to 65,536 characters), the `kind`,
+`memory_class`, and `scope` taxonomy enums, `scope_id` (string, 1 to 2,048
+characters), and `valid_from` and `valid_until` (ISO-8601 datetime with a
+UTC offset or null).
+
+`session_close`
+
+| Field | Required | Shape |
+| --- | --- | --- |
+| `session_id` | yes | UUID |
+| `expected_session_version` | yes | Positive integer |
+| `summary` | no | String, at most 8,192 characters |
+| `trigger_consolidation` | yes | Boolean |
+| `idempotency_key` | yes | String, 8 to 256 characters |
+
+`workflow_get`
+
+| Field | Required | Shape |
+| --- | --- | --- |
+| `project_ref` | yes | String, 8 to 256 characters |
+| `workflow_id` | yes | String, 8 to 256 characters |
+
 ### Repository-bound sessions
 
 `session_open.worktree_meta` accepts only normalized repository context:
@@ -218,3 +316,11 @@ Public codes are `UNAUTHENTICATED`, `PROJECT_UNAVAILABLE`,
 `RESOURCE_UNAVAILABLE`, `VALIDATION_FAILED`, `VERSION_CONFLICT`,
 `IDEMPOTENCY_CONFLICT`, `PAGE_TOKEN_INVALID`, `RATE_LIMITED`,
 `WORKFLOW_FAILED`, and `INTERNAL`.
+
+A failing tool call is returned as a normal tool result with `isError: true`
+and a single text block containing that JSON body; it is not a JSON-RPC
+protocol error. `retry_after_ms` appears only on errors that carry one, such
+as `RATE_LIMITED`. Unexpected exceptions collapse to `INTERNAL` with a fixed
+message, so stack traces and internal details never reach the client. A
+failing resource read throws an error whose message is the same serialized
+JSON body.

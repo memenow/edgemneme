@@ -6,8 +6,8 @@ Contract:
     -> {"text"} (model final answer, expected to be raw JSON arguments)
   GET /health -> {"ok": true}
 
-Secrets: MODEL_API_KEY lives only in this container's environment (injected
-at deploy time, never committed). The Worker authenticates with
+Secrets: META_MODEL_API_KEY lives only in this container's environment
+(injected at deploy time, never committed). The Worker authenticates with
 HERMES_SHARED_SECRET. Request bodies are never logged; only the profile,
 byte sizes, and idempotency key are logged.
 """

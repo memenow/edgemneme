@@ -137,8 +137,7 @@ export function resolveModelRunner(env: ModelRunnerEnv): ModelRunner {
 // contract is sent as prompt text and schema discipline comes from the
 // downstream zod parsers and the verbatim-evidence checks, with failures
 // mapping to the existing deferred diagnostic codes. Do not assume output
-// parity with Workers AI; the shadow comparison in Phase 1.5 measures the
-// schema-valid rate before any cutover.
+// parity with Workers AI.
 export class HermesRunner implements ModelRunner {
   readonly kind = MODEL_RUNNER_HERMES;
 

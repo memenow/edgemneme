@@ -1,3 +1,10 @@
+/**
+ * Private scheduled GitHub reader. The cron handler only dispatches sync
+ * Workflows (runScheduledGitHubSync remains exported for tests); every path
+ * stays inert unless the credential and schedule gates explicitly enable
+ * it, and D1 cursors, manifests, and access baselines keep syncs
+ * restart-safe.
+ */
 import {
   createGitHubRequestPacer,
   GitHubReadOnlyClient,

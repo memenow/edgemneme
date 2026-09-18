@@ -117,6 +117,18 @@ character estimates. Consolidation batch steps persist accepted results and
 return no model payload to Workflow storage; even the maximum 9,000-entry batch
 index result remains below Workflow's 1 MiB step-result limit.
 
+Model execution goes through a selectable ModelRunner. The default is the
+Workers AI runner described above; an explicit deployment can select the
+Hermes container runner through the `memory-orchestrator` template variables
+`MODEL_RUNNER` (default `workers-ai`), `HERMES_PROFILE` (default `meta-muse`),
+and `HERMES_CREDENTIAL_VERSION` (default `unconfigured`), plus the
+`HERMES_SHARED_SECRET` Worker secret. Selection fails closed on an unknown
+runner name or an unconfigured credential version, and there is no fallback
+between runners. The Hermes path sends the tool contract as prompt text
+without a forced tool choice and relies on the same strict local schema,
+scope, evidence, provenance, and temporal validation before any review
+candidate exists; the model stays advisory.
+
 ## Repository boundaries
 
 - A project-wide principal can work across every registered repository in its
@@ -149,6 +161,8 @@ physical deployment per repository or project.
   and Workers AI. The production contract requires Paid-plan GLM-5.2 access,
   10,000 Workflow steps, 1,500,000 orchestrator subrequests, and the configured
   CPU limit.
+- The optional Hermes model-runner path additionally requires Cloudflare
+  Containers on the paid plan
 - A separately approved, expiring GitHub PAT (classic) if private-repository
   sync is enabled
 
@@ -211,7 +225,7 @@ Configure these environment variables for deployment and production migration:
 - `ENABLE_GITHUB_SYNC` (`false` until explicitly approved)
 - `MEMORY_GATEWAY_ALLOWED_ORIGINS` (optional comma-separated HTTPS origins)
 - `MEMORY_GATEWAY_CUSTOM_DOMAIN` (optional route only; an empty value uses `workers.dev`)
-- `SYNC_CREDENTIAL_VERSION` (required only when GitHub sync is enabled)
+- `GITHUB_CREDENTIAL_VERSION` (required only when GitHub sync is enabled)
 
 The release procedure derives the production canary URL and hostname from
 the verified remote gateway trigger. Do not configure a separate canary URL or
@@ -260,7 +274,7 @@ pnpm exec wrangler secret put PAGE_TOKEN_HMAC_KEY \
 ```
 
 Do not rotate `GITHUB_CLASSIC_TOKEN` with `wrangler secret put`. GitHub sync
-binds every dispatch and recovery receipt to `SYNC_CREDENTIAL_VERSION`, so the
+binds every dispatch and recovery receipt to `GITHUB_CREDENTIAL_VERSION`, so the
 token and its new version must be promoted together through the drained
 deployment procedure in the operations runbook.
 
@@ -307,7 +321,9 @@ the operator and is never persisted by EdgeMneme.
 ## Project layout
 
 ```text
+containers/hermes/           Hermes model-runner container image
 migrations/                  Authoritative and search D1 migrations
+scripts/                     Node.js operational CLIs
 src/                         Shared contracts, security, storage, and projection logic
 tests/                       Deterministic unit and security contract tests
 workers/memory-gateway/      Public Streamable HTTP MCP Worker

@@ -14,6 +14,8 @@
   two spaces, double quotes, semicolons, multiline trailing commas, kebab-case
   filenames, camelCase values and functions, PascalCase types and classes, and
   SCREAMING_SNAKE_CASE constants.
+- Write code, comments, commit messages, README, and `docs/` in standard
+  American English.
 
 ## Architecture and ownership
 
@@ -29,6 +31,11 @@
   schedule gates.
 - `workers/claude-runner/` is a disabled boundary. It must not gain authority or
   enter the default deployment path without an explicit architecture change.
+- `containers/hermes/` owns the optional Hermes model-runner container image,
+  HTTP adapter, and profile config. It is reachable only through
+  `memory-orchestrator`'s Container binding on the quality path, stays inert
+  unless the model-runner variables explicitly select it, and shares no
+  credential with the gateway or GitHub boundaries.
 - The directories under `src/` own the shared domain named by the directory:
   contracts, security, storage, gateway, GitHub synchronization, quality,
   search, projection, and workflows. Worker entrypoints may depend on these

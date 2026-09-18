@@ -1,3 +1,9 @@
+/**
+ * Project-principal authentication and role/ACL checks against D1. Bearer
+ * tokens are only ever looked up as peppered HMAC-SHA256 digests, and every
+ * failure fails closed with uniform errors so unknown tokens, revocations,
+ * and missing grants are indistinguishable.
+ */
 import { EdgeMnemeError } from "../contracts/errors";
 import { encodeBase64Url } from "./crypto";
 

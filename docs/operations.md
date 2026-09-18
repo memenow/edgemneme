@@ -176,17 +176,26 @@ script that queries Cloudflare directly (`verify-d1-backup-bucket`,
 `CLOUDFLARE_API_TOKEN` in the environment. Read the token with `read -rs` so
 it never lands in shell history.
 
-Then capture the maintenance fingerprint, retain the Time Travel bookmarks and
-the byte-verified private R2 export set, re-verify the fingerprint, and apply
-SEARCH_DB first. Verify no pending Search migration, `PRAGMA quick_check`,
-foreign keys, and the exact checked-out schema, then run two fresh stable
-maintenance observations before applying MEMORY_DB. The run finally validates
-both databases. If Search succeeds and Memory fails, or any later validation
-fails, keep every ingress and producer disabled and roll forward; never reopen
-an old writer or attempt an automatic paired Time Travel restore. Supporting an
-in-place production upgrade requires a separate reviewed design for a durable
-cross-version write fence and Queue generation or drain receipts. The migration
-run never creates that fence or changes Cloudflare triggers.
+Then capture the maintenance fingerprint with `node
+scripts/d1-maintenance-admission.mjs capture --config <rendered-config>`,
+which prints the SHA-256 fingerprint, retain the Time Travel bookmarks and the
+byte-verified private R2 export set, re-verify the fingerprint with `node
+scripts/d1-maintenance-admission.mjs verify --config <rendered-config>
+--expected-fingerprint <sha256>`, and apply SEARCH_DB first. Verify no pending
+Search migration, `PRAGMA quick_check`, foreign keys, and the exact
+checked-out schema, then run two fresh stable maintenance observations before
+applying MEMORY_DB. The export paging, search-snapshot, backup-manifest, and
+database validation steps run through `node scripts/d1-migration-safety.mjs`
+subcommands: `append-page`, `append-keyset-page`, `keyset-predicate`,
+`detect-search-table`, `validate-search-snapshot`, `create-backup-manifest`,
+`verify-backup`, `validate-integrity`, and `validate-schema`. The run finally
+validates both databases. If Search succeeds and Memory fails, or any later
+validation fails, keep every ingress and producer disabled and roll forward;
+never reopen an old writer or attempt an automatic paired Time Travel restore.
+Supporting an in-place production upgrade requires a separate reviewed design
+for a durable cross-version write fence and Queue generation or drain
+receipts. The migration run never creates that fence or changes Cloudflare
+triggers.
 
 The eight metadata indexes are query prefilters, not authority. The namespace
 provides the project filter. `repository_partition` narrows authorization;
@@ -240,10 +249,12 @@ root directory and the pinned Wrangler from `package.json`:
 Set the per-Worker build-only variables listed below, configure build watch
 paths so each Worker rebuilds only for its own paths plus the shared
 directories (`src/`, `workers/`, `wrangler/`, `scripts/`, `migrations/`,
-`package.json`, `pnpm-lock.yaml`), and keep non-production branch builds
-disabled. The dashboard Worker name must match the `name` in the rendered
-configuration or the build fails. A failed build never mutates the live Worker;
-fix forward with a new commit and inspect Build History before retrying.
+`containers/`, `package.json`, `pnpm-lock.yaml`), and keep non-production
+branch builds disabled. `memory-orchestrator` builds its container image from
+`containers/hermes/Dockerfile`. The dashboard Worker name must match the
+`name` in the rendered configuration or the build fails. A failed build never
+mutates the live Worker; fix forward with a new commit and inspect Build
+History before retrying.
 
 For a local release instead of a push, export the same variables in an operator
 shell, render with `node scripts/render-wrangler-config.mjs
@@ -487,15 +498,19 @@ CF_RATE_LIMIT_NAMESPACE_PRINCIPAL # gateway
 MEMORY_GATEWAY_ALLOWED_ORIGINS    # gateway, optional
 MEMORY_GATEWAY_CUSTOM_DOMAIN      # gateway, optional
 ENABLE_GITHUB_SYNC                # github-sync, exactly true or false
-SYNC_CREDENTIAL_VERSION           # github-sync, required only when enabled
+GITHUB_CREDENTIAL_VERSION         # github-sync, required only when enabled
 ```
 
 `D1_MIGRATION_BACKUP_R2_BUCKET` and `D1_MIGRATION_BACKUP_RETENTION_DAYS` are
-local-only migration variables; Builds never reads them. A gateway URL or host
-variable is neither read nor accepted as canary authority; the operator derives
-both values from the verified Cloudflare trigger state.
+local-only migration variables; Builds never reads them. The model-runner
+variables `MODEL_RUNNER`, `HERMES_PROFILE`, and `HERMES_CREDENTIAL_VERSION`
+are Wrangler template vars with defaults (`workers-ai`, `meta-muse`,
+`unconfigured`); they are not renderer inputs and matter only for
+`memory-orchestrator`. A gateway URL or host variable is neither read nor
+accepted as canary authority; the operator derives both values from the
+verified Cloudflare trigger state.
 
-`SYNC_CREDENTIAL_VERSION` is required only when GitHub synchronization is
+`GITHUB_CREDENTIAL_VERSION` is required only when GitHub synchronization is
 enabled. The origin list and custom domain are optional: an empty custom domain
 uses `workers.dev`, while an empty origin list accepts non-browser MCP clients
 but no browser origin. The renderer writes only ignored files; builds and local
@@ -519,6 +534,7 @@ The dashboard Worker secrets are:
 TOKEN_DIGEST_PEPPER   # memory-gateway
 PAGE_TOKEN_HMAC_KEY   # memory-gateway
 GITHUB_CLASSIC_TOKEN  # github-sync, only when sync is enabled
+HERMES_SHARED_SECRET  # memory-orchestrator, Hermes runner only
 ```
 
 After a successful disabled-state reconciliation, `GITHUB_CLASSIC_TOKEN` is
@@ -1109,7 +1125,7 @@ permissions. Those checks belong to the isolated synthetic project.
    gates completed. This creates a fail-closed rotation window.
 6. While synchronization remains disabled and no production deployment is
    running, replace the `GITHUB_CLASSIC_TOKEN` Worker secret and set
-   `SYNC_CREDENTIAL_VERSION` to a new unique value. These two settings are one
+   `GITHUB_CREDENTIAL_VERSION` to a new unique value. These two settings are one
    credential identity and must never be promoted independently.
 7. Set `ENABLE_GITHUB_SYNC=true`, deploy, and verify its exact version, secret
    binding, six-hour Cron, three Workflow definitions, credential identity,

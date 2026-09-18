@@ -1,3 +1,9 @@
+/**
+ * Builds the guarded D1 batch that promotes a reviewed candidate into its
+ * first memory revision. Validates scope/repository-context pairing up
+ * front, then writes audit event, revision, and candidate state together
+ * under the project-version and candidate-status guards.
+ */
 import type { MemoryClass, MemoryKind, MemoryScope } from "../contracts/taxonomy";
 import type { RepositoryAuthority } from "../contracts/repository-context";
 import { requireValidValidityInterval } from "../contracts/validity";

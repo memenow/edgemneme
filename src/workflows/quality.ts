@@ -1,3 +1,10 @@
+/**
+ * AI quality path for MemoryWorkflow: candidate analysis and session
+ * consolidation. Model output is never trusted — schema or verbatim-evidence
+ * failures defer to diagnostic codes instead of partial writes, and
+ * consolidation batches run under a fenced D1 lease with input/result
+ * digests so repeated Workflow steps cannot double-apply.
+ */
 import { EdgeMnemeError } from "../contracts/errors";
 import { canonicalJson } from "../security/canonical-json";
 import { sha256 } from "../security/crypto";

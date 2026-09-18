@@ -1,3 +1,10 @@
+/**
+ * Builds the guarded D1 batch that records a candidate review decision
+ * (reject or request_changes; approval is promotion). Audit event, review
+ * decision, and candidate state advance together under project-version,
+ * candidate-status, and review-request guards so repeats and races apply
+ * at most once.
+ */
 import type { SqlStatement } from "./mutation-plan";
 
 interface CandidateReviewInput {

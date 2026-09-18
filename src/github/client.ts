@@ -1,3 +1,9 @@
+/**
+ * Read-only GitHub REST client for the sync path. Every request targets an
+ * allowlisted path shape and repository id, with per-endpoint response size
+ * caps, pacing, and request/deadline budgets; responses surface only the
+ * narrowly parsed shapes declared here.
+ */
 import {
   parseNextPageLink,
   parsePositiveSafeInteger
