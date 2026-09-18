@@ -1,3 +1,10 @@
+/**
+ * The only public Worker: a single /mcp route. Owns the request boundary —
+ * origin validation, CORS, edge/client/principal rate limiting, bearer
+ * authentication, and bounded request bodies; formal writes delegate to the
+ * orchestrator's ProjectCoordinator, with intake recorded as queued outbox
+ * events.
+ */
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { createMcpHandler } from "agents/mcp";
 import { z } from "zod";

@@ -1,3 +1,9 @@
+/**
+ * Orchestrator Worker: Queue consumer, ProjectCoordinator Durable Object,
+ * MemoryWorkflow, and the scheduled recovery pass. Formal writes, GitHub
+ * cursors, projections, and terminal Workflow states advance only through
+ * guarded D1 batches, fenced receipts, and idempotent recovery proofs.
+ */
 import {
   DurableObject,
   WorkflowEntrypoint,

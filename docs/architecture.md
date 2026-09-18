@@ -27,7 +27,7 @@
 10. A GitHub Cron invocation only schedules durable work. Per-ref Workflow items,
     the credential lane, activation receipts, and terminal receipts remain the
     authoritative execution record across retries and control-plane ambiguity.
-11. The protected deployment and migration Actions may reconcile only GitHub
+11. The local operator quiescence procedure may reconcile only GitHub
     synchronization ledgers, and only after proving an exact disabled Worker,
     an empty schedule, and no nonterminal GitHub Workflow. This operational D1
     writer cannot create or change formal memory.
@@ -121,9 +121,10 @@ GitHubRefSyncWorkflow (one bounded ref attempt)
 GitHubRetentionWorkflow
   -> independently purge eligible failed manifests in bounded D1 transactions
 
-Protected deployment or migration Action (GitHub sync disabled)
+Local operator quiescence run (GitHub sync disabled)
   -> prove exact disabled Worker, empty Cron schedule, and no nonterminal Workflow
   -> reconcile only GitHub synchronization ledgers through receipt-fenced D1 writes
+     (node scripts/github-sync-quiescence.mjs reconcile)
   -> revalidate the control plane and require two fenced zero-work observations
      60 seconds apart
   -> keep the post-backup migration gate read-only
@@ -306,6 +307,18 @@ assuming one byte per character. A consolidation batch persists the accepted
 result and returns no model payload from its Workflow step. The only large
 durable step result is the batch-index array, whose 9,000-entry maximum remains
 below Workflow's 1 MiB step-result limit. There is no silent model fallback.
+
+Model execution is selected through a ModelRunner. The default Workers AI
+runner applies the forced function call above. An explicit deployment can
+select the Hermes container runner through `MODEL_RUNNER`, which additionally
+requires a configured `HERMES_CREDENTIAL_VERSION` and the
+`HERMES_SHARED_SECRET` Worker secret on `memory-orchestrator`, while
+`HERMES_PROFILE` defaults to `meta-muse`. An unknown runner name or an
+unconfigured credential version fails closed, and there is no fallback
+between runners. The Hermes path sends the tool contract as prompt text
+without a forced tool choice; the same strict local schema, scope, evidence,
+provenance, and temporal validation gates every response before a review
+candidate can exist.
 
 The model receives server-created opaque scope option IDs, the semantic scope
 type, selection guidance, and evidence source IDs. It does not receive the raw

@@ -1,3 +1,9 @@
+/**
+ * Deterministic JSON serialization: sorted keys, no whitespace, finite
+ * numbers only (-0 normalizes to 0). Callers rely on it for stable digests,
+ * so values that would make output vary (cycles, prototypes, non-finite
+ * numbers) throw instead of serializing.
+ */
 function serialize(value: unknown, ancestors: WeakSet<object>): string {
   if (value === null) {
     return "null";

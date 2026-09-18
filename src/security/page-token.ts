@@ -1,3 +1,9 @@
+/**
+ * Stateless signed pagination cursors: HMAC-SHA256 over a versioned payload
+ * binding project, query digest, snapshot version, and sort key.
+ * Verification is fail-closed — signature, context, or expiry problems all
+ * collapse into a single PAGE_TOKEN_INVALID error.
+ */
 import { EdgeMnemeError } from "../contracts/errors";
 import { constantTimeEqual, decodeBase64Url, encodeBase64Url } from "./crypto";
 

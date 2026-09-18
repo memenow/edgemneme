@@ -1,3 +1,9 @@
+/**
+ * Body of the GitHub dispatch Workflow: page through repositories, admit
+ * only refs that pass the approved access baseline, materialize dispatch
+ * items in fenced D1 steps, then fan out per-ref Workflows under the
+ * credential lane and fixed step/subrequest budgets.
+ */
 import type { WorkflowStep } from "cloudflare:workers";
 import { GitHubReadOnlyClient, GitHubSyncError } from "../../src/github/client";
 import {

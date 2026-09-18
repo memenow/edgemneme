@@ -1,3 +1,9 @@
+/**
+ * Optional Hermes container boundary for the orchestrator's quality path.
+ * Stays inert unless the model-runner variables select it; this Worker-side
+ * code handles only the shared auth secret and never the model credential,
+ * which reaches the container through its own secret environment.
+ */
 import { Container, getContainer } from "@cloudflare/containers";
 import {
   HERMES_DEFAULT_PROFILE,
@@ -25,8 +31,9 @@ export class HermesContainer extends Container<HermesContainerEnv> {
   constructor(ctx: DurableObjectState<Record<string, unknown>>, env: HermesContainerEnv) {
     super(ctx, env);
     // Forward the Worker-side shared secret into the container process
-    // environment. MODEL_API_KEY is never handled here: Hermes itself reads
-    // it from the container secret environment injected at deploy time.
+    // environment. META_MODEL_API_KEY is never handled here: Hermes
+    // itself reads it from the container secret environment injected at
+    // deploy time.
     const secret = env.HERMES_SHARED_SECRET;
     if (secret !== undefined && secret !== "") {
       this.envVars = { HERMES_SHARED_SECRET: secret };

@@ -7,6 +7,11 @@
 - `github-sync` is the only Worker that receives `GITHUB_CLASSIC_TOKEN`.
 - `memory-orchestrator` receives D1, R2, Vectorize, Workers AI, Queue, Workflow,
   and Durable Object bindings, but no GitHub or MCP credential.
+- When the Hermes model runner is selected, `memory-orchestrator` additionally
+  holds the Hermes Container binding and the `HERMES_SHARED_SECRET` Worker
+  secret. The container process environment holds the model provider key
+  (`META_MODEL_API_KEY`), injected at deploy time and never present in the
+  repository. The gateway and `github-sync` never receive these credentials.
 - `claude-runner` is disabled and receives no D1 write, GitHub, or MCP
   credential.
 
@@ -31,8 +36,8 @@ GitHub synchronization ledgers, requires two clear observations 60 seconds
 apart, and only then deletes and verifies the Worker secret. The scheduled
 handler checks the runtime gate before any D1, GitHub, or token access.
 
-The ledger helper is available only to the protected deployment and migration
-Actions. Every pass is bounded to 20 candidates per phase, 18 Cloudflare HTTP
+The ledger helper is available only to the local operator quiescence
+procedure. Every pass is bounded to 20 candidates per phase, 18 Cloudflare HTTP
 requests, and 288 D1 statements. It uses a fixed D1 REST origin, parameterized
 queries, 1 MiB encoded request and response body limits, primary-service
 attestation, a native number/null parameter preflight, immutable receipts, and
@@ -300,6 +305,15 @@ unregistered provenance fail closed. A single-repository claim may receive an
 advisory project option, but every project-scope proposal requires explicit
 maintainer review. The model never grants access, approves a candidate, or
 writes formal memory.
+
+Model execution is bounded to one selectable runner. The default Workers AI
+runner holds no credential beyond its binding, while selecting the Hermes
+container runner adds the container credential surface described above. An
+unknown runner name or an unconfigured credential version fails closed with
+no fallback between runners. The Hermes path sends the tool contract as
+prompt text without a forced tool choice and applies the same strict local
+schema, scope, evidence, provenance, and temporal validation before any
+review candidate can exist.
 
 ## Known release blockers
 
